@@ -1,0 +1,5 @@
+symbol,raw_symbol,name,exchange,product_type,management_type,asset_class,category,tracking_index,tracking_index_code,fund_company,listed_date,delisted_date,expense_ratio,custody_fee,lot_size,price_tick,is_active,include_in_universe,exclusion_reason,source
+510300.SH,510300,沪深300ETF,SH,ETF,passive_index,equity,broad_based,沪深300,000300.SH,manual,2012-05-28,,0.005,0.001,100,0.001,1,1,,manual
+510500.SH,510500,中证500ETF,SH,ETF,passive_index,equity,broad_based,中证500,000905.SH,manual,2013-03-15,,0.005,0.001,100,0.001,1,1,,manual
+518880.SH,518880,黄金ETF,SH,ETF,passive_commodity,commodity,gold,黄金现货,AU9999.SH,manual,2013-07-29,,0.006,0.001,100,0.001,1,1,,manual
+

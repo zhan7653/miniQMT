@@ -1,0 +1,3368 @@
+下面这版方案把你的系统定位为：
+
+以 MiniQMT / xtquant 为底层接入，以本地可信数据仓库为核心，以 DataPortal 和 Broker 抽象隔离上层研究、回测、模拟盘、Agent 与真实交易接口的轻量型场内规则基金实验平台。
+
+核心原则是：
+
+数据先可信
+回测再可信
+模拟盘收益最后可信
+Agent / 自动执行 / 推送全部后置
+
+xtdata 本身适合作为行情、K 线、分笔、合约基础信息、板块分类等数据入口；它通过 MiniQMT 连接行情服务，且数据能力与 MiniQMT 当前连接环境一致，历史数据不足时通常需要先下载再读取。你的系统不应该让策略直接调用 xtdata，而应当把 xtdata 封装成 SourceAdapter。 xttrader 则适合封装在后续的 QmtBroker / QmtGateway 中，例如下单接口最终需要映射到证券代码、买卖方向、委托数量、报价类型、价格等字段。
+
+1. 项目目标与边界
+1.1 项目目标
+
+项目名称建议：
+
+FundLab
+Exchange-Traded Rule-Based Fund Lab
+场内规则型基金投资实验系统
+
+第一性目标不是“做一个 ETF 策略”，而是做一个长期可扩展的实验平台：
+
+可信数据仓库
+  → 统一数据接口
+    → 可复现回测
+      → 内部虚拟模拟盘
+        → ETF / 场内基金雷达
+          → Agent 虚拟投资者
+            → MiniQMT 自动执行
+              → 报告与推送
+
+你的平台要解决三个可信问题：
+
+数据可信：
+  数据来源、清洗、复权、缺失、停牌、估值可得性、分红、折溢价都可追溯。
+
+回测可信：
+  严格区分信号日、可得日、下单日、成交日，不允许未来函数。
+
+模拟盘可信：
+  每个虚拟账户有独立订单、成交、现金、持仓、估值、收益曲线和审计记录。
+1.2 第一版资产范围
+
+第一版建议只支持：
+
+A 股场内 ETF
+债券 ETF
+黄金 ETF
+跨境指数 ETF / QDII ETF
+货币 ETF可以纳入，但第一版策略中尽量先作为现金替代品观察
+
+暂不进入主流程：
+
+REITs
+指数 LOF
+指数增强基金
+主动 ETF
+FOF
+主动权益基金
+
+原因很简单：第一阶段最重要的是把数据、回测、模拟盘闭环跑通。资产范围越宽，越容易让项目卡在分类、估值、净值、分红、流动性、交易规则差异上。
+
+1.3 第一版非目标
+
+第一版不要做：
+
+分钟级回测
+高频撮合
+复杂订单类型
+真实自动交易
+多数据源仲裁
+复杂 Agent 自主进化
+Web 大屏
+实时推送系统
+完整归因系统
+指数成分穿透分析
+
+第一版要做：
+
+日线数据可信落库
+DataPortal 可用
+5 个规则策略可回测
+T 日收盘信号，T+1 日开盘成交
+手续费、滑点、成交额限制
+分红现金入账
+折溢价风控
+内部虚拟模拟账户
+每日账户净值和持仓可追溯
+2. 总体系统架构
+┌──────────────────────────────────────────────────────────┐
+│                    MiniQMT / QMT                         │
+│  xtdata: 行情 / K线 / 合约 / 板块 / ETF资料              │
+│  xttrader: 报单 / 撤单 / 资产 / 委托 / 成交 / 持仓        │
+└──────────────────────────┬───────────────────────────────┘
+                           │
+                           │ SourceAdapter
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                    Data Ingestion                         │
+│  下载器 Downloaders                                       │
+│  清洗器 Cleaners                                          │
+│  标准化 Normalizers                                       │
+│  质量校验 Quality Checkers                                │
+│  增量更新 Update Jobs                                     │
+└──────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                    Local Data Warehouse                   │
+│  Parquet: 日线行情 / 特征 / 回测面板                      │
+│  SQLite: 元数据 / 交易日历 / 账户 / 订单 / 成交 / 结果    │
+│  YAML/JSON/Markdown: 配置 / Agent 文件 / 报告摘要         │
+└──────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                       DataPortal                          │
+│  get_universe                                             │
+│  get_daily_bar                                            │
+│  get_price                                                │
+│  get_features                                             │
+│  get_index_valuation                                      │
+│  get_nav / get_premium_discount                           │
+│  get_dividends                                            │
+│  get_trading_days                                         │
+│  asof / available_date / no future data                   │
+└─────────────┬─────────────────────┬──────────────────────┘
+              │                     │
+              ▼                     ▼
+┌──────────────────────┐    ┌──────────────────────────────┐
+│ Backtest System      │    │ Paper Trading System          │
+│ Strategy             │    │ Virtual Account                │
+│ Portfolio            │    │ Virtual Position               │
+│ BacktestBroker       │    │ PaperBroker                    │
+│ Accounting           │    │ Daily Mark-to-Market           │
+│ Metrics              │    │ Account Ledger                 │
+└──────────┬───────────┘    └─────────────┬────────────────┘
+           │                              │
+           ▼                              ▼
+┌──────────────────────┐    ┌──────────────────────────────┐
+│ ETF / Fund Radar     │    │ Agent System                  │
+│ Valuation            │    │ Observe / Analyze / Decide     │
+│ Momentum             │    │ Risk Check / Execute / Reflect │
+│ Dividend             │    │ Agent Memory / Logs / Ranking  │
+│ Liquidity            │    │ Structured JSON Decisions      │
+└──────────┬───────────┘    └─────────────┬────────────────┘
+           │                              │
+           └──────────────┬───────────────┘
+                          ▼
+┌──────────────────────────────────────────────────────────┐
+│                  Reports / Push / QmtBroker               │
+│  HTML / Markdown / CSV / Parquet Reports                  │
+│  Email / Feishu CLI / Local Dashboard                     │
+│  后续：MiniQMT 模拟 / 实盘执行                            │
+└──────────────────────────────────────────────────────────┘
+3. 子系统职责拆分
+3.1 data_system
+
+职责：
+
+从 xtquant / akshare / 手工表 / 其他数据源读取数据；
+清洗字段；
+统一 symbol；
+处理交易日历；
+处理停牌、缺失、复权、净值、分红、估值可得性；
+落库；
+提供质量校验报告；
+最终只通过 DataPortal 对上层开放。
+
+核心原则：
+
+Source 负责“拿原始数据”
+Loader 负责“按业务主题拉取”
+Processor 负责“清洗标准化”
+Store 负责“存储”
+DataPortal 负责“按时间点可信读取”
+3.2 backtest
+
+职责：
+
+加载历史数据；
+调用策略生成目标仓位；
+把目标仓位转成订单；
+做风控；
+按成交模型成交；
+维护现金、持仓、成本、分红；
+每日估值；
+输出订单、成交、持仓、净值、绩效。
+
+策略不记账，策略只返回：
+
+{
+    "510300.SH": 0.30,
+    "510500.SH": 0.20,
+    "518880.SH": 0.10,
+    "cash": 0.40
+}
+3.3 sim / paper trading
+
+职责：
+
+维护内部虚拟账户；
+每天真实推进一次；
+使用当日数据更新估值；
+使用策略或 Agent 生成订单意图；
+经过风控；
+由 PaperBroker 虚拟成交；
+保存所有订单、成交、现金、持仓、收益。
+
+它和 backtest 复用：
+
+Order
+Trade
+Position
+Account
+Portfolio
+CostModel
+SlippageModel
+RiskChecker
+PerformanceAnalyzer
+
+不同点是：
+
+BacktestBroker: 历史撮合
+PaperBroker: 内部模拟撮合
+QmtBroker: 后续真实或 MiniQMT 模拟交易
+3.4 radar
+
+职责：
+
+每天把原始行情、估值、分红、流动性、折溢价变成可读信号；
+服务于人工观察、策略筛选、Agent 上下文、日报推送。
+3.5 agent
+
+职责：
+
+读取 DataPortal 和自身记忆；
+输出结构化决策 JSON；
+不得绕过风控；
+不得直接修改账户；
+不得直接调 xttrader；
+不得篡改历史收益；
+只允许写入复盘、假设、观察笔记。
+3.6 qmt execution
+
+职责：
+
+后续把内部订单对象映射到 xttrader；
+查询 MiniQMT 资产、委托、成交、持仓；
+做实盘/模拟盘状态对账；
+保留独立审计。
+4. 技术选型建议
+4.1 第一版推荐
+语言：
+  Python 3.10 或 3.11
+
+本地事务数据：
+  SQLite
+
+行情与特征时间序列：
+  Parquet + PyArrow
+
+分析查询：
+  DuckDB 可选，用于直接查询 Parquet
+
+配置：
+  YAML
+
+实验结果：
+  SQLite 元数据 + Parquet 明细
+
+报告：
+  Markdown / HTML
+
+测试：
+  pytest
+
+任务调度：
+  第一版用 scripts + crontab / Windows Task Scheduler
+  后续再考虑 APScheduler / Prefect
+4.2 SQLite 与 DuckDB 的分工
+
+建议不要二选一，而是这样分工：
+
+SQLite：
+  fund_master
+  trading_calendar
+  virtual_account
+  virtual_order
+  virtual_trade
+  virtual_account_daily
+  backtest_run
+  backtest_summary
+  数据版本、更新日志、审计日志
+
+Parquet：
+  fund_daily_bar
+  fund_features_daily
+  大规模回测结果明细
+  账户日度权益曲线
+  持仓快照
+
+DuckDB：
+  用于研究查询和报表分析
+  不作为第一版主事务库
+5. MVP 范围
+
+MVP 目标是跑通：
+
+数据更新
+  → 特征计算
+    → 规则策略回测
+      → 回测报告
+        → 同一策略进入内部模拟盘
+          → 每日账户净值可信记录
+5.1 MVP 必做
+1. fund_master
+2. trading_calendar
+3. fund_daily_bar
+4. fund_nav
+5. fund_dividend
+6. index_valuation
+7. fund_features_daily
+8. DataPortal
+9. BacktestEngine
+10. BacktestBroker
+11. PaperBroker
+12. VirtualAccount
+13. 风控模块
+14. 成本 / 滑点 / 成交额限制
+15. 5 个规则策略
+16. 回测报告
+17. 单元测试 + 集成测试 + 未来函数测试
+5.2 MVP 可暂缓
+分钟线
+tick
+真实自动下单
+复杂订单簿撮合
+Web UI
+Agent 自动复盘
+参数优化平台
+多账户实盘同步
+实时行情推送
+6. 数据仓库设计
+6.1 数据目录布局
+data/
+  raw/
+    xtquant/
+      daily_bar/
+      instrument/
+      etf_info/
+      dividend/
+    akshare/
+      nav/
+      valuation/
+      dividend/
+    manual/
+      universe_seed.csv
+      tracking_index_mapping.csv
+
+  warehouse/
+    parquet/
+      fund_daily_bar/
+        year=2024/
+        year=2025/
+        year=2026/
+      fund_minute_bar/
+      fund_features_daily/
+        feature_version=v1/
+          year=2026/
+      backtest_equity_curve/
+      backtest_position_daily/
+      paper_equity_curve/
+
+    sqlite/
+      fundlab.db
+
+  reports/
+    quality/
+    backtest/
+    paper/
+    radar/
+
+第一版不要过度分区。ETF 数量不算巨大，日线数据可以按年份分区：
+
+fund_daily_bar/year=2026/part-000.parquet
+
+这样适合一次读取多只 ETF 的面板数据。后续如果分钟线体量变大，再改为：
+
+fund_minute_bar/symbol=510300.SH/year=2026/month=05/
+6.2 数据版本与更新日志
+
+建议额外增加：
+
+CREATE TABLE data_update_log (
+    update_id           TEXT PRIMARY KEY,
+    job_name            TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    table_name          TEXT NOT NULL,
+    start_date          DATE,
+    end_date            DATE,
+    row_count           INTEGER DEFAULT 0,
+    status              TEXT NOT NULL, -- success / failed / partial
+    error_message       TEXT,
+    data_version        TEXT,
+    started_at          TIMESTAMP NOT NULL,
+    finished_at         TIMESTAMP
+);
+
+CREATE INDEX idx_data_update_log_table_time
+ON data_update_log(table_name, started_at);
+
+用途：
+
+追踪每天哪些数据更新成功；
+回测 run_id 绑定 data_version；
+出现结果异常时可以回溯数据变更。
+7. 核心数据表设计
+
+下面是逻辑表结构。实际落地时，日线和特征可以放 Parquet，但仍然应该按这些主键和约束来设计。
+
+7.1 fund_master
+
+用途：
+
+核心 universe 表；
+管理基金分类；
+判断是否纳入研究；
+避免主动基金混入；
+支持未来解决幸存者偏差。
+表结构
+CREATE TABLE fund_master (
+    symbol                  TEXT PRIMARY KEY,      -- 510300.SH
+    raw_symbol              TEXT,                  -- 原始代码
+    name                    TEXT NOT NULL,
+    exchange                TEXT NOT NULL,          -- SH / SZ / BJ
+    product_type            TEXT NOT NULL,          -- ETF / LOF / REIT / MONEY_ETF
+    management_type         TEXT NOT NULL,          -- passive_index / smart_beta / active / enhanced / fof
+    asset_class             TEXT NOT NULL,          -- equity / bond / commodity / money_market / cross_border / reits
+    category                TEXT,                   -- broad_based / sector / theme / dividend / gold / treasury_bond
+    tracking_index          TEXT,
+    tracking_index_code     TEXT,
+    fund_company            TEXT,
+    listed_date             DATE,
+    delisted_date           DATE,
+    expense_ratio           REAL,
+    custody_fee             REAL,
+    lot_size                INTEGER DEFAULT 100,
+    price_tick              REAL DEFAULT 0.001,
+    is_active               INTEGER NOT NULL DEFAULT 1,
+    include_in_universe     INTEGER NOT NULL DEFAULT 0,
+    exclusion_reason        TEXT,
+    source                  TEXT,
+    source_updated_at       TIMESTAMP,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_fund_master_universe
+ON fund_master(include_in_universe, is_active, product_type, management_type);
+
+CREATE INDEX idx_fund_master_asset_class
+ON fund_master(asset_class, category);
+
+CREATE INDEX idx_fund_master_tracking_index
+ON fund_master(tracking_index_code);
+字段约束建议
+management_type:
+  passive_index
+  smart_beta
+  passive_bond
+  passive_commodity
+  passive_money_market
+  cross_border_index
+  index_enhanced
+  active
+  fof
+  unknown
+
+asset_class:
+  equity
+  bond
+  commodity
+  money_market
+  cross_border
+  reits
+  mixed
+  unknown
+
+product_type:
+  ETF
+  LOF
+  REIT
+  MONEY_ETF
+  OTHER
+更新逻辑
+每日或每周更新：
+  1. 从 xtquant 合约基础信息拉取当前可交易品种；
+  2. 从补充源拉取 ETF / LOF 基础资料；
+  3. symbol_normalizer 标准化为 510300.SH；
+  4. 按 symbol upsert；
+  5. 不删除退市品种，只设置 is_active = 0；
+  6. include_in_universe 由规则和人工白名单共同决定；
+  7. 主动基金、FOF、无法识别管理方式的品种默认 exclude；
+  8. 每次变更写入 fund_master_audit。
+
+建议增加审计表：
+
+CREATE TABLE fund_master_audit (
+    audit_id        TEXT PRIMARY KEY,
+    symbol          TEXT NOT NULL,
+    field_name      TEXT NOT NULL,
+    old_value       TEXT,
+    new_value       TEXT,
+    reason          TEXT,
+    changed_by      TEXT,
+    changed_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+后续为解决幸存者偏差，增加：
+
+CREATE TABLE fund_master_snapshot (
+    snapshot_date            DATE NOT NULL,
+    symbol                   TEXT NOT NULL,
+    name                     TEXT NOT NULL,
+    exchange                 TEXT NOT NULL,
+    product_type             TEXT NOT NULL,
+    management_type          TEXT NOT NULL,
+    asset_class              TEXT NOT NULL,
+    category                 TEXT,
+    tracking_index_code      TEXT,
+    is_active                INTEGER NOT NULL,
+    include_in_universe      INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_date, symbol)
+);
+
+第一版可以先没有完整历史 snapshot，但所有回测报告必须写：
+
+当前回测 universe 基于当前可获得基金列表，存在幸存者偏差，结果可能偏乐观。
+7.2 trading_calendar
+
+用途：
+
+统一交易日判断；
+回测时间推进；
+T+1 成交；
+周度/月度调仓；
+避免用自然日误判。
+表结构
+CREATE TABLE trading_calendar (
+    date                    DATE PRIMARY KEY,
+    exchange                TEXT NOT NULL DEFAULT 'CN',
+    is_trading_day          INTEGER NOT NULL,
+    previous_trading_day    DATE,
+    next_trading_day        DATE,
+    is_month_end            INTEGER DEFAULT 0,
+    is_week_end             INTEGER DEFAULT 0,
+    is_quarter_end          INTEGER DEFAULT 0,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_trading_calendar_trading
+ON trading_calendar(is_trading_day, date);
+
+CREATE INDEX idx_trading_calendar_month_end
+ON trading_calendar(is_month_end, date);
+更新逻辑
+1. 优先从 xtdata.get_trading_calendar 或等价接口更新；
+2. 至少维护未来 12 个月交易日；
+3. 每次更新后重新计算 previous_trading_day / next_trading_day；
+4. 计算 is_week_end / is_month_end；
+5. 回测、模拟盘全部依赖此表，不允许自己用 pandas bdate_range 猜交易日。
+7.3 fund_daily_bar
+
+用途：
+
+日线行情核心表；
+第一版所有回测、模拟盘、特征计算都基于它。
+逻辑结构
+-- 实际可用 Parquet 存储，此处表示逻辑 schema
+CREATE TABLE fund_daily_bar (
+    date            DATE NOT NULL,
+    symbol          TEXT NOT NULL,
+    open            REAL,
+    high            REAL,
+    low             REAL,
+    close           REAL,
+    volume          REAL,
+    amount          REAL,
+    pre_close       REAL,
+    adj_factor      REAL,
+    suspended       INTEGER DEFAULT 0,
+    limit_up        REAL,
+    limit_down      REAL,
+    source          TEXT,
+    updated_at      TIMESTAMP,
+    PRIMARY KEY (date, symbol)
+);
+
+CREATE INDEX idx_fund_daily_bar_symbol_date
+ON fund_daily_bar(symbol, date);
+
+CREATE INDEX idx_fund_daily_bar_date
+ON fund_daily_bar(date);
+Parquet 字段类型建议
+date: date32
+symbol: string
+open/high/low/close/pre_close/adj_factor/limit_up/limit_down: float64
+volume: float64
+amount: float64
+suspended: bool
+source: string
+updated_at: timestamp
+更新逻辑
+每日收盘后：
+  1. 获取 universe 中所有 active symbol；
+  2. 对每个 symbol 增量下载最近 N 日，N 建议 10；
+  3. 用 symbol + date 去重；
+  4. 检查 open/high/low/close 合法性；
+  5. 检查 amount、volume 是否异常；
+  6. 检查 date 是否为交易日；
+  7. 如果该交易日无行情：
+       - 若 suspended = true，保留停牌记录；
+       - 若无法判断，写入 quality_issue；
+  8. 写入 Parquet；
+  9. 更新 data_update_log。
+质量校验
+open <= high
+low <= high
+close <= high
+close >= low
+amount >= 0
+volume >= 0
+pre_close 非空率
+重复主键检查
+缺失交易日检查
+极端涨跌幅检查
+7.4 fund_minute_bar
+
+第一版先保留目录和接口，不实现完整流程。
+
+CREATE TABLE fund_minute_bar (
+    datetime        TIMESTAMP NOT NULL,
+    date            DATE NOT NULL,
+    symbol          TEXT NOT NULL,
+    open            REAL,
+    high            REAL,
+    low             REAL,
+    close           REAL,
+    volume          REAL,
+    amount          REAL,
+    source          TEXT,
+    updated_at      TIMESTAMP,
+    PRIMARY KEY (datetime, symbol)
+);
+
+后续才加：
+
+分钟线 VWAP
+盘中成交模拟
+盘中雷达
+真实交易前检查
+7.5 fund_nav
+
+用途：
+
+ETF / LOF / 跨境 ETF 折溢价；
+QDII / 跨境 ETF 风控；
+净值与收盘价偏离分析。
+表结构
+CREATE TABLE fund_nav (
+    date                    DATE NOT NULL,
+    symbol                  TEXT NOT NULL,
+    nav                     REAL,
+    iopv                    REAL,
+    close                   REAL,
+    premium_discount        REAL,
+    estimate_nav            REAL,
+    available_date          DATE,
+    source                  TEXT,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (date, symbol)
+);
+
+CREATE INDEX idx_fund_nav_symbol_date
+ON fund_nav(symbol, date);
+
+CREATE INDEX idx_fund_nav_available
+ON fund_nav(symbol, available_date);
+关键逻辑
+
+premium_discount 计算：
+
+premium_discount = close / nav - 1
+
+如果是跨境 ETF：
+
+优先使用 estimate_nav / IOPV；
+如果 nav 发布滞后，则 DataPortal 必须按 available_date 读取；
+回测中不能在 T 日使用 T 日之后才公布的 NAV。
+更新逻辑
+1. 每日更新 close；
+2. nav / iopv / estimate_nav 从可用数据源拉取；
+3. 对于晚公布数据，available_date 必须晚于或等于 date；
+4. DataPortal 查询时只允许 available_date <= signal_date；
+5. 缺失 NAV 的基金可以参与普通价格策略，但不能参与 premium_discount 风控通过。
+7.6 fund_dividend
+
+用途：
+
+现金分红入账；
+总收益曲线；
+股息率；
+分红稳定性；
+除权影响。
+表结构
+CREATE TABLE fund_dividend (
+    dividend_id             TEXT PRIMARY KEY,
+    symbol                  TEXT NOT NULL,
+    announcement_date       DATE,
+    ex_dividend_date        DATE NOT NULL,
+    record_date             DATE,
+    payment_date            DATE,
+    dividend_per_share      REAL NOT NULL,
+    dividend_type           TEXT,       -- cash / reinvest / other
+    tax_rate                REAL DEFAULT 0,
+    available_date          DATE,
+    source                  TEXT,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_fund_dividend_symbol_exdate
+ON fund_dividend(symbol, ex_dividend_date);
+
+CREATE INDEX idx_fund_dividend_payment
+ON fund_dividend(payment_date);
+
+CREATE UNIQUE INDEX uq_fund_dividend_event
+ON fund_dividend(symbol, ex_dividend_date, dividend_per_share, dividend_type);
+分红处理建议
+
+第一版实现：
+
+现金分红进入 cash。
+
+更可信的做法：
+
+record_date:
+  确定有权获得分红的持仓数量。
+
+ex_dividend_date:
+  价格自然除权，不额外调整持仓成本；
+  记录 dividend_receivable。
+
+payment_date:
+  cash += dividend_per_share * eligible_quantity * (1 - tax_rate)
+
+如果数据源没有完整 payment_date，MVP 可以：
+
+默认 payment_date = ex_dividend_date
+
+但必须在报告中标记：
+
+分红到账日使用简化假设。
+
+建议增加：
+
+CREATE TABLE dividend_receivable (
+    receivable_id       TEXT PRIMARY KEY,
+    account_id          TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    record_date         DATE,
+    ex_dividend_date    DATE NOT NULL,
+    payment_date        DATE NOT NULL,
+    quantity            REAL NOT NULL,
+    dividend_per_share  REAL NOT NULL,
+    amount              REAL NOT NULL,
+    status              TEXT NOT NULL, -- pending / paid
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    paid_at             TIMESTAMP
+);
+7.7 index_valuation
+
+用途：
+
+低估 + 高股息分析核心；
+红利低估策略；
+估值雷达；
+Agent 观察上下文。
+表结构
+CREATE TABLE index_valuation (
+    date                                DATE NOT NULL,
+    index_code                          TEXT NOT NULL,
+    index_name                          TEXT,
+    pe_ttm                              REAL,
+    pb                                  REAL,
+    ps                                  REAL,
+    dividend_yield                      REAL,
+    roe                                 REAL,
+    pe_percentile_3y                    REAL,
+    pe_percentile_5y                    REAL,
+    pb_percentile_3y                    REAL,
+    pb_percentile_5y                    REAL,
+    dividend_yield_percentile_3y        REAL,
+    dividend_yield_percentile_5y        REAL,
+    available_date                      DATE NOT NULL,
+    source                              TEXT,
+    updated_at                          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (date, index_code)
+);
+
+CREATE INDEX idx_index_valuation_available
+ON index_valuation(index_code, available_date, date);
+
+CREATE INDEX idx_index_valuation_date
+ON index_valuation(date);
+关键规则
+date:
+  指估值对应的市场日期。
+
+available_date:
+  指系统在回测中允许看到这条数据的日期。
+
+DataPortal 必须这样查：
+
+SELECT *
+FROM index_valuation
+WHERE index_code = :index_code
+  AND date <= :signal_date
+  AND available_date <= :signal_date
+ORDER BY date DESC
+LIMIT 1;
+
+绝对不要这样查：
+
+WHERE date = :signal_date
+
+因为很多估值数据并不是当天收盘立刻可得。
+
+7.8 fund_features_daily
+
+用途：
+
+预计算特征；
+服务 ETF 雷达、规则策略、Agent、回测、推送。
+表结构
+CREATE TABLE fund_features_daily (
+    date                        DATE NOT NULL,
+    symbol                      TEXT NOT NULL,
+    feature_version             TEXT NOT NULL DEFAULT 'v1',
+
+    ret_1d                      REAL,
+    ret_5d                      REAL,
+    ret_20d                     REAL,
+    ret_60d                     REAL,
+    ret_120d                    REAL,
+
+    volatility_20d              REAL,
+    volatility_60d              REAL,
+    max_drawdown_60d            REAL,
+
+    amount_avg_20d              REAL,
+    amount_avg_60d              REAL,
+    amount_percentile_60d       REAL,
+
+    turnover_score              REAL,
+    momentum_score              REAL,
+    valuation_score             REAL,
+    dividend_score              REAL,
+    liquidity_score             REAL,
+    premium_discount_score      REAL,
+    risk_penalty_score          REAL,
+    total_score                 REAL,
+
+    premium_discount            REAL,
+    dividend_yield_12m          REAL,
+    tracking_index_code         TEXT,
+
+    available_date              DATE NOT NULL,
+    source_data_version         TEXT,
+    updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (date, symbol, feature_version)
+);
+
+CREATE INDEX idx_fund_features_symbol_date
+ON fund_features_daily(symbol, date, feature_version);
+
+CREATE INDEX idx_fund_features_date_score
+ON fund_features_daily(date, total_score);
+
+CREATE INDEX idx_fund_features_available
+ON fund_features_daily(symbol, available_date);
+特征计算规则
+ret_20d:
+  close_t / close_t-20 - 1
+
+volatility_20d:
+  std(daily_return, 20) * sqrt(252)
+
+max_drawdown_60d:
+  rolling 60 日最大回撤
+
+amount_avg_20d:
+  rolling mean(amount, 20)
+
+valuation_score:
+  来自 tracking_index_code 对应的 index_valuation
+  只使用 available_date <= date 的估值
+
+premium_discount_score:
+  折价适当加分
+  高溢价扣分
+  缺失则中性或剔除，具体由策略配置决定
+
+total_score:
+  不直接硬编码在策略里；
+  由 features 配置生成；
+  便于不同策略复用。
+8. DataPortal 设计
+
+DataPortal 是整个系统最关键的边界。
+
+8.1 核心原则
+策略、回测、模拟盘、Agent 不允许直接访问 xtquant。
+策略、回测、模拟盘、Agent 不允许直接读 raw 数据。
+策略、回测、模拟盘、Agent 原则上也不直接读 SQLite / Parquet。
+所有读取都走 DataPortal。
+8.2 推荐接口
+from typing import Optional, Sequence, Literal
+import pandas as pd
+
+class DataPortal:
+    def __init__(self, store, calendar, config):
+        self.store = store
+        self.calendar = calendar
+        self.config = config
+
+    def get_universe(
+        self,
+        date: str,
+        filters: Optional[dict] = None,
+        asof: Optional[str] = None,
+    ) -> list[str]:
+        """
+        返回 date 当天可投资 universe。
+        必须满足:
+        - listed_date <= date
+        - delisted_date is null or delisted_date > date
+        - include_in_universe = 1
+        - is_active 或 point-in-time active
+        - filters 条件
+        """
+
+    def get_fund_master(
+        self,
+        symbols: Optional[Sequence[str]] = None,
+        date: Optional[str] = None,
+        point_in_time: bool = True,
+    ) -> pd.DataFrame:
+        ...
+
+    def get_daily_bar(
+        self,
+        symbols: Sequence[str],
+        start_date: str,
+        end_date: str,
+        fields: Optional[Sequence[str]] = None,
+        adjusted: Literal["none", "front", "back"] = "none",
+        fill_method: Literal["none", "previous_close"] = "none",
+    ) -> pd.DataFrame:
+        """
+        返回 MultiIndex: date, symbol。
+        默认不填充缺失，避免隐藏停牌和数据问题。
+        """
+
+    def get_price(
+        self,
+        symbol: str,
+        date: str,
+        field: str = "close",
+        adjusted: Literal["none", "front", "back"] = "none",
+        asof: Optional[str] = None,
+        allow_previous: bool = False,
+    ) -> Optional[float]:
+        ...
+
+    def get_open_price_for_execution(
+        self,
+        symbol: str,
+        execution_date: str,
+    ) -> Optional[float]:
+        """
+        Broker 使用，不给 Strategy 使用。
+        """
+
+    def get_features(
+        self,
+        symbols: Sequence[str],
+        date: str,
+        feature_version: str = "v1",
+        asof: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        只返回 available_date <= asof/date 的特征。
+        """
+
+    def get_index_valuation(
+        self,
+        index_code: str,
+        date: str,
+        asof: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        使用 date <= signal_date 且 available_date <= asof 的最近估值。
+        """
+
+    def get_nav(
+        self,
+        symbol: str,
+        date: str,
+        asof: Optional[str] = None,
+    ) -> Optional[dict]:
+        ...
+
+    def get_premium_discount(
+        self,
+        symbol: str,
+        date: str,
+        asof: Optional[str] = None,
+    ) -> Optional[float]:
+        ...
+
+    def get_dividends(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        asof: Optional[str] = None,
+    ) -> pd.DataFrame:
+        ...
+
+    def get_trading_days(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> list[str]:
+        ...
+
+    def next_trading_day(self, date: str) -> Optional[str]:
+        ...
+
+    def previous_trading_day(self, date: str) -> Optional[str]:
+        ...
+
+    def is_trading_day(self, date: str) -> bool:
+        ...
+8.3 asof 语义
+
+DataPortal 所有与估值、净值、分红、特征相关的接口都要支持：
+
+asof
+
+默认：
+
+asof = date
+
+但回测中建议显式传入：
+
+data_portal.get_features(symbols, date=signal_date, asof=signal_date)
+
+含义：
+
+站在 signal_date 当天收盘后，只能看到 available_date <= signal_date 的数据。
+8.4 缺失值策略
+
+不要默默填充所有缺失。推荐分层：
+
+价格缺失：
+  - 策略读取时默认返回缺失；
+  - 估值时允许用 previous_close 估值，但必须标记 stale_price = true；
+  - 成交时不允许用 previous_close 成交。
+
+估值缺失：
+  - 红利低估策略应剔除；
+  - 普通动量策略可以忽略估值字段。
+
+NAV 缺失：
+  - 跨境 ETF 折溢价风控无法通过；
+  - 非跨境 ETF 可根据配置放行。
+
+特征缺失：
+  - 低于 warmup window 的品种不参与排序；
+  - 不允许填 0 后排序。
+9. 数据系统模块拆分
+
+建议目录：
+
+fundlab/
+  data/
+    sources/
+      base.py
+      xtquant_source.py
+      akshare_source.py
+      manual_source.py
+
+    loaders/
+      fund_universe_loader.py
+      bar_loader.py
+      nav_loader.py
+      dividend_loader.py
+      index_valuation_loader.py
+      calendar_loader.py
+
+    processors/
+      symbol_normalizer.py
+      calendar_processor.py
+      adjustment_processor.py
+      quality_checker.py
+      universe_classifier.py
+      feature_processor.py
+
+    storage/
+      parquet_store.py
+      sqlite_store.py
+      metadata_store.py
+      data_update_log.py
+
+    portal/
+      data_portal.py
+      query_context.py
+      exceptions.py
+9.1 SourceAdapter
+class MarketDataSource:
+    name: str
+
+    def get_instruments(self) -> list[dict]:
+        raise NotImplementedError
+
+    def download_daily_bar(self, symbols, start_date, end_date) -> None:
+        raise NotImplementedError
+
+    def get_daily_bar(self, symbols, start_date, end_date) -> "pd.DataFrame":
+        raise NotImplementedError
+
+    def get_trading_calendar(self, start_date, end_date) -> "pd.DataFrame":
+        raise NotImplementedError
+9.2 xtquant_source.py
+
+职责：
+
+连接 MiniQMT；
+拉取交易日历；
+拉取合约基础信息；
+下载并读取日线；
+读取 ETF 相关信息；
+后续订阅实时行情。
+
+注意事项：
+
+1. xtquant 依赖 MiniQMT 环境；
+2. 券商版本差异可能导致字段或行为差异；
+3. 不要让 DataPortal 直接 import xtquant；
+4. xtquant 连接失败时，不应该影响本地历史回测；
+5. 所有 xtquant 原始返回保留 raw 快照，便于排查字段变化。
+
+EasyXT 项目也强调过 QMT / xtquant 版本与券商发布节奏可能存在差异，因此你自己的系统要把 xtquant 封装在 adapter 内，避免核心回测、模拟盘、Agent 直接依赖具体版本行为。
+
+10. 回测系统设计
+10.1 核心分层
+Strategy
+  只负责产生 target_weights
+
+Portfolio
+  管理当前持仓、市值、现金、权重
+
+Broker / Execution
+  根据订单和成交模型生成 Trade
+
+Accounting
+  处理现金、持仓、费用、分红、成交入账
+
+Performance
+  计算净值、收益、回撤、夏普、换手、成本
+
+Recorder
+  保存所有明细
+
+目录：
+
+fundlab/backtest/
+  engine.py
+  strategy.py
+  context.py
+  broker.py
+  account.py
+  portfolio.py
+  position.py
+  order.py
+  trade.py
+  cost.py
+  slippage.py
+  execution.py
+  accounting.py
+  metrics.py
+  recorder.py
+  schedule.py
+
+RQAlpha 的模块化思想值得参考，尤其是账户持仓、分析器、风控、调度、模拟撮合、交易成本这些独立模块；但第一版不建议直接套用它，因为你要的是面向 xtquant + 场内基金 + Agent 的轻量系统。
+
+10.2 基础对象
+OrderIntent
+
+策略在 T 日收盘后生成的是意图，不是已经成交的订单。
+
+@dataclass
+class OrderIntent:
+    intent_id: str
+    account_id: str
+    strategy_id: str
+    signal_date: str
+    execution_date: str
+    symbol: str
+    target_weight: float
+    reason: str = ""
+Order
+
+由 ExecutionPlanner 在成交日前生成。
+
+@dataclass
+class Order:
+    order_id: str
+    account_id: str
+    symbol: str
+    side: Literal["buy", "sell"]
+    order_type: Literal["target_weight", "target_quantity", "market", "limit"]
+    target_weight: Optional[float]
+    target_quantity: Optional[int]
+    quantity: int
+    signal_date: str
+    execution_date: str
+    status: Literal["pending", "filled", "partial_filled", "rejected", "cancelled"]
+    reason: str = ""
+    reject_reason: Optional[str] = None
+Trade
+@dataclass
+class Trade:
+    trade_id: str
+    order_id: str
+    account_id: str
+    symbol: str
+    side: Literal["buy", "sell"]
+    datetime: str
+    price: float
+    quantity: int
+    amount: float
+    fee: float
+    slippage: float
+Position
+@dataclass
+class Position:
+    symbol: str
+    quantity: int
+    avg_cost: float
+    market_price: float
+    market_value: float
+    unrealized_pnl: float
+Account
+@dataclass
+class Account:
+    account_id: str
+    initial_cash: float
+    cash: float
+    positions: dict[str, Position]
+    total_asset: float
+    nav: float
+11. 回测主流程
+11.1 推荐时序
+
+默认采用：
+
+T 日收盘后生成信号
+T+1 日开盘成交
+每日收盘价估值
+
+这能避免最常见的错误：
+
+同一天收盘价既生成信号又作为成交价。
+11.2 事件流
+初始化：
+  1. 加载配置
+  2. 加载交易日历
+  3. 初始化账户
+  4. 初始化策略
+  5. 初始化 Broker / CostModel / SlippageModel / RiskChecker
+  6. 创建 run_id
+  7. 记录 config_hash / data_version / git_commit
+
+for date in trading_days:
+
+  [盘前 / 开盘]
+  1. 处理上一个 signal_date 生成、计划在 date 执行的订单意图
+  2. 用 date 的 open 价格进行模拟成交
+  3. 先卖后买
+  4. 检查停牌、涨跌停、成交额限制、现金、最小交易单位
+  5. 生成 Trade
+  6. Accounting 更新现金与持仓
+
+  [日内忽略，MVP 不做]
+
+  [收盘]
+  7. 使用 close 做 mark-to-market
+  8. 处理分红应收 / 到账
+  9. 记录 account_daily
+  10. 记录 position_daily
+
+  [收盘后]
+  11. 如果 date 是调仓日：
+        a. Strategy.on_rebalance(date, data_portal, context)
+        b. 返回 target_weights
+        c. 检查权重合法性
+        d. 风控预检查
+        e. 生成 OrderIntent
+        f. execution_date = next_trading_day(date)
+        g. 保存 pending intents
+11.3 伪代码
+class BacktestEngine:
+    def run(self):
+        trading_days = self.data_portal.get_trading_days(
+            self.start_date, self.end_date
+        )
+
+        for date in trading_days:
+            self.current_date = date
+
+            # 1. 执行此前生成、今日成交的订单
+            intents = self.recorder.load_order_intents(execution_date=date)
+            if intents:
+                orders = self.execution_planner.create_orders(
+                    intents=intents,
+                    account=self.account,
+                    execution_date=date,
+                    data_portal=self.data_portal,
+                )
+
+                orders = self.risk_checker.check_orders(
+                    orders=orders,
+                    account=self.account,
+                    date=date,
+                    data_portal=self.data_portal,
+                )
+
+                trades = self.broker.execute_orders(
+                    orders=orders,
+                    account=self.account,
+                    date=date,
+                    data_portal=self.data_portal,
+                )
+
+                self.accounting.apply_trades(self.account, trades)
+                self.recorder.record_orders(orders)
+                self.recorder.record_trades(trades)
+
+            # 2. 分红处理
+            dividend_events = self.accounting.process_dividends(
+                account=self.account,
+                date=date,
+                data_portal=self.data_portal,
+            )
+            self.recorder.record_account_events(dividend_events)
+
+            # 3. 收盘估值
+            self.accounting.mark_to_market(
+                account=self.account,
+                date=date,
+                data_portal=self.data_portal,
+                price_field="close",
+            )
+
+            self.recorder.record_account_daily(date, self.account)
+            self.recorder.record_position_daily(date, self.account.positions)
+
+            # 4. 收盘后生成下一交易日订单意图
+            if self.schedule.is_rebalance_day(date):
+                context = self.build_context(date)
+                target_weights = self.strategy.on_rebalance(
+                    date=date,
+                    data_portal=self.data_portal,
+                    context=context,
+                )
+
+                target_weights = self.normalize_target_weights(target_weights)
+
+                checked_targets = self.risk_checker.check_target_weights(
+                    target_weights=target_weights,
+                    account=self.account,
+                    date=date,
+                    data_portal=self.data_portal,
+                )
+
+                next_date = self.data_portal.next_trading_day(date)
+                intents = self.execution_planner.create_order_intents(
+                    account_id=self.account.account_id,
+                    strategy_id=self.strategy.strategy_id,
+                    signal_date=date,
+                    execution_date=next_date,
+                    target_weights=checked_targets,
+                )
+
+                self.recorder.record_order_intents(intents)
+
+        self.metrics = self.performance_analyzer.analyze(self.recorder)
+        self.recorder.record_metrics(self.metrics)
+12. 目标仓位到订单
+12.1 目标权重合法性
+
+规则：
+
+所有 symbol 权重 >= 0
+cash 权重 >= 0
+sum(symbol_weights) + cash <= 1.0001
+如果未传 cash，则 cash = 1 - sum(symbol_weights)
+单品种不超过 max_weight_per_symbol
+不在 universe 的 symbol 拒绝
+停牌品种不能买入，可以继续持有
+12.2 订单生成
+
+推荐流程：
+
+1. 在 T 日收盘后只保存 target_weight intent。
+2. T+1 日开盘时，用 open price 计算目标股数。
+3. 当前持仓与目标股数差额形成订单。
+4. 卖单先执行，买单后执行。
+5. 买单根据现金不足情况等比例缩放。
+6. 买入数量按 lot_size 向下取整。
+7. 卖出数量不能超过当前持仓。
+目标股数计算
+target_value = account_total_asset_at_execution * target_weight
+target_quantity_raw = target_value / execution_price
+target_quantity = floor(target_quantity_raw / lot_size) * lot_size
+差额订单
+delta_quantity = target_quantity - current_quantity
+
+delta_quantity > 0:
+  buy
+
+delta_quantity < 0:
+  sell
+12.3 现金权重
+
+不要对 cash 生成订单。cash 是结果：
+
+cash = total_asset - market_value_after_trades - fees
+13. 成交模型、费用模型、滑点模型
+
+LEAN / QuantConnect 把手续费、滑点、成交、容量等作为 reality models，这个思想很适合你；尤其 ETF 里有很多低流动性品种，默认假设“高度流动”会让回测失真。
+
+13.1 配置文件
+execution:
+  model: realistic_daily
+  price_field: open
+  trade_timing: next_open
+  sell_first: true
+  round_lot: true
+  allow_partial_fill: true
+
+cost:
+  commission_rate: 0.00003
+  min_commission: 0
+  stamp_tax: 0
+  transfer_fee: 0
+
+slippage:
+  base_bps: 2
+  low_liquidity_penalty_bps: 5
+  low_liquidity_amount_threshold: 30000000
+  max_participation_rate: 0.05
+
+risk:
+  allow_universe_only: true
+  max_weight_per_symbol: 0.25
+  max_total_equity_weight: 1.00
+  min_cash_weight: 0.02
+  min_avg_amount_20d: 30000000
+  max_daily_turnover: 0.50
+  max_premium_abs: 0.03
+  max_single_order_participation: 0.05
+13.2 simple_close
+
+虽然名字叫 simple_close，但根据你的原则，建议实际使用：
+
+信号：T close
+成交：T+1 open
+估值：每日 close
+
+模型：
+
+成交价 = T+1 open
+手续费 = commission_rate * amount
+滑点 = 0
+无成交额限制
+停牌不成交
+
+用途：
+
+验证回测引擎主流程。
+13.3 realistic_daily
+
+模型：
+
+成交价 = T+1 open * slippage_adjustment
+手续费 = max(amount * commission_rate, min_commission)
+成交额限制 = 当日 amount * max_participation_rate
+不能买入 suspended = true 的品种
+不能买入 premium_abs 超限的跨境 ETF
+低流动性产品增加滑点
+
+买入：
+
+fill_price = open * (1 + slippage_bps / 10000)
+
+卖出：
+
+fill_price = open * (1 - slippage_bps / 10000)
+
+成交量限制：
+
+max_trade_amount = daily_amount * max_participation_rate
+requested_amount = abs(quantity * fill_price)
+
+if requested_amount > max_trade_amount:
+    partial fill or reject
+
+第一版建议：
+
+allow_partial_fill = true
+
+并记录：
+
+partial_fill_reason = "participation_limit"
+13.4 conservative
+
+模型：
+
+基础滑点更高；
+低流动性惩罚更高；
+折溢价异常直接拒绝；
+成交额限制更严格；
+开盘价异常时改用更差价格。
+
+示例：
+
+execution:
+  model: conservative
+
+slippage:
+  base_bps: 5
+  low_liquidity_penalty_bps: 10
+  max_participation_rate: 0.02
+
+risk:
+  max_premium_abs: 0.02
+
+用途：
+
+压力测试策略是否只在理想撮合下有效。
+14. 风控模块设计
+
+目录：
+
+fundlab/risk/
+  base.py
+  universe_check.py
+  position_limit.py
+  liquidity_check.py
+  turnover_check.py
+  premium_discount_check.py
+  drawdown_control.py
+  cash_check.py
+  cooldown_check.py
+  risk_engine.py
+14.1 RiskChecker 接口
+class RiskCheckResult:
+    def __init__(self, passed: bool, adjusted_order=None, reason=None):
+        self.passed = passed
+        self.adjusted_order = adjusted_order
+        self.reason = reason
+
+class RiskRule:
+    name: str
+
+    def check_order(self, order, account, date, data_portal) -> RiskCheckResult:
+        raise NotImplementedError
+
+    def check_target_weights(self, target_weights, account, date, data_portal):
+        return target_weights
+14.2 第一版风控规则
+UniverseCheck
+如果 allow_universe_only = true：
+  symbol 必须在 get_universe(date) 返回结果中。
+PositionLimit
+单只 ETF 目标权重 <= max_weight_per_symbol
+股票类 ETF 总权重 <= max_total_equity_weight
+现金权重 >= min_cash_weight
+LiquidityCheck
+amount_avg_20d >= min_avg_amount_20d
+单笔订单成交金额 <= 当日成交额 * max_single_order_participation
+TurnoverCheck
+daily_turnover = sum(abs(trade_amount)) / total_asset
+daily_turnover <= max_daily_turnover
+
+如果超过：
+
+按比例缩放订单；
+或者直接拒单。
+
+MVP 建议：
+
+回测中缩放；
+模拟盘中拒绝并记录。
+PremiumDiscountCheck
+
+尤其针对跨境 ETF：
+
+abs(premium_discount) <= max_premium_abs
+
+如果缺失：
+
+cross_border ETF 默认拒绝买入；
+已有持仓允许卖出。
+DrawdownControl
+
+第一版先保留接口，不默认启用。
+
+账户回撤超过阈值：
+  降低风险资产权重；
+  或暂停新增买入。
+15. 回测结果记录设计
+15.1 backtest_run
+CREATE TABLE backtest_run (
+    run_id              TEXT PRIMARY KEY,
+    strategy_id         TEXT NOT NULL,
+    strategy_name       TEXT,
+    start_date          DATE NOT NULL,
+    end_date            DATE NOT NULL,
+    initial_cash        REAL NOT NULL,
+    benchmark_symbol    TEXT,
+    config_json         TEXT,
+    config_hash         TEXT,
+    data_version        TEXT,
+    code_version        TEXT,
+    universe_version    TEXT,
+    status              TEXT NOT NULL,
+    warning_text        TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at         TIMESTAMP
+);
+
+CREATE INDEX idx_backtest_run_strategy
+ON backtest_run(strategy_id, start_date, end_date);
+15.2 backtest_account_daily
+CREATE TABLE backtest_account_daily (
+    run_id                  TEXT NOT NULL,
+    date                    DATE NOT NULL,
+    cash                    REAL NOT NULL,
+    market_value            REAL NOT NULL,
+    total_asset             REAL NOT NULL,
+    nav                     REAL NOT NULL,
+    daily_return            REAL,
+    cumulative_return       REAL,
+    drawdown                REAL,
+    turnover                REAL,
+    cost                    REAL,
+    PRIMARY KEY (run_id, date)
+);
+
+CREATE INDEX idx_backtest_account_daily_date
+ON backtest_account_daily(date);
+15.3 backtest_order
+CREATE TABLE backtest_order (
+    order_id            TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL,
+    account_id          TEXT NOT NULL,
+    signal_date         DATE NOT NULL,
+    execution_date      DATE NOT NULL,
+    symbol              TEXT NOT NULL,
+    side                TEXT NOT NULL,
+    order_type          TEXT NOT NULL,
+    target_weight       REAL,
+    target_quantity     INTEGER,
+    quantity            INTEGER,
+    status              TEXT NOT NULL,
+    reason              TEXT,
+    reject_reason       TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_backtest_order_run_date
+ON backtest_order(run_id, execution_date);
+
+CREATE INDEX idx_backtest_order_symbol
+ON backtest_order(symbol);
+15.4 backtest_trade
+CREATE TABLE backtest_trade (
+    trade_id            TEXT PRIMARY KEY,
+    order_id            TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    account_id          TEXT NOT NULL,
+    datetime            TIMESTAMP NOT NULL,
+    date                DATE NOT NULL,
+    symbol              TEXT NOT NULL,
+    side                TEXT NOT NULL,
+    price               REAL NOT NULL,
+    quantity            INTEGER NOT NULL,
+    amount              REAL NOT NULL,
+    fee                 REAL NOT NULL,
+    slippage            REAL NOT NULL,
+    execution_model     TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_backtest_trade_run_date
+ON backtest_trade(run_id, date);
+
+CREATE INDEX idx_backtest_trade_symbol
+ON backtest_trade(symbol);
+15.5 backtest_position_daily
+
+建议 Parquet 存储，逻辑结构：
+
+CREATE TABLE backtest_position_daily (
+    run_id              TEXT NOT NULL,
+    date                DATE NOT NULL,
+    symbol              TEXT NOT NULL,
+    quantity            INTEGER NOT NULL,
+    avg_cost            REAL,
+    market_price        REAL,
+    market_value        REAL,
+    weight              REAL,
+    unrealized_pnl      REAL,
+    PRIMARY KEY (run_id, date, symbol)
+);
+15.6 backtest_metrics
+CREATE TABLE backtest_metrics (
+    run_id                      TEXT PRIMARY KEY,
+    cumulative_return           REAL,
+    annualized_return           REAL,
+    annualized_volatility       REAL,
+    sharpe                      REAL,
+    calmar                      REAL,
+    max_drawdown                REAL,
+    win_rate                    REAL,
+    turnover                    REAL,
+    trade_count                 INTEGER,
+    total_cost                  REAL,
+    benchmark_return            REAL,
+    excess_return               REAL,
+    max_drawdown_recovery_days  INTEGER,
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+16. 模拟盘系统设计
+16.1 模拟盘定位
+
+模拟盘不是 MiniQMT 模拟账户的替代 UI，而是你的内部可审计账户系统。
+
+MiniQMT 模拟账户：
+  真实接口测试；
+  少数策略验证报单链路；
+  后续实盘执行通道。
+
+内部虚拟账户：
+  每个策略 / Agent 一个账户；
+  可并行运行；
+  可完全审计；
+  不依赖 MiniQMT 账户数量；
+  与回测账务模型一致。
+
+vn.py 的本地仿真、组合管理、风险管理、事件引擎、数据库适配等思想值得参考；但第一版不建议引入完整 vn.py，因为你的日线 ETF 实验平台不需要 GUI、多网关、高频事件引擎这些复杂度。
+
+16.2 模拟盘目录
+fundlab/sim/
+  paper_account.py
+  paper_broker.py
+  paper_engine.py
+  daily_runner.py
+  account_service.py
+  reconciliation.py
+16.3 virtual_account
+CREATE TABLE virtual_account (
+    account_id          TEXT PRIMARY KEY,
+    account_name        TEXT,
+    agent_id            TEXT,
+    strategy_id         TEXT,
+    initial_cash        REAL NOT NULL,
+    current_cash        REAL NOT NULL,
+    nav                 REAL NOT NULL DEFAULT 1.0,
+    total_asset         REAL NOT NULL,
+    status              TEXT NOT NULL, -- active / paused / closed
+    broker_type         TEXT NOT NULL DEFAULT 'paper',
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_virtual_account_agent
+ON virtual_account(agent_id);
+
+CREATE INDEX idx_virtual_account_strategy
+ON virtual_account(strategy_id);
+16.4 virtual_position
+
+建议拆成当前持仓和日度快照。
+
+当前持仓
+CREATE TABLE virtual_position_current (
+    account_id          TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    quantity            INTEGER NOT NULL,
+    avg_cost            REAL NOT NULL,
+    market_price        REAL,
+    market_value        REAL,
+    weight              REAL,
+    unrealized_pnl      REAL,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account_id, symbol)
+);
+日度快照
+CREATE TABLE virtual_position_daily (
+    date                DATE NOT NULL,
+    account_id          TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    quantity            INTEGER NOT NULL,
+    avg_cost            REAL NOT NULL,
+    market_price        REAL,
+    market_value        REAL,
+    weight              REAL,
+    unrealized_pnl      REAL,
+    PRIMARY KEY (date, account_id, symbol)
+);
+
+CREATE INDEX idx_virtual_position_daily_account_date
+ON virtual_position_daily(account_id, date);
+16.5 virtual_order
+CREATE TABLE virtual_order (
+    order_id            TEXT PRIMARY KEY,
+    account_id          TEXT NOT NULL,
+    agent_id            TEXT,
+    strategy_id         TEXT,
+    datetime            TIMESTAMP NOT NULL,
+    signal_date         DATE,
+    execution_date      DATE,
+    symbol              TEXT NOT NULL,
+    side                TEXT,
+    order_type          TEXT NOT NULL, -- target_weight / target_quantity / market / limit
+    target_weight       REAL,
+    target_quantity     INTEGER,
+    quantity            INTEGER,
+    price_type          TEXT,
+    limit_price         REAL,
+    status              TEXT NOT NULL, -- pending / filled / partial_filled / rejected / cancelled
+    reason              TEXT,
+    reject_reason       TEXT,
+    decision_id         TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_virtual_order_account_date
+ON virtual_order(account_id, execution_date);
+
+CREATE INDEX idx_virtual_order_status
+ON virtual_order(status);
+
+CREATE INDEX idx_virtual_order_symbol
+ON virtual_order(symbol);
+16.6 virtual_trade
+CREATE TABLE virtual_trade (
+    trade_id            TEXT PRIMARY KEY,
+    order_id            TEXT NOT NULL,
+    account_id          TEXT NOT NULL,
+    datetime            TIMESTAMP NOT NULL,
+    date                DATE NOT NULL,
+    symbol              TEXT NOT NULL,
+    side                TEXT NOT NULL,
+    price               REAL NOT NULL,
+    quantity            INTEGER NOT NULL,
+    amount              REAL NOT NULL,
+    fee                 REAL NOT NULL,
+    slippage            REAL NOT NULL,
+    execution_model     TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_virtual_trade_account_date
+ON virtual_trade(account_id, date);
+
+CREATE INDEX idx_virtual_trade_order
+ON virtual_trade(order_id);
+16.7 virtual_account_daily
+CREATE TABLE virtual_account_daily (
+    date                    DATE NOT NULL,
+    account_id              TEXT NOT NULL,
+    cash                    REAL NOT NULL,
+    market_value            REAL NOT NULL,
+    total_asset             REAL NOT NULL,
+    nav                     REAL NOT NULL,
+    daily_return            REAL,
+    cumulative_return       REAL,
+    drawdown                REAL,
+    turnover                REAL,
+    total_cost              REAL,
+    benchmark_return        REAL,
+    excess_return           REAL,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (date, account_id)
+);
+
+CREATE INDEX idx_virtual_account_daily_account
+ON virtual_account_daily(account_id, date);
+16.8 account_event_ledger
+
+强烈建议加事件流水。
+
+CREATE TABLE account_event_ledger (
+    event_id            TEXT PRIMARY KEY,
+    account_id          TEXT NOT NULL,
+    date                DATE NOT NULL,
+    datetime            TIMESTAMP NOT NULL,
+    event_type          TEXT NOT NULL,
+    symbol              TEXT,
+    amount              REAL,
+    quantity            INTEGER,
+    cash_before         REAL,
+    cash_after          REAL,
+    description         TEXT,
+    ref_id              TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_account_event_ledger_account_date
+ON account_event_ledger(account_id, date);
+
+事件类型：
+
+trade_buy
+trade_sell
+commission
+dividend_receivable
+dividend_paid
+mark_to_market
+cash_adjustment
+order_rejected
+risk_violation
+16.9 模拟盘每日流程
+T 日收盘后：
+
+1. update_daily_bars.py
+2. update_nav.py
+3. update_dividend.py
+4. update_index_valuation.py
+5. compute_features.py
+6. paper_engine 读取所有 active account
+7. 对每个 account:
+     a. 用 close 估值
+     b. 处理分红
+     c. 判断是否调仓
+     d. 调用 strategy 或 agent
+     e. 生成 target_weights / order intents
+     f. 风控
+     g. 写入 virtual_order pending，execution_date = T+1
+8. 生成日报
+
+T+1 开盘后或 T+1 收盘后补数据时：
+
+1. 读取 execution_date = today 的 pending orders
+2. 使用 today open 或实际行情快照成交
+3. 更新 virtual_trade
+4. 更新 virtual_position_current
+5. 更新 virtual_account
+6. 收盘后 mark-to-market
+7. 写 virtual_account_daily
+
+第一版可以做“日终模拟盘”：
+
+T+1 收盘后拿到 T+1 open 数据，再补记 T+1 开盘成交。
+
+优点：
+
+不需要实时行情；
+收益曲线可信；
+和回测完全一致。
+
+缺点：
+
+不是实时盘中模拟。
+
+这是合理取舍。
+
+17. 第一批策略设计
+
+所有策略都继承：
+
+class Strategy:
+    strategy_id: str
+
+    def on_rebalance(self, date, data_portal, context) -> dict[str, float]:
+        raise NotImplementedError
+17.1 策略 1：等权宽基
+配置
+strategy:
+  name: equal_weight_broad_index
+  rebalance: monthly
+  symbols:
+    - 510300.SH   # 沪深300 ETF 示例
+    - 510500.SH   # 中证500 ETF 示例
+    - 159915.SZ   # 创业板 ETF 示例
+    - 588000.SH   # 科创50 ETF 示例
+  cash_weight: 0.02
+  max_weight_per_symbol: 0.25
+逻辑
+1. 读取 symbols；
+2. 过滤停牌、非 universe、流动性不足；
+3. 剩余品种等权；
+4. 保留 cash_weight。
+作用
+测试：
+  - DataPortal
+  - 调仓日
+  - 目标仓位
+  - T+1 open
+  - 订单生成
+  - 估值
+17.2 策略 2：红利低估
+筛选
+include_in_universe = true
+asset_class = equity
+category in dividend / smart_beta / broad_based
+amount_avg_20d >= 3000 万
+abs(premium_discount) <= 3%
+dividend_yield 高
+pe_percentile_5y 低
+pb_percentile_5y 低
+打分
+valuation_score =
+    0.4 * (1 - pe_percentile_5y)
+  + 0.3 * (1 - pb_percentile_5y)
+  + 0.3 * dividend_yield_percentile_5y
+
+liquidity_penalty =
+  amount_avg_20d 不足则剔除，不做连续惩罚
+
+final_score =
+  valuation_score
+  + dividend_score
+  - premium_penalty
+持仓
+每月持有前 3-5 只
+单只最高 20%
+现金 5%
+作用
+验证“低估 + 高股息”方向；
+检验估值 available_date；
+检验分红处理；
+检验折溢价限制。
+17.3 策略 3：动量轮动
+筛选
+amount_avg_20d >= 3000 万
+volatility_60d 不超过阈值
+上市满 120 个交易日
+非高溢价
+打分
+momentum_score =
+    0.5 * rank(ret_20d)
+  + 0.5 * rank(ret_60d)
+
+risk_penalty =
+    rank(volatility_60d)
+final_score = momentum_score - 0.3 * risk_penalty
+持仓
+每月前 3 只
+单只 30% 上限
+现金 5%
+作用
+测试高换手策略；
+观察成本、滑点、换手率是否吞噬收益。
+17.4 策略 4：股债商配置
+资产桶
+股票 ETF bucket
+债券 ETF bucket
+黄金 ETF bucket
+货币 ETF bucket
+权重示例
+如果股票 ETF 动量强且回撤可控：
+  股票 60%，债券 20%，黄金 10%，货币 10%
+
+如果股票动量弱且回撤扩大：
+  股票 20%，债券 40%，黄金 20%，货币 20%
+规则
+股票桶内选择 ret_60d 较强且流动性充足的 2-3 只；
+债券桶选择流动性最好的 1-2 只；
+黄金桶选择黄金 ETF；
+货币桶作为现金替代。
+作用
+测试多资产；
+测试防守资产；
+测试回撤控制。
+17.5 策略 5：估值 + 动量双因子
+思路
+便宜但不能持续下跌；
+强势但不能极端过热。
+筛选
+估值：
+  pe_percentile_5y <= 60%
+  pb_percentile_5y <= 60%
+
+趋势：
+  ret_20d > 0
+  close > ma_60 或 ret_60d > 0
+
+风险：
+  volatility_60d 不在最高 20%
+  premium_discount 正常
+  amount_avg_20d 充足
+打分
+value_score =
+    0.5 * (1 - pe_percentile_5y)
+  + 0.3 * (1 - pb_percentile_5y)
+  + 0.2 * dividend_yield_percentile_5y
+
+momentum_score =
+    0.4 * rank(ret_20d)
+  + 0.6 * rank(ret_60d)
+
+final_score =
+    0.55 * value_score
+  + 0.35 * momentum_score
+  + 0.10 * liquidity_score
+  - risk_penalty
+作用
+作为未来 Agent 的基础策略模板。
+18. 如何接入 xtquant
+18.1 xtdata 接入
+
+建议封装为：
+
+fundlab/data/sources/xtquant_source.py
+能力
+get_trading_calendar
+get_instruments
+download_daily_bar
+get_daily_bar
+get_etf_info
+get_dividend_factors
+get_sector_constituents
+原则
+xtquant_source 只负责拿数据；
+不做策略逻辑；
+不做回测逻辑；
+不直接写业务表；
+返回 raw DataFrame 后交给 loader / processor。
+示例结构
+class XtQuantSource(MarketDataSource):
+    name = "xtquant"
+
+    def __init__(self, config):
+        self.config = config
+        self.connected = False
+
+    def connect(self):
+        from xtquant import xtdata
+        self.xtdata = xtdata
+        self.connected = True
+
+    def download_daily_bar(self, symbols, start_date, end_date):
+        for symbol in symbols:
+            self.xtdata.download_history_data(
+                stock_code=symbol,
+                period="1d",
+                start_time=start_date.replace("-", ""),
+                end_time=end_date.replace("-", ""),
+            )
+
+    def get_daily_bar(self, symbols, start_date, end_date):
+        return self.xtdata.get_market_data_ex(
+            field_list=[],
+            stock_list=list(symbols),
+            period="1d",
+            start_time=start_date.replace("-", ""),
+            end_time=end_date.replace("-", ""),
+            count=-1,
+            dividend_type="none",
+            fill_data=False,
+        )
+
+实际参数需要按你本机 xtquant 版本校正。关键是：
+
+先 adapter；
+后清洗；
+再落库；
+上层永远不直接依赖 xtdata 返回格式。
+18.2 xttrader 接入
+
+后续建立：
+
+fundlab/brokers/qmt_broker.py
+fundlab/gateway/qmt_gateway.py
+QmtBroker 只接受内部 Order
+class QmtBroker:
+    def submit_order(self, order: Order) -> ExternalOrderRef:
+        ...
+
+内部映射：
+
+Order.side = buy
+  → xttrader order_type = 23
+
+Order.side = sell
+  → xttrader order_type = 24
+
+xttrader 的股票委托接口需要传入账户、证券代码、委托类型、委托数量、报价类型、价格、策略名、备注等字段，且同步/异步接口的返回值和失败状态需要单独处理。
+
+QmtBroker 必须做的事
+1. 内部 order_id 与 qmt_order_id 映射；
+2. 下单前二次风控；
+3. 查询委托状态；
+4. 查询成交；
+5. 查询持仓；
+6. 与内部账户对账；
+7. 记录所有外部返回；
+8. 不允许 Agent 直接调用。
+19. 如何避免未来函数
+
+这是整个系统的生死线。
+
+19.1 四个时间必须分开
+data_date:
+  数据对应的市场日期。
+
+available_date:
+  数据在系统中可被看到的日期。
+
+signal_date:
+  策略生成信号的日期。
+
+execution_date:
+  订单成交日期。
+
+示例：
+
+2026-05-06 close 产生信号
+2026-05-07 open 成交
+2026-05-07 close 估值
+
+估值数据：
+
+index_valuation.date = 2026-05-06
+index_valuation.available_date = 2026-05-07
+
+那么在 2026-05-06 生成信号时不能用这条估值。
+
+19.2 DataPortal 强制 asof
+
+所有 PIT 数据读取都必须：
+
+available_date <= asof
+
+包括：
+
+index_valuation
+fund_nav
+fund_features_daily
+fund_dividend
+fund_master_snapshot
+19.3 策略不能读取未来价格
+
+策略只允许：
+
+data_portal.get_daily_bar(
+    symbols,
+    start_date=lookback_start,
+    end_date=signal_date,
+)
+
+不能：
+
+get_price(symbol, execution_date, "open")
+
+执行价格只能 Broker 读取。
+
+19.4 未来函数测试
+
+设计一个毒丸测试：
+
+在未来某一天插入一个极端估值或价格特征；
+运行截至该日之前的回测；
+如果结果变化，说明存在未来函数。
+
+测试名：
+
+test_no_future_data_in_features
+test_no_future_data_in_index_valuation
+test_signal_close_execute_next_open
+test_strategy_cannot_access_execution_open
+20. 分红、折溢价、流动性处理
+20.1 分红
+
+第一版必须支持：
+
+现金分红进入 cash。
+
+实现顺序：
+
+1. fund_dividend 入库；
+2. 回测中按 record_date 记录 eligible_quantity；
+3. payment_date 增加 cash；
+4. account_event_ledger 记录 dividend_paid；
+5. performance 同时支持 price_return 和 total_return。
+
+最小实现：
+
+如果 record_date / payment_date 缺失：
+  用 ex_dividend_date 作为到账日。
+
+报告标记：
+
+分红到账日存在简化假设。
+20.2 折溢价
+
+跨境 ETF 必须启用：
+
+risk:
+  max_premium_abs: 0.03
+
+买入规则：
+
+premium_discount 缺失：
+  跨境 ETF 拒绝买入。
+
+premium_discount > 3%：
+  拒绝买入。
+
+premium_discount < -3%：
+  允许，但仍需检查流动性。
+
+卖出规则：
+
+已有持仓允许卖出；
+极端折溢价只限制新增买入。
+20.3 流动性
+
+三层限制：
+
+准入限制：
+  amount_avg_20d >= 3000 万
+
+成交限制：
+  单笔成交金额 <= 当日成交额 * 5%
+
+滑点惩罚：
+  低于成交额阈值的 ETF 增加滑点
+
+低流动性品种不能只靠“加滑点”解决，必须有硬过滤。否则回测容易出现“流动性幻觉”。
+
+21. ETF / 场内基金雷达设计
+
+雷达不是第一阶段核心，但 feature 表应当为它预留。
+
+21.1 雷达输出表
+CREATE TABLE radar_daily (
+    date                    DATE NOT NULL,
+    symbol                  TEXT NOT NULL,
+    name                    TEXT,
+    asset_class             TEXT,
+    category                TEXT,
+    tracking_index          TEXT,
+    valuation_label         TEXT,
+    momentum_label          TEXT,
+    liquidity_label         TEXT,
+    dividend_label          TEXT,
+    premium_label           TEXT,
+    risk_label              TEXT,
+    total_score             REAL,
+    rank_in_category        INTEGER,
+    notes                   TEXT,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (date, symbol)
+);
+
+CREATE INDEX idx_radar_daily_date_score
+ON radar_daily(date, total_score);
+21.2 雷达标签示例
+valuation_label:
+  very_cheap
+  cheap
+  neutral
+  expensive
+  very_expensive
+  unknown
+
+momentum_label:
+  strong
+  improving
+  neutral
+  weakening
+  falling
+
+liquidity_label:
+  excellent
+  good
+  weak
+  avoid
+
+premium_label:
+  discount
+  normal
+  high_premium
+  missing
+21.3 每日报告内容
+1. 今日 ETF 总览
+2. 低估高股息候选
+3. 动量强势候选
+4. 高折溢价警告
+5. 低流动性剔除列表
+6. 模拟盘账户排名
+7. 策略昨日/本周/本月表现
+8. 风控触发记录
+22. Agent 系统预留接口
+
+Qlib 的数据层、工作流、Recorder、实验管理思想很适合未来 Agent 与策略实验记录；它本身定位为面向 AI 的量化投资平台，并且有数据层、工作流、投资组合回测、Recorder 等组件，但第一版不建议直接引入完整 Qlib。
+
+22.1 Agent 文件结构
+agents/
+  dividend_value_agent/
+    profile.md
+    philosophy.md
+    constraints.yaml
+    memory.md
+    playbook.md
+    state.json
+    portfolio.json
+    trades.csv
+    performance.parquet
+    reflections/
+      2026-05-06.md
+
+  momentum_rotation_agent/
+    profile.md
+    philosophy.md
+    constraints.yaml
+    memory.md
+    playbook.md
+    state.json
+    reflections/
+22.2 Agent 决策接口
+class AgentDecisionProvider:
+    agent_id: str
+
+    def observe(self, date, data_portal, account_snapshot) -> dict:
+        ...
+
+    def decide(self, observation: dict) -> dict:
+        """
+        返回结构化 JSON
+        """
+22.3 Agent JSON Schema
+{
+  "agent_id": "dividend_value_agent",
+  "date": "2026-05-06",
+  "decision_id": "uuid",
+  "target_weights": {
+    "510880.SH": 0.15,
+    "512890.SH": 0.10,
+    "cash": 0.75
+  },
+  "orders": [
+    {
+      "symbol": "510880.SH",
+      "action": "buy",
+      "target_weight": 0.15,
+      "reason": "红利类 ETF 估值分位较低，股息率较高，流动性充足"
+    }
+  ],
+  "risk_notes": "单只 ETF 不超过 15%，避免拥挤交易",
+  "confidence": 0.66
+}
+22.4 Agent 决策表
+CREATE TABLE agent_decision (
+    decision_id         TEXT PRIMARY KEY,
+    agent_id            TEXT NOT NULL,
+    account_id          TEXT NOT NULL,
+    date                DATE NOT NULL,
+    observation_hash    TEXT,
+    decision_json       TEXT NOT NULL,
+    validation_status   TEXT NOT NULL, -- pending / passed / failed
+    validation_errors   TEXT,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_decision_agent_date
+ON agent_decision(agent_id, date);
+22.5 Agent 权限边界
+
+Agent 可以写：
+
+decision_json
+reflection markdown
+memory proposal
+hypothesis
+watchlist
+
+Agent 不可以写：
+
+virtual_trade
+virtual_position
+virtual_account_daily
+risk config
+cost config
+DataPortal storage
+xttrader order
+
+Agent 修改策略规则必须进入：
+
+proposal
+  → offline backtest
+    → validation
+      → human approval
+        → config version update
+23. 项目目录结构
+
+推荐结构：
+
+fundlab/
+  pyproject.toml
+  README.md
+  .env.example
+  .gitignore
+
+  config/
+    base.yaml
+    universe.yaml
+    risk.yaml
+    cost.yaml
+    execution.yaml
+    data_sources.yaml
+    strategies/
+      equal_weight.yaml
+      dividend_value.yaml
+      momentum_rotation.yaml
+      asset_allocation.yaml
+      value_momentum.yaml
+    accounts/
+      paper_accounts.yaml
+
+  data/
+    raw/
+    warehouse/
+      parquet/
+      sqlite/
+    reports/
+
+  fundlab/
+    __init__.py
+
+    common/
+      ids.py
+      dates.py
+      logging.py
+      config.py
+      hashing.py
+      exceptions.py
+
+    data/
+      sources/
+        base.py
+        xtquant_source.py
+        akshare_source.py
+        manual_source.py
+
+      loaders/
+        fund_universe_loader.py
+        calendar_loader.py
+        bar_loader.py
+        nav_loader.py
+        dividend_loader.py
+        index_valuation_loader.py
+
+      processors/
+        symbol_normalizer.py
+        universe_classifier.py
+        calendar_processor.py
+        adjustment_processor.py
+        quality_checker.py
+        feature_processor.py
+
+      storage/
+        parquet_store.py
+        sqlite_store.py
+        metadata_store.py
+        data_update_log.py
+
+      portal/
+        data_portal.py
+        query_context.py
+        exceptions.py
+
+    features/
+      base.py
+      momentum.py
+      liquidity.py
+      valuation.py
+      dividend.py
+      premium.py
+      risk.py
+      scoring.py
+
+    backtest/
+      engine.py
+      strategy.py
+      context.py
+      account.py
+      portfolio.py
+      position.py
+      order.py
+      trade.py
+      broker.py
+      execution.py
+      accounting.py
+      cost.py
+      slippage.py
+      metrics.py
+      recorder.py
+      schedule.py
+
+    brokers/
+      base.py
+      backtest_broker.py
+      paper_broker.py
+      qmt_broker.py
+
+    sim/
+      paper_engine.py
+      paper_account.py
+      account_service.py
+      daily_runner.py
+      reconciliation.py
+
+    risk/
+      base.py
+      risk_engine.py
+      universe_check.py
+      position_limit.py
+      liquidity_check.py
+      turnover_check.py
+      premium_discount_check.py
+      drawdown_control.py
+      cash_check.py
+      cooldown_check.py
+
+    strategies/
+      base.py
+      equal_weight.py
+      dividend_value.py
+      momentum_rotation.py
+      asset_allocation.py
+      value_momentum.py
+
+    radar/
+      radar_engine.py
+      labels.py
+      ranking.py
+
+    agents/
+      schema.py
+      agent_runner.py
+      decision_validator.py
+      memory.py
+      reflection.py
+
+    reports/
+      performance_report.py
+      paper_report.py
+      radar_report.py
+      html.py
+      markdown.py
+
+    gateway/
+      qmt_gateway.py
+      qmt_types.py
+      qmt_reconciliation.py
+
+  scripts/
+    init_db.py
+    update_calendar.py
+    update_universe.py
+    update_daily_bars.py
+    update_nav.py
+    update_dividends.py
+    update_index_valuation.py
+    compute_features.py
+    run_backtest.py
+    run_backtest_batch.py
+    run_paper_trading.py
+    generate_daily_report.py
+    check_data_quality.py
+
+  tests/
+    unit/
+      test_symbol_normalizer.py
+      test_calendar.py
+      test_cost_model.py
+      test_slippage_model.py
+      test_order_sizing.py
+      test_accounting.py
+      test_metrics.py
+
+    integration/
+      test_data_portal.py
+      test_backtest_equal_weight.py
+      test_paper_daily_flow.py
+
+    regression/
+      test_no_future_function.py
+      test_backtest_reproducibility.py
+      test_dividend_accounting.py
+      test_liquidity_limit.py
+
+    fixtures/
+      tiny_bars.parquet
+      tiny_calendar.csv
+      tiny_dividends.csv
+      tiny_valuation.csv
+24. 配置文件示例
+24.1 universe.yaml
+core_universe:
+  product_types:
+    - ETF
+    - MONEY_ETF
+
+  management_types:
+    - passive_index
+    - smart_beta
+    - passive_bond
+    - passive_commodity
+    - passive_money_market
+    - cross_border_index
+
+  asset_classes:
+    - equity
+    - bond
+    - commodity
+    - money_market
+    - cross_border
+
+excluded:
+  management_types:
+    - active
+    - fof
+    - index_enhanced
+    - unknown
+
+manual_include:
+  - 510300.SH
+  - 510500.SH
+  - 518880.SH
+
+manual_exclude:
+  - symbol: 000000.SH
+    reason: "example"
+24.2 risk.yaml
+risk:
+  allow_universe_only: true
+  max_weight_per_symbol: 0.25
+  max_total_equity_weight: 1.00
+  min_cash_weight: 0.02
+  min_avg_amount_20d: 30000000
+  max_daily_turnover: 0.50
+  max_premium_abs: 0.03
+  max_single_order_participation: 0.05
+24.3 cost.yaml
+cost:
+  commission_rate: 0.00003
+  min_commission: 0
+  stamp_tax: 0
+  transfer_fee: 0
+24.4 execution.yaml
+execution:
+  model: realistic_daily
+  trade_timing: next_open
+  price_field: open
+  valuation_price_field: close
+  sell_first: true
+  allow_partial_fill: true
+  lot_size_default: 100
+25. 测试方案
+25.1 单元测试
+symbol_normalizer
+510300 → 510300.SH
+159915 → 159915.SZ
+510300.SH 保持不变
+非法代码抛异常
+calendar
+next_trading_day 正确
+previous_trading_day 正确
+month_end 正确
+非交易日不进入回测
+cost_model
+买入 ETF 无印花税
+卖出 ETF 无印花税
+commission = amount * rate
+min_commission 生效
+slippage_model
+买入价格上调
+卖出价格下调
+低流动性额外惩罚
+order_sizing
+目标权重转目标股数
+按 100 份取整
+现金不足时缩放
+卖单不能超过持仓
+accounting
+买入减少现金增加持仓
+卖出增加现金减少持仓
+手续费扣现金
+分红到账增加现金
+mark-to-market 正确
+25.2 集成测试
+DataPortal 集成测试
+构造 3 只 ETF、30 个交易日数据；
+get_universe 返回正确；
+get_daily_bar 返回正确面板；
+get_features 不返回未来 available_date；
+缺失价格不被默认填充。
+回测集成测试
+用 tiny dataset 跑等权策略；
+检查：
+  run_id 生成；
+  order/trade/account_daily/position_daily 都落库；
+  T 日信号，T+1 日成交；
+  NAV 连续；
+  交易成本正确。
+模拟盘集成测试
+初始化虚拟账户；
+导入 5 天行情；
+运行每日流程；
+检查：
+  pending order
+  virtual trade
+  current position
+  account daily
+  event ledger
+25.3 回测一致性测试
+
+目标：
+
+同样数据、同样配置、同样代码，重复运行结果完全一致。
+
+检查：
+
+config_hash 一致
+data_version 一致
+run_id 不同但 equity_curve 内容一致
+metrics 一致
+orders/trades 数量一致
+25.4 未来函数测试
+估值毒丸
+在 2026-06-01 插入极端低估值；
+运行截至 2026-05-31 的回测；
+结果不得变化。
+特征毒丸
+把未来 ret_60d 改成极大值；
+运行之前区间；
+持仓不得变化。
+成交价隔离
+策略对象不能访问 execution_date open；
+DataPortal 对 StrategyContext 隐藏 get_open_price_for_execution。
+25.5 分红测试
+record_date 持有 10000 份；
+dividend_per_share = 0.05；
+payment_date cash 增加 500；
+净值不能因除息被错误低估。
+25.6 流动性测试
+日成交额 100 万；
+max_participation_rate = 5%；
+最大成交金额 = 5 万；
+请求买入 20 万；
+应部分成交或拒绝。
+26. 分阶段开发路线与验收标准
+Phase 0：项目骨架与配置
+任务
+1. 创建项目结构；
+2. 建立 pyproject.toml；
+3. 建立 config loader；
+4. 建立日志系统；
+5. 建立 SQLite 初始化脚本；
+6. 建立 ID / hash 工具；
+7. 建立 pytest 框架。
+验收标准
+python -m scripts.init_db 可创建 fundlab.db
+pytest 可运行
+配置文件可读取
+日志可输出到 logs/
+Phase 1：数据系统 MVP
+任务
+1. fund_master 表；
+2. trading_calendar 表；
+3. fund_daily_bar Parquet；
+4. fund_nav 表；
+5. fund_dividend 表；
+6. index_valuation 表；
+7. data_update_log；
+8. xtquant_source；
+9. manual_source；
+10. DataPortal 基础接口。
+验收标准
+可以拉取并落库至少 20 只 ETF 的日线；
+可以读取交易日历；
+可以查询指定日期 universe；
+可以读取指定 symbols 的日线面板；
+可以生成数据质量报告；
+DataPortal 不依赖实时 xtquant 也可读取本地数据。
+Phase 2：特征系统
+任务
+1. momentum features；
+2. volatility / drawdown；
+3. liquidity；
+4. dividend_yield_12m；
+5. premium_discount；
+6. valuation_score；
+7. total_score；
+8. feature_version。
+验收标准
+compute_features.py 可按日期增量运行；
+fund_features_daily 有完整特征；
+低于 lookback window 的特征为 NULL，不乱填；
+估值只使用 available_date <= date 的数据。
+Phase 3：回测系统 MVP
+任务
+1. Account / Position / Order / Trade；
+2. CostModel；
+3. SlippageModel；
+4. BacktestBroker；
+5. Accounting；
+6. Recorder；
+7. Metrics；
+8. MonthlySchedule；
+9. EqualWeight 策略；
+10. DividendValue 策略。
+验收标准
+可运行等权宽基月度回测；
+可运行红利低估月度回测；
+输出 equity curve；
+输出 orders/trades；
+输出 metrics；
+T 日信号、T+1 日成交；
+费用和滑点可配置；
+结果可重复。
+Phase 4：完整策略与风控
+任务
+1. MomentumRotation；
+2. AssetAllocation；
+3. ValueMomentum；
+4. UniverseCheck；
+5. LiquidityCheck；
+6. PremiumDiscountCheck；
+7. TurnoverCheck；
+8. PositionLimit；
+9. 分红入账。
+验收标准
+5 个策略都能跑；
+风控拒单有记录；
+跨境 ETF 高溢价买入会被拒绝；
+低流动性 ETF 不能无限成交；
+分红能进入现金；
+报告能显示交易成本和换手率。
+Phase 5：内部模拟盘
+任务
+1. virtual_account；
+2. virtual_position_current；
+3. virtual_position_daily；
+4. virtual_order；
+5. virtual_trade；
+6. virtual_account_daily；
+7. account_event_ledger；
+8. PaperBroker；
+9. PaperEngine；
+10. daily_runner。
+验收标准
+可创建多个虚拟账户；
+每个账户运行不同策略；
+每日生成订单；
+次日成交；
+每日估值；
+持仓、现金、净值、收益曲线可追溯；
+回测和模拟盘使用同一套成本、滑点、风控。
+Phase 6：ETF 雷达与报告
+任务
+1. radar_daily；
+2. 标签系统；
+3. 排名系统；
+4. Markdown 报告；
+5. HTML 报告；
+6. 策略对比；
+7. 模拟盘排名。
+验收标准
+每日生成 radar report；
+能看到低估高股息候选；
+能看到高溢价警告；
+能看到 Agent/策略账户排名；
+能看到本周、本月表现。
+Phase 7：Agent 预研
+任务
+1. agent_decision 表；
+2. Agent JSON schema；
+3. DecisionValidator；
+4. AgentContextBuilder；
+5. Reflection 文件写入；
+6. Agent 只进入 paper，不允许真实下单。
+验收标准
+Agent 能输出 JSON；
+系统能校验 JSON；
+违规 symbol / 超仓位 / 高溢价 / 低流动性会被拒绝；
+Agent 不能直接修改账户；
+Agent 决策和复盘可追溯。
+Phase 8：MiniQMT 自动执行
+任务
+1. QmtGateway；
+2. QmtBroker；
+3. 委托映射；
+4. 成交回报同步；
+5. 持仓对账；
+6. 真实/模拟账户隔离；
+7. 人工确认开关。
+验收标准
+内部订单能生成 QMT 委托；
+QMT 委托号能回写；
+成交能同步；
+持仓能对账；
+风控在下单前二次执行；
+默认不自动实盘，必须显式开启。
+27. 优先开发任务清单
+
+按实际开发顺序：
+
+P0:
+  1. 项目骨架
+  2. SQLite schema
+  3. 配置系统
+  4. 日志系统
+  5. ID/hash 工具
+
+P1:
+  6. trading_calendar
+  7. fund_master
+  8. xtquant_source
+  9. daily_bar_loader
+  10. parquet_store
+  11. data_quality_checker
+  12. DataPortal.get_daily_bar
+  13. DataPortal.get_universe
+
+P2:
+  14. fund_nav
+  15. fund_dividend
+  16. index_valuation
+  17. fund_features_daily
+  18. compute_features.py
+
+P3:
+  19. Account / Position / Order / Trade
+  20. CostModel
+  21. SlippageModel
+  22. RiskEngine
+  23. BacktestBroker
+  24. Accounting
+  25. Recorder
+  26. Metrics
+
+P4:
+  27. EqualWeightStrategy
+  28. DividendValueStrategy
+  29. MomentumRotationStrategy
+  30. AssetAllocationStrategy
+  31. ValueMomentumStrategy
+
+P5:
+  32. Backtest report
+  33. backtest consistency tests
+  34. no future function tests
+  35. dividend tests
+  36. liquidity tests
+
+P6:
+  37. virtual_account
+  38. PaperBroker
+  39. PaperEngine
+  40. daily_runner
+  41. paper report
+
+P7:
+  42. radar_daily
+  43. radar report
+  44. agent_decision schema
+  45. AgentDecisionValidator
+28. 参考开源项目：学什么，不学什么
+28.1 RQAlpha
+
+可参考：
+
+账户模型
+持仓模型
+撮合逻辑
+交易成本模型
+风控模块
+分析器
+调度器
+模块化 Mod 思想
+
+不建议第一版直接引入：
+
+完整框架生命周期
+完整 API 兼容层
+股票 / 期货 / 多资产复杂逻辑
+28.2 Qlib
+
+可参考：
+
+数据层
+特征层
+Workflow
+Recorder
+实验记录
+AI-oriented pipeline
+
+不建议第一版直接引入：
+
+完整 Qlib 数据格式
+完整 ML 训练流水线
+复杂模型管理
+28.3 EasyXT
+
+可参考：
+
+xtquant 封装经验
+MiniQMT 接入细节
+QMT 版本兼容问题
+本地数据管理经验
+
+不建议第一版直接引入：
+
+把核心系统绑定到 EasyXT 的 API 风格
+直接复用其回测框架
+28.4 vn.py / vnpy_qmt
+
+可参考：
+
+EventEngine
+Gateway
+OrderData / TradeData / AccountData / PositionData
+Paper account
+Portfolio manager
+Risk manager
+
+不建议第一版直接引入：
+
+GUI
+多网关交易平台复杂度
+高频事件循环
+28.5 Zipline Reloaded
+
+可参考：
+
+事件驱动回测
+Trading Calendar
+Data Bundle
+Performance DataFrame
+
+不建议第一版直接引入：
+
+美股市场假设
+复杂资产生命周期
+完整 bundle 格式
+28.6 VectorBT
+
+可参考：
+
+快速参数扫描
+因子敏感性分析
+矩阵化研究
+orders / trades / portfolio 记录思想
+
+VectorBT 文档结构中也有 portfolio、orders、trades、records 等模块，适合作为快速研究和批量扫描的参考，但不建议把它作为你第一版的账户记账真源。
+
+28.7 LEAN / QuantConnect
+
+可参考：
+
+Brokerage 抽象
+Fee Model
+Slippage Model
+Fill Model
+Portfolio Construction
+Execution Model
+Risk Model
+
+不建议第一版直接引入：
+
+多市场、多经纪商、云平台级复杂架构
+28.8 WonderTrader
+
+可参考：
+
+专业交易系统分层
+回测、实盘、监控、数据服务组织方式
+
+WonderTrader 文档覆盖历史数据处理、回测、实盘、监控、扩展行情解析器、扩展执行器等方向，适合后续对照专业交易系统边界，但第一版不应复制其复杂度。
+
+29. 主要技术风险与规避方案
+29.1 幸存者偏差
+
+风险：
+
+只用当前存在 ETF 回测过去，结果偏乐观。
+
+第一版处理：
+
+报告显式标记幸存者偏差；
+fund_master 保留 listed_date / delisted_date；
+不删除退市品种。
+
+后续处理：
+
+补历史 ETF 列表；
+建立 fund_master_snapshot；
+回测按 date 查询当时 universe。
+29.2 未来函数
+
+风险：
+
+估值、净值、特征、分红公告使用了未来数据。
+
+规避：
+
+所有 PIT 数据必须有 available_date；
+DataPortal 强制 available_date <= asof；
+策略只拿 signal_date 之前数据；
+执行价只给 Broker。
+29.3 分红低估
+
+风险：
+
+高股息 ETF 如果只看价格收益，会低估总收益。
+
+规避：
+
+fund_dividend；
+dividend_receivable；
+payment_date cash 入账；
+报告区分 price return 和 total return。
+29.4 跨境 ETF 溢价
+
+风险：
+
+高溢价买入，净值回归后亏损；
+回测如果不用折溢价会过度乐观。
+
+规避：
+
+fund_nav；
+premium_discount；
+max_premium_abs；
+缺失折溢价的跨境 ETF 禁止新增买入。
+29.5 流动性幻觉
+
+风险：
+
+低成交额 ETF 回测收益很好，但实际无法成交。
+
+规避：
+
+amount_avg_20d 准入；
+max_participation_rate；
+低流动性滑点惩罚；
+部分成交或拒单；
+报告显示容量限制影响。
+29.6 xtquant 版本差异
+
+风险：
+
+不同券商 MiniQMT / xtquant 字段、行为、连接方式不同。
+
+规避：
+
+xtquant_source 隔离；
+raw 数据落盘；
+字段映射配置化；
+集成测试覆盖本机环境；
+核心回测不依赖 xtquant 在线。
+29.7 数据源不稳定
+
+风险：
+
+NAV、估值、分红源缺失或更新延迟。
+
+规避：
+
+source 字段；
+available_date；
+data_update_log；
+quality_issue；
+缺失时策略降级或剔除。
+29.8 过早接 Agent
+
+风险：
+
+Agent 看似智能，但账户、收益、风控不可信。
+
+规避：
+
+Agent 后置；
+先跑规则策略；
+Agent 只能输出 JSON；
+所有动作经过 RiskEngine 和 Broker；
+Agent 不能改账本。
+30. 最推荐的 MVP 路线
+
+最务实的 8 周内路线可以是：
+
+第 1 周：
+  项目骨架、SQLite、配置、日志、交易日历、fund_master。
+
+第 2 周：
+  xtquant_source、daily_bar_loader、Parquet、DataPortal.get_daily_bar。
+
+第 3 周：
+  NAV、分红、估值、feature 计算、quality checker。
+
+第 4 周：
+  Account / Order / Trade / Position / Cost / Slippage / BacktestBroker。
+
+第 5 周：
+  BacktestEngine、Recorder、Metrics、等权宽基、红利低估。
+
+第 6 周：
+  动量轮动、股债商配置、估值动量双因子、风控完善。
+
+第 7 周：
+  分红入账、折溢价限制、流动性限制、未来函数测试、回测报告。
+
+第 8 周：
+  PaperBroker、VirtualAccount、每日模拟盘流程、模拟盘报告。
+
+最终 MVP 验收口径：
+
+1. 可以稳定更新 ETF 日线数据；
+2. 可以查询 point-in-time universe；
+3. 可以计算每日特征；
+4. 可以跑 5 个策略；
+5. 回测严格 T 日信号、T+1 日成交；
+6. 分红进入现金；
+7. 跨境 ETF 高溢价会被限制；
+8. 低流动性不能无限成交；
+9. 每次回测有 run_id、config_hash、data_version；
+10. 内部模拟盘每天有订单、成交、持仓、净值；
+11. 所有结果可复现、可追溯、可审计。
+
+这个方案最关键的取舍是：**先不要追求策略复杂度，也不要急着接 Agent 或实盘自动执行；先把数据、账本、时点、成交、风控和结果记录做硬。**只要这三层可信，后面的 ETF 雷达、Agent 排名、日报推送、MiniQMT 自动执行都只是自然扩展。

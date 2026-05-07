@@ -1,0 +1,20 @@
+paths:
+  sqlite_db: data/warehouse/sqlite/fundlab.db
+  parquet_root: data/warehouse/parquet
+  log_dir: logs
+
+data:
+  default_feature_version: v1
+
+universe:
+  include_product_types:
+    - ETF
+    - MONEY_ETF
+  include_management_types:
+    - passive_index
+    - smart_beta
+    - passive_bond
+    - passive_commodity
+    - passive_money_market
+    - cross_border_index
+
