@@ -5,6 +5,21 @@ paths:
 
 data:
   default_feature_version: v1
+  source: xtquant
+  default_start_date: "2023-01-01"
+  default_end_date: "2026-05-07"
+  validation_symbols:
+    - 510300.SH
+    - 510500.SH
+    - 518880.SH
+
+xtquant:
+  calendar_market: SH
+  calendar_probe_symbol: 510300.SH
+  fund_sectors:
+    - 沪深基金
+    - 上证基金
+    - 深证基金
 
 universe:
   include_product_types:
@@ -17,4 +32,3 @@ universe:
     - passive_commodity
     - passive_money_market
     - cross_border_index
-

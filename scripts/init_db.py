@@ -282,7 +282,7 @@ CREATE TABLE IF NOT EXISTS backtest_metrics (
 """
 
 
-def init_db(config_path: str | Path = "config/base.yaml") -> Path:
+def init_db(config_path: str | Path | None = None) -> Path:
     config = load_config(config_path)
     db_path = get_path(config, "sqlite_db")
     db_path.parent.mkdir(parents=True, exist_ok=True)

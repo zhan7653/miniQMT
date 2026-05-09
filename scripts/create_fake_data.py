@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
+import os
 
 import pandas as pd
 
@@ -325,14 +326,24 @@ def fake_index_valuation_frame() -> pd.DataFrame:
     )
 
 
-def create_fake_data(config_path: str | Path = "config/base.yaml") -> None:
+def create_fake_data(config_path: str | Path | None = None) -> None:
     init_db(config_path)
     config = load_config(config_path)
     db_path = get_path(config, "sqlite_db")
     parquet_root = get_path(config, "parquet_root")
+    _guard_fake_data_path(db_path, parquet_root)
     trading_days = business_days(date(2026, 1, 2), 30)
 
     with sqlite3.connect(db_path) as connection:
+        for table in [
+            "fund_master",
+            "trading_calendar",
+            "fund_nav",
+            "fund_dividend",
+            "index_valuation",
+            "fund_features_daily",
+        ]:
+            connection.execute(f"DELETE FROM {table}")
         write_fund_master(connection)
         write_calendar(connection, trading_days)
 
@@ -342,6 +353,26 @@ def create_fake_data(config_path: str | Path = "config/base.yaml") -> None:
     DividendLoader(sqlite_store).load_frame(fake_dividend_frame())
     IndexValuationLoader(sqlite_store).load_frame(fake_index_valuation_frame())
     print(f"Created fake data in {db_path} and {output_path}")
+
+
+def _guard_fake_data_path(db_path: Path, parquet_root: Path) -> None:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if os.environ.get("FUNDLAB_ALLOW_FAKE_PRODUCTION_WRITE") == "1":
+        return
+    protected_paths = {
+        Path("data/warehouse/sqlite/fundlab.db"),
+        Path("data/warehouse/parquet"),
+    }
+    resolved_db = db_path.resolve()
+    resolved_parquet = parquet_root.resolve()
+    for protected_path in protected_paths:
+        resolved_protected = protected_path.resolve()
+        if resolved_db == resolved_protected or resolved_protected in resolved_parquet.parents or resolved_parquet == resolved_protected:
+            raise RuntimeError(
+                "Refusing to write fake data into production warehouse. "
+                "Use a test config path or set FUNDLAB_ALLOW_FAKE_PRODUCTION_WRITE=1 explicitly."
+            )
 
 
 def main() -> None:

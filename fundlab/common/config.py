@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -7,10 +8,11 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = Path("config/base.yaml")
+CONFIG_ENV_VAR = "FUNDLAB_CONFIG_PATH"
 
 
-def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
-    config_path = Path(path)
+def load_config(path: str | Path | None = None) -> dict[str, Any]:
+    config_path = Path(path) if path is not None else Path(os.environ.get(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH))
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -30,4 +32,3 @@ def get_path(config: dict[str, Any], key: str) -> Path:
         raise KeyError(f"Missing config path: paths.{key}") from exc
 
     return Path(value)
-

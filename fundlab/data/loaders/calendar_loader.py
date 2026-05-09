@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pandas as pd
+
 from fundlab.data.storage.sqlite_store import SQLiteStore
 
 
@@ -11,16 +13,30 @@ class CalendarLoader:
 
     def load_business_days(self, start_date: date, end_date: date) -> int:
         trading_days = self._business_days(start_date, end_date)
+        return self.load_trading_days([trading_day.isoformat() for trading_day in trading_days])
+
+    def load_frame(self, data: pd.DataFrame) -> int:
+        if data.empty:
+            return 0
+        if "date" not in data.columns:
+            raise ValueError("trading calendar frame must contain a date column")
+        trading_days = sorted(pd.to_datetime(data["date"]).dt.strftime("%Y-%m-%d").dropna().unique().tolist())
+        return self.load_trading_days(trading_days)
+
+    def load_trading_days(self, trading_days: list[str]) -> int:
+        trading_days = sorted(dict.fromkeys(trading_days))
         rows = []
         for index, trading_day in enumerate(trading_days):
-            previous_day = trading_days[index - 1].isoformat() if index > 0 else None
-            next_day = trading_days[index + 1].isoformat() if index + 1 < len(trading_days) else None
-            is_week_end = index + 1 == len(trading_days) or trading_days[index + 1].weekday() < trading_day.weekday()
-            is_month_end = index + 1 == len(trading_days) or trading_days[index + 1].month != trading_day.month
-            is_quarter_end = is_month_end and trading_day.month in {3, 6, 9, 12}
+            current_date = date.fromisoformat(trading_day)
+            next_date = date.fromisoformat(trading_days[index + 1]) if index + 1 < len(trading_days) else None
+            previous_day = trading_days[index - 1] if index > 0 else None
+            next_day = trading_days[index + 1] if next_date else None
+            is_week_end = next_date is None or next_date.isocalendar().week != current_date.isocalendar().week
+            is_month_end = next_date is None or next_date.month != current_date.month
+            is_quarter_end = is_month_end and current_date.month in {3, 6, 9, 12}
             rows.append(
                 (
-                    trading_day.isoformat(),
+                    trading_day,
                     "CN",
                     1,
                     previous_day,
@@ -60,4 +76,3 @@ class CalendarLoader:
                 days.append(current)
             current += timedelta(days=1)
         return days
-

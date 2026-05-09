@@ -11,6 +11,8 @@ def test_manual_universe_loader_and_calendar_loader():
     init_db()
     config = load_config()
     sqlite_store = SQLiteStore(get_path(config, "sqlite_db"))
+    sqlite_store.execute_many("DELETE FROM fund_master", [])
+    sqlite_store.execute_many("DELETE FROM trading_calendar", [])
 
     universe_count = FundUniverseLoader(ManualSource("data/raw/manual"), sqlite_store).load()
     calendar_count = CalendarLoader(sqlite_store).load_business_days(date(2026, 1, 1), date(2026, 1, 9))
@@ -27,4 +29,3 @@ def test_manual_universe_loader_and_calendar_loader():
         "2026-01-08",
         "2026-01-09",
     ]
-

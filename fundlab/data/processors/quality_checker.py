@@ -17,7 +17,12 @@ class QualityIssue:
 class DailyBarQualityChecker:
     required_columns = {"date", "symbol", "open", "high", "low", "close", "volume", "amount"}
 
-    def check(self, data: pd.DataFrame, trading_days: Iterable[str] | None = None) -> list[QualityIssue]:
+    def check(
+        self,
+        data: pd.DataFrame,
+        trading_days: Iterable[str] | None = None,
+        listed_dates: dict[str, str | None] | None = None,
+    ) -> list[QualityIssue]:
         issues: list[QualityIssue] = []
         missing_columns = sorted(self.required_columns - set(data.columns))
         if missing_columns:
@@ -48,8 +53,33 @@ class DailyBarQualityChecker:
             for invalid_date in invalid_dates:
                 issues.append(QualityIssue("non_trading_date", None, invalid_date, "bar date is not a trading day"))
 
+            expected_days = sorted(valid_days)
+            listed_dates = listed_dates or {}
+            for symbol in sorted(data["symbol"].dropna().unique()):
+                symbol_data = data[data["symbol"] == symbol]
+                present_days = set(symbol_data["date"])
+                first_bar_date = min(present_days) if present_days else None
+                listed_date = listed_dates.get(symbol)
+                start_date = max([value for value in [first_bar_date, listed_date] if value], default=None)
+                symbol_expected_days = [day for day in expected_days if start_date is None or day >= start_date]
+                missing_days = [day for day in symbol_expected_days if day not in present_days]
+                for missing_day in missing_days:
+                    issues.append(QualityIssue("missing_bar", symbol, missing_day, "symbol has no bar on trading day"))
+
+        zero_liquidity = data[(data["amount"] == 0) & (data["volume"] == 0)]
+        for row in zero_liquidity[["date", "symbol"]].itertuples(index=False):
+            issues.append(QualityIssue("zero_liquidity", row.symbol, row.date, "amount and volume are both zero"))
+
+        no_price_move = data[
+            (data["open"] == data["high"])
+            & (data["high"] == data["low"])
+            & (data["low"] == data["close"])
+            & ((data["amount"] == 0) | (data["volume"] == 0))
+        ]
+        for row in no_price_move[["date", "symbol"]].itertuples(index=False):
+            issues.append(QualityIssue("suspected_suspension", row.symbol, row.date, "flat OHLC with zero liquidity"))
+
         return issues
 
     def to_frame(self, issues: list[QualityIssue]) -> pd.DataFrame:
         return pd.DataFrame([issue.__dict__ for issue in issues])
-

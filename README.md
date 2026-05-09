@@ -1,6 +1,6 @@
 # FundLab
 
-FundLab is a lightweight research and backtesting lab for exchange-traded rule-based funds. The current codebase provides a local warehouse, point-in-time `DataPortal`, feature generation, rule strategies, risk checks, and a simple next-open backtest engine that can run without MiniQMT or `xtquant`.
+FundLab is a lightweight research and backtesting lab for exchange-traded rule-based funds. The current codebase provides a local warehouse, point-in-time `DataPortal`, `xtquant` ingestion scripts, feature generation, rule strategies, risk checks, and a simple next-open backtest engine.
 
 ## Quick Start
 
@@ -13,12 +13,34 @@ uv run python -m scripts.run_backtest
 uv run pytest
 ```
 
+## Real Data Workflow
+
+Run these commands with MiniQMT logged in and `xtquant` available in the active Python environment:
+
+```powershell
+python -m scripts.update_calendar
+python -m scripts.update_universe
+python -m scripts.update_daily_bars
+python -m scripts.update_nav
+python -m scripts.update_dividends
+python -m scripts.update_index_valuation
+python -m scripts.compute_features
+python -m scripts.check_data_quality
+python -m scripts.run_backtest
+```
+
+Or run the full data refresh path:
+
+```powershell
+python -m scripts.update_real_data
+```
+
 ## Current Scope
 
 - Local Python package skeleton using `uv` and Python 3.11+.
 - SQLite metadata and result database at `data/warehouse/sqlite/fundlab.db`.
 - Parquet daily bars under `data/warehouse/parquet/fund_daily_bar/`.
-- Fake local ETF/fund universe, trading calendar, daily bars, NAV/premium-discount data, dividends, index valuations, and generated features.
+- Fake local test data plus real `xtquant` update scripts for trading calendar, ETF universe, daily bars, NAV placeholders, dividends, index valuations, and generated features.
 - Point-in-time `DataPortal` for universe, calendar, daily bars, NAV, dividends, index valuations, and features.
 - Rule strategies, risk checks, feature generation, backtest execution, metrics, and backtest persistence.
 

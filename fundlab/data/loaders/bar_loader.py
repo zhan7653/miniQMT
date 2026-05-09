@@ -29,6 +29,8 @@ class DailyBarLoader:
 
     def load_frame(self, data: pd.DataFrame, year: int | None = None) -> Path:
         normalized = data.copy()
+        if normalized.empty:
+            raise ValueError("daily bar data is empty")
         normalized["date"] = normalized["date"].astype(str)
         if year is None:
             year = int(normalized["date"].str.slice(0, 4).mode().iloc[0])
@@ -41,6 +43,20 @@ class DailyBarLoader:
         output_dir = self.parquet_root / "fund_daily_bar" / f"year={year}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "part-000.parquet"
+        if output_path.exists():
+            existing = pd.read_parquet(output_path)
+            normalized = pd.concat([existing, normalized], ignore_index=True)
+            normalized["date"] = normalized["date"].astype(str)
+            normalized = normalized.drop_duplicates(["date", "symbol"], keep="last")
         normalized.sort_values(["date", "symbol"]).to_parquet(output_path, index=False)
         return output_path
 
+    def load_frame_by_year(self, data: pd.DataFrame) -> list[Path]:
+        normalized = data.copy()
+        if normalized.empty:
+            return []
+        normalized["date"] = normalized["date"].astype(str)
+        paths = []
+        for year, group in normalized.groupby(normalized["date"].str.slice(0, 4)):
+            paths.append(self.load_frame(group, year=int(year)))
+        return paths

@@ -12,6 +12,7 @@ FundLab is a lightweight research and backtesting lab for exchange-traded rule-b
 - SQLite metadata warehouse at `data/warehouse/sqlite/fundlab.db`.
 - Parquet daily-bar store under `data/warehouse/parquet/fund_daily_bar/`.
 - Fake local dataset covering fund master data, trading calendar, daily bars, NAV/premium-discount data, dividends, and index valuation data.
+- Real `xtquant` ingestion scripts for trading calendars, ETF universe discovery, daily bars, close-derived NAV placeholders, dividend stubs, and index valuation stubs.
 - Point-in-time reads through `DataPortal` using `date` plus `available_date` filters where applicable.
 - Feature computation and persistence for momentum, volatility, drawdown, liquidity, valuation, dividend, premium/discount, and composite scores.
 - Rule strategies that only consume data through `DataPortal`.
@@ -71,7 +72,9 @@ Implemented loaders normalize incoming frames and upsert into the warehouse:
 - `DailyBarLoader` writes normalized daily bars to Parquet.
 - `NavLoader`, `DividendLoader`, `IndexValuationLoader`, and `FeatureLoader` write point-in-time SQLite datasets.
 
-`ManualSource` reads local manual files from `data/raw/manual`. `XtQuantSource` currently defines the source boundary but is not implemented.
+`ManualSource` reads local manual files from `data/raw/manual`. `XtQuantSource` connects to `xtquant`, reads trading calendars, discovers ETF-like instruments from configured sectors, downloads daily bars, and normalizes `get_market_data_ex` responses into the warehouse bar schema.
+
+`scripts.update_real_data` runs the full real-data refresh path: calendar, universe, daily bars, NAV placeholders, dividends, index valuations, feature generation, and daily-bar quality reporting.
 
 ## Feature Generation
 
@@ -142,16 +145,18 @@ uv run pytest
 
 Additional scripts:
 
-- `scripts.update_universe` loads `fund_master` from the manual source.
-- `scripts.update_calendar` writes placeholder business-day calendar rows.
-- `scripts.update_nav`, `scripts.update_dividends`, and `scripts.update_index_valuation` load fake point-in-time datasets.
+- `scripts.update_universe` loads `fund_master` from `xtquant` instrument discovery.
+- `scripts.update_calendar` writes real `xtquant` trading-calendar rows.
+- `scripts.update_daily_bars` downloads and stores real `xtquant` daily bars in Parquet.
+- `scripts.update_nav`, `scripts.update_dividends`, and `scripts.update_index_valuation` use `xtquant` source methods; NAV currently uses close-derived neutral placeholders where true NAV is unavailable.
 - `scripts.check_data_quality` writes a daily-bar quality report to `data/reports/quality/daily_bar_quality.csv`.
+- `scripts.update_real_data` orchestrates the real-data refresh, feature generation, and quality report.
 
 ## Current Limitations
 
-- MiniQMT and live `xtquant` ingestion are not implemented.
+- MiniQMT/`xtquant` ingestion now has a first usable implementation, but exact sector names and instrument field mappings may need adjustment for the local QMT build.
 - Daily-bar adjustment and fill modes are not implemented.
-- The current calendar loader uses a business-day placeholder, not an exchange holiday calendar.
+- True ETF NAV, dividend events, and index valuation data are still limited by available `xtquant` fields; NAV currently falls back to close-derived neutral premium/discount placeholders.
 - Fake data is deterministic and test-oriented, not production market data.
 - Strategy execution is a simple next-open simulation, not a live trading or paper-trading gateway.
 - Risk checks are intentionally lightweight and should be extended before production trading.
