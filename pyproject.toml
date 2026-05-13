@@ -12,6 +12,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "backtrader>=1.9.78.123",
     "pytest>=8.0",
 ]
 
