@@ -15,6 +15,8 @@ uv run pytest
 
 ## Real Data Workflow
 
+Real market data must come primarily from MiniQMT / `xtquant`. If `xtquant` is unavailable, stop and fix the MiniQMT environment instead of automatically falling back to another provider. Non-`xtquant` sources may only be used as explicitly requested auxiliary supplements or comparison reports for data that already exists locally.
+
 Run these commands with MiniQMT logged in and `xtquant` available in the active Python environment:
 
 ```powershell
@@ -45,3 +47,4 @@ python -m scripts.update_real_data
 - Rule strategies, risk checks, feature generation, backtest execution, metrics, and backtest persistence.
 
 See `docs/current_implementation.md` for a detailed implementation map, workflows, and known limitations.
+See `docs/data_source_policy.md` for the project data-source policy.

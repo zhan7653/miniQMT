@@ -76,6 +76,8 @@ Implemented loaders normalize incoming frames and upsert into the warehouse:
 
 `scripts.update_real_data` runs the full real-data refresh path: calendar, universe, daily bars, NAV placeholders, dividends, index valuations, feature generation, and daily-bar quality reporting.
 
+Real market data policy: MiniQMT / `xtquant` is the primary source for warehouse real data. If `xtquant` is unavailable, refresh scripts must fail clearly and the operator must restore the `xtquant` environment; the project must not silently switch to another market-data provider. Non-`xtquant` sources are allowed only as explicitly requested auxiliary supplements or comparison/reporting inputs for data that already exists locally. See `docs/data_source_policy.md`.
+
 ## Feature Generation
 
 `FeatureEngine` computes daily features for a date range and optional symbol list. It uses only `DataPortal` reads, which keeps feature generation aligned with the same point-in-time access path used by strategies.
