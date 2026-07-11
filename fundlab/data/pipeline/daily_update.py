@@ -214,11 +214,17 @@ class DailyUpdateRunner:
         merged: dict[str, pd.DataFrame] = {}
         keys = {"calendar": ["date"], "daily_bars_raw": ["date", "symbol"],
                 "daily_bars_adjusted": ["date", "symbol"], "features": ["date", "symbol"]}
-        for name, new_rows in incoming.items():
-            try:
-                old_rows = self.store.read_table(previous.version_id, name).to_pandas()
-            except Exception:
-                old_rows = pd.DataFrame(columns=new_rows.columns)
+        _, manifest = self.store.resolve_complete(previous.version_id)
+        predecessor_names = {item.path.split("/", 1)[0] for item in manifest.files if "/" in item.path}
+        for name in sorted(predecessor_names | set(incoming)):
+            new_rows = incoming.get(name)
+            old_rows = self.store.read_table(previous.version_id, name).to_pandas() if name in predecessor_names else pd.DataFrame()
+            if new_rows is None:
+                merged[name] = old_rows.reset_index(drop=True)
+                continue
+            if name not in keys:
+                merged[name] = new_rows.reset_index(drop=True)
+                continue
             if old_rows.empty:
                 combined = new_rows.copy()
             elif new_rows.empty:

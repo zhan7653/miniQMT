@@ -1,10 +1,13 @@
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import pyarrow as pa
 
 from fundlab.data.pipeline import DailyUpdateRunner
-from fundlab.data.platform import (DataCatalog, PreflightResult, ProviderCapability, ProviderHealth,
-                                   PriceMode, ProviderResult, SymbolResult, UniverseSnapshot)
+from fundlab.data.platform import (BatchRecord, BatchStatus, DataCatalog, ManifestIdentity, PreflightResult,
+                                   ProviderCapability, ProviderHealth, PriceMode, ProviderRequest, ProviderResult,
+                                   SymbolResult, TrustState, UniverseSnapshot, VersionRecord, VersionStatus,
+                                   stable_fingerprint)
 from fundlab.data.portal import DataPortal
 from fundlab.data.sources.provider_registry import ProviderRegistry
 from fundlab.data.storage import VersionedParquetStore
@@ -52,6 +55,39 @@ def make_runner(tmp_path, provider):
     return DailyUpdateRunner(registry=registry, provider_name="xtquant", catalog=catalog,
         store=VersionedParquetStore(tmp_path / "warehouse", catalog), universe=universe,
         report_root=tmp_path / "reports", config_hash="cfg"), catalog
+
+
+def seed_complete_snapshot(runner, catalog, provider):
+    start, end = date(2026, 5, 1), date(2026, 5, 5)
+    calendar, _ = provider.fetch(ProviderRequest(("510300.SH",), start, end, ProviderCapability.TRADING_CALENDAR))
+    raw, _ = provider.fetch(ProviderRequest(("510300.SH", "510500.SH"), start, end,
+                                            ProviderCapability.DAILY_BARS_RAW))
+    adjusted, _ = provider.fetch(ProviderRequest(("510300.SH", "510500.SH"), start, end,
+                                                 ProviderCapability.DAILY_BARS_ADJUSTED))
+    tables = {"calendar": calendar, "daily_bars_raw": raw, "daily_bars_adjusted": adjusted,
+              "features": pd.DataFrame({"date": ["2026-05-05"], "symbol": ["510300.SH"], "ret_1d": [.01]}),
+              "universe": pd.DataFrame({"symbol": ["510300.SH", "510500.SH"],
+                                        "effective_date": ["2026-01-01", "2026-01-01"]}),
+              "quarantine": pd.DataFrame({"symbol": ["BAD.SH"], "reason": ["legacy contamination"]}),
+              "future_table": pd.DataFrame({"key": ["preserve-me"], "value": [7]})}
+    batch_id, version_id = "seed-batch", "seed-version"
+    catalog.create_batch(BatchRecord(batch_id, "xtquant", start, end, ("510300.SH", "510500.SH"), "u1",
+        "cfg", "seed-request", BatchStatus.PENDING, 0, None))
+    catalog.transition_batch(batch_id, BatchStatus.RUNNING)
+    runner.store.begin_version(version_id)
+    for name, frame in tables.items():
+        runner.store.write_table(version_id, name, pa.Table.from_pandas(frame, preserve_index=False))
+    counts = {name: len(frame) for name, frame in tables.items()}
+    content = stable_fingerprint(counts)
+    identity = ManifestIdentity("xtquant", batch_id, version_id, datetime.now().astimezone(), TrustState.TRUSTED,
+                                content, 1, counts)
+    manifest = runner.store.prepare_manifest(identity, counts)
+    catalog.create_version(VersionRecord(version_id, batch_id, manifest.fingerprint, content,
+                                          VersionStatus.BUILDING, None, None, None))
+    runner.store.finalize_manifest(manifest)
+    catalog.transition_batch(batch_id, BatchStatus.COMPLETE, row_count=sum(counts.values()))
+    catalog.complete_version(version_id)
+    return tables
 
 
 def test_preflight_failure_does_not_fallback_or_publish(tmp_path):
@@ -140,3 +176,23 @@ def test_backfill_flag_changes_missing_date_resolution(tmp_path):
     assert runner2.run(date(2026, 5, 5), start_date=date(2026, 5, 5)).succeeded
     backfilled = runner2.run(date(2026, 5, 7), backfill_missing=True)
     assert backfilled.missing_dates == ("2026-05-06", "2026-05-07")
+
+
+def test_successor_carries_every_predecessor_table_and_universe_is_readable(tmp_path):
+    provider = FakeProvider()
+    runner, catalog = make_runner(tmp_path, provider)
+    seeded = seed_complete_snapshot(runner, catalog, provider)
+    provider.bad_symbol = "510500.SH"
+    result = runner.run(date(2026, 5, 7), start_date=date(2026, 5, 6))
+    assert result.succeeded
+
+    _, manifest = runner.store.resolve_complete(result.version_id)
+    table_names = {item.path.split("/", 1)[0] for item in manifest.files}
+    assert {"calendar", "universe", "daily_bars_raw", "daily_bars_adjusted", "features",
+            "quarantine", "future_table"}.issubset(table_names)
+    pd.testing.assert_frame_equal(runner.store.read_table(result.version_id, "quarantine").to_pandas(),
+                                  seeded["quarantine"])
+    pd.testing.assert_frame_equal(runner.store.read_table(result.version_id, "future_table").to_pandas(),
+                                  seeded["future_table"])
+    portal = DataPortal.open_latest_complete(runner.store)
+    assert portal.get_universe("2026-05-07") == ["510300.SH", "510500.SH"]
