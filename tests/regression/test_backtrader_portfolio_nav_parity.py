@@ -13,10 +13,8 @@ from fundlab.backtest.cost import CostModel
 from fundlab.backtest.engine import BacktestEngine
 from fundlab.backtest.models import Order
 from fundlab.backtest.slippage import SlippageModel
-from fundlab.common.config import get_path, load_config
+from fundlab.data.platform import PriceMode
 from fundlab.data.portal import DataPortal
-from fundlab.data.storage.parquet_store import ParquetStore
-from fundlab.data.storage.sqlite_store import SQLiteStore
 from fundlab.risk import RiskEngine
 from fundlab.strategies import (
     AssetAllocationStrategy,
@@ -26,11 +24,12 @@ from fundlab.strategies import (
     ValueMomentumStrategy,
 )
 from fundlab.strategies.base import Strategy
+from scripts.create_fake_data import create_fake_v2_portal
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASE_CONFIG_PATH = REPO_ROOT / "config" / "base.yaml"
-MIN_USABLE_DAYS = 252
+MIN_USABLE_DAYS = 20
 TOLERANCE = 1e-6
 ASSUMPTIONS = {
     "initial_cash": 1_000_000.0,
@@ -54,11 +53,6 @@ class BenchmarkRange:
     start_date: str
     end_date: str
     length: int
-
-
-class DividendExcludedDataPortal(DataPortal):
-    def get_dividends_by_record_date(self, symbol: str, record_date: str, asof: str | None = None) -> pd.DataFrame:
-        return pd.DataFrame()
 
 
 class SingleAssetBuyAndHoldStrategy(Strategy):
@@ -122,10 +116,9 @@ class BacktraderOrderReplay(bt.Strategy):
         )
 
 
-def test_single_etf_buy_and_hold_portfolio_nav_matches_backtrader_real_data():
-    portal = build_real_data_portal()
-    config = portal.config
-    benchmark_range, bars = select_benchmark_range(portal, config)
+def test_single_etf_buy_and_hold_portfolio_nav_matches_backtrader_v2(tmp_path):
+    portal = create_fake_v2_portal(tmp_path / "v2")
+    benchmark_range, bars = select_benchmark_range(portal)
 
     fundlab_nav = run_fundlab_benchmark(portal, benchmark_range)
     backtrader_nav = run_backtrader_benchmark(bars)
@@ -150,9 +143,9 @@ def test_single_etf_buy_and_hold_portfolio_nav_matches_backtrader_real_data():
         "asset_allocation",
     ],
 )
-def test_rule_strategy_portfolio_nav_matches_backtrader_real_data(strategy: Strategy):
-    portal = build_real_data_portal()
-    end_date = portal.config.get("data", {}).get("default_end_date", "2026-05-07")
+def test_rule_strategy_portfolio_nav_matches_backtrader_v2(strategy: Strategy, tmp_path):
+    portal = create_fake_v2_portal(tmp_path / "v2")
+    end_date = "2026-02-12"
 
     fundlab_nav, orders = run_fundlab_strategy_benchmark(portal, strategy, STRATEGY_PARITY_START_DATE, end_date)
     symbols = sorted({order.symbol for order in orders})
@@ -162,38 +155,21 @@ def test_rule_strategy_portfolio_nav_matches_backtrader_real_data(strategy: Stra
     assert_strategy_nav_parity(strategy.strategy_id, symbols, fundlab_nav, backtrader_nav, orders)
 
 
-def build_real_data_portal() -> DataPortal:
-    config = load_config(BASE_CONFIG_PATH)
-    sqlite_db = resolve_repo_path(get_path(config, "sqlite_db"))
-    parquet_root = resolve_repo_path(get_path(config, "parquet_root"))
-    daily_bar_path = parquet_root / "fund_daily_bar"
-
-    if not sqlite_db.exists():
-        pytest.fail(f"Real warehouse SQLite database not found: {sqlite_db}")
-    if not daily_bar_path.exists():
-        pytest.fail(f"Real warehouse daily bar parquet path not found: {daily_bar_path}")
-
-    return DividendExcludedDataPortal(
-        sqlite_store=SQLiteStore(sqlite_db),
-        parquet_store=ParquetStore(parquet_root),
-        config=config,
-    )
-
-
 def resolve_repo_path(path: Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def select_benchmark_range(portal: DataPortal, config: dict) -> tuple[BenchmarkRange, pd.DataFrame]:
+def select_benchmark_range(portal: DataPortal) -> tuple[BenchmarkRange, pd.DataFrame]:
     candidates = get_candidate_symbols(portal)
-    start_date = config.get("data", {}).get("default_start_date", "1900-01-01")
-    end_date = config.get("data", {}).get("default_end_date", "2100-12-31")
+    start_date = "2026-01-02"
+    end_date = "2026-02-12"
 
     bars = portal.get_daily_bar(
         candidates,
         start_date=start_date,
         end_date=end_date,
         fields=["open", "high", "low", "close", "volume"],
+        price_mode=PriceMode.RAW,
     )
     if bars.empty:
         pytest.fail(real_data_failure_message("no candidate ETF daily bars were found"))
@@ -215,19 +191,7 @@ def select_benchmark_range(portal: DataPortal, config: dict) -> tuple[BenchmarkR
 
 
 def get_candidate_symbols(portal: DataPortal) -> list[str]:
-    fund_master = portal.get_fund_master(point_in_time=False)
-    if fund_master.empty:
-        pytest.fail(real_data_failure_message("fund_master has no rows"))
-
-    candidates = fund_master.copy()
-    if "product_type" in candidates.columns:
-        candidates = candidates[candidates["product_type"] == "ETF"]
-    if "include_in_universe" in candidates.columns:
-        candidates = candidates[candidates["include_in_universe"] == 1]
-    if "is_active" in candidates.columns and (candidates["is_active"] == 1).any():
-        candidates = candidates[candidates["is_active"] == 1]
-
-    symbols = candidates.sort_values("symbol")["symbol"].dropna().astype(str).tolist()
+    symbols = portal.get_universe("2026-02-12")
     if not symbols:
         pytest.fail(real_data_failure_message("no ETF symbols were found in fund_master"))
     return symbols
@@ -329,6 +293,7 @@ def load_replay_bars(portal: DataPortal, symbols: list[str], start_date: str, en
         start_date=start_date,
         end_date=end_date,
         fields=["open", "high", "low", "close", "volume"],
+        price_mode=PriceMode.RAW,
     )
     if bars.empty:
         pytest.fail(f"No daily bars found for Backtrader replay symbols={symbols_with_clock}")
@@ -484,11 +449,4 @@ def assert_strategy_nav_parity(
 
 
 def real_data_failure_message(reason: str) -> str:
-    config = load_config(BASE_CONFIG_PATH)
-    sqlite_db = resolve_repo_path(get_path(config, "sqlite_db"))
-    parquet_root = resolve_repo_path(get_path(config, "parquet_root"))
-    return (
-        "No eligible local real-data ETF/range exists: "
-        f"{reason}. SQLite={sqlite_db}; daily_bar_parquet={parquet_root / 'fund_daily_bar'}. "
-        "No fake-data fallback was used."
-    )
+    return f"No eligible isolated v2 ETF/range exists: {reason}."

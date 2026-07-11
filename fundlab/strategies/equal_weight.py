@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fundlab.data.portal import DataPortal
+from fundlab.data.platform import PriceMode
 from fundlab.strategies.base import Strategy
 
 
@@ -16,7 +17,7 @@ class EqualWeightStrategy(Strategy):
         for symbol in self.symbols:
             if symbol not in universe:
                 continue
-            if data_portal.get_price(symbol, date, field="close") is not None:
+            if data_portal.get_price(symbol, date, price_mode=PriceMode.RAW, field="close") is not None:
                 tradable.append(symbol)
 
         if not tradable:
@@ -27,4 +28,3 @@ class EqualWeightStrategy(Strategy):
         targets = {symbol: weight for symbol in tradable}
         targets["cash"] = self.cash_weight
         return targets
-

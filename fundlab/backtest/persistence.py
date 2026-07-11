@@ -24,7 +24,7 @@ class BacktestSQLiteWriter:
         end_date: str,
         initial_cash: float,
         config: dict | None = None,
-        data_version: str | None = "fake-local",
+        data_version: str | None = None,
     ) -> tuple[str, dict]:
         run_id = new_id("bt")
         config_payload = config or {}
@@ -178,4 +178,3 @@ class BacktestSQLiteWriter:
             """,
             [row],
         )
-

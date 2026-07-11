@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fundlab.backtest.models import Account, Position, Trade
+from fundlab.data.platform import PriceMode
 from fundlab.data.portal import DataPortal
 
 
@@ -23,25 +24,9 @@ class Accounting:
         account.positions[trade.symbol] = position
 
     def accrue_dividends(self, account: Account, date: str, data_portal: DataPortal) -> list[dict]:
-        events = []
-        for symbol, position in account.positions.items():
-            if position.quantity <= 0:
-                continue
-            dividends = data_portal.get_dividends_by_record_date(symbol, date, asof=date)
-            for dividend in dividends.to_dict(orient="records"):
-                amount = position.quantity * float(dividend["dividend_per_share"]) * (1 - float(dividend.get("tax_rate") or 0))
-                receivable = {
-                    "symbol": symbol,
-                    "record_date": date,
-                    "payment_date": dividend.get("payment_date") or dividend["ex_dividend_date"],
-                    "quantity": position.quantity,
-                    "dividend_per_share": float(dividend["dividend_per_share"]),
-                    "amount": amount,
-                    "status": "pending",
-                }
-                account.dividend_receivables.append(receivable)
-                events.append({"date": date, "event_type": "dividend_receivable", **receivable})
-        return events
+        # Dividend data is not trusted/published in Data Platform v2. Existing
+        # receivables can still be paid, but normal runs must not read legacy data.
+        return []
 
     def pay_dividends(self, account: Account, date: str) -> list[dict]:
         events = []
@@ -69,7 +54,9 @@ class Accounting:
             if position.quantity <= 0:
                 account.positions.pop(symbol, None)
                 continue
-            price = data_portal.get_price(symbol, date, field="close", allow_previous=True)
+            price = data_portal.get_price(
+                symbol, date, price_mode=PriceMode.RAW, field="close", allow_previous=True
+            )
             if price is None:
                 continue
             position.market_price = price

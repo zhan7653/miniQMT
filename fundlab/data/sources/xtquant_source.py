@@ -6,15 +6,31 @@ from typing import Any, Sequence
 import pandas as pd
 
 from fundlab.data.sources.base import MarketDataSource
+from fundlab.data.platform import (
+    PreflightResult,
+    ProviderCapability,
+    ProviderHealth,
+    ProviderRequest,
+    SymbolResult,
+)
+from fundlab.data.sources.base import ProviderUnavailableError
 
 
 class XtQuantSource(MarketDataSource):
     name = "xtquant"
+    capabilities = frozenset(
+        {
+            ProviderCapability.TRADING_CALENDAR,
+            ProviderCapability.INSTRUMENTS,
+            ProviderCapability.DAILY_BARS_RAW,
+            ProviderCapability.DAILY_BARS_ADJUSTED,
+        }
+    )
 
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict | None = None, *, xtdata: Any | None = None):
         self.config = config or {}
-        self.connected = False
-        self.xtdata = None
+        self.xtdata = xtdata
+        self.connected = xtdata is not None
 
     def connect(self) -> None:
         try:
@@ -25,9 +41,71 @@ class XtQuantSource(MarketDataSource):
         self.xtdata = xtdata
         self.connected = True
 
+    def preflight(self) -> PreflightResult:
+        observed_at = datetime.now().astimezone()
+        if self.xtdata is None:
+            try:
+                self.connect()
+            except (ImportError, RuntimeError) as exc:
+                health = ProviderHealth.SDK_MISSING if isinstance(exc.__cause__, ImportError) else ProviderHealth.SERVICE_UNAVAILABLE
+                return PreflightResult(self.name, health, observed_at, str(exc))
+        probe_symbol = self.config.get("preflight_symbol", "510300.SH")
+        try:
+            raw = self.xtdata.get_market_data_ex(
+                field_list=["close"], stock_list=[probe_symbol], period="1d", start_time="", end_time="",
+                count=1, dividend_type="none", fill_data=False,
+            )
+        except Exception as exc:
+            return PreflightResult(self.name, ProviderHealth.SERVICE_UNAVAILABLE, observed_at, str(exc))
+        if raw is None:
+            return PreflightResult(self.name, ProviderHealth.UNHEALTHY, observed_at, "MiniQMT probe returned no response")
+        return PreflightResult(self.name, ProviderHealth.AVAILABLE, observed_at)
+
+    def fetch(self, request: ProviderRequest):
+        self.require_capability(request.capability)
+        self._require_connection()
+        start = request.start_date.strftime("%Y%m%d")
+        end = request.end_date.strftime("%Y%m%d")
+        if request.capability in {ProviderCapability.DAILY_BARS_RAW, ProviderCapability.DAILY_BARS_ADJUSTED}:
+            dividend_type = "none" if request.capability is ProviderCapability.DAILY_BARS_RAW else "front"
+            return self._fetch_bars(request, start, end, dividend_type)
+        if request.capability is ProviderCapability.TRADING_CALENDAR:
+            frame = self.get_trading_calendar(request.start_date.isoformat(), request.end_date.isoformat())
+            results = [SymbolResult(symbol, len(frame)) for symbol in request.symbols]
+            return frame, self._provider_result(request, results)
+        rows = self.get_instruments()
+        frame = pd.DataFrame(rows)
+        results = [SymbolResult(symbol, int(not frame.empty and symbol in set(frame["symbol"]))) for symbol in request.symbols]
+        return frame, self._provider_result(request, results)
+
+    def _fetch_bars(self, request: ProviderRequest, start: str, end: str, dividend_type: str):
+        frames: list[pd.DataFrame] = []
+        statuses: list[SymbolResult] = []
+        for symbol in request.symbols:
+            try:
+                raw = self.xtdata.get_market_data_ex(
+                    field_list=[], stock_list=[symbol], period="1d", start_time=start, end_time=end,
+                    count=-1, dividend_type=dividend_type, fill_data=False,
+                )
+                frame = self._normalize_daily_bar_response(raw, price_mode=dividend_type)
+                symbol_frame = frame[frame["symbol"] == symbol] if not frame.empty else frame
+                if symbol_frame.empty:
+                    statuses.append(SymbolResult(symbol, 0, "no data returned"))
+                else:
+                    frames.append(symbol_frame)
+                    statuses.append(SymbolResult(symbol, len(symbol_frame)))
+            except Exception as exc:
+                if isinstance(exc, (ConnectionError, TimeoutError, RuntimeError)):
+                    raise ProviderUnavailableError(
+                        f"MiniQMT failed while reading {request.capability.value}: {exc}"
+                    ) from exc
+                statuses.append(SymbolResult(symbol, 0, str(exc)))
+        data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return data, self._provider_result(request, statuses)
+
     def _require_connection(self) -> None:
         if not self.connected or self.xtdata is None:
-            raise RuntimeError("XtQuantSource is not connected. Call connect() first.")
+            raise ProviderUnavailableError("XtQuantSource is not connected. Call connect() first.")
 
     def get_instruments(self) -> list[dict]:
         self._require_connection()
@@ -264,7 +342,7 @@ class XtQuantSource(MarketDataSource):
             return "equity", "sector", "passive_index"
         return "equity", "broad_based", "passive_index"
 
-    def _normalize_daily_bar_response(self, raw: Any) -> pd.DataFrame:
+    def _normalize_daily_bar_response(self, raw: Any, price_mode: str = "none") -> pd.DataFrame:
         frames = []
         if isinstance(raw, dict):
             for symbol, frame in raw.items():
@@ -281,7 +359,7 @@ class XtQuantSource(MarketDataSource):
             data["pre_close"] = data.groupby("symbol")["close"].shift(1)
         else:
             data["pre_close"] = data["pre_close"].fillna(data.groupby("symbol")["close"].shift(1))
-        data["adj_factor"] = 1.0
+        data["price_mode"] = "raw" if price_mode == "none" else "adjusted"
         if "suspended" not in data.columns:
             data["suspended"] = False
         data["limit_up"] = None

@@ -6,6 +6,11 @@ This document describes what is implemented in the current FundLab codebase. It 
 
 FundLab is a lightweight research and backtesting lab for exchange-traded rule-based funds. The current implementation centers on a local data warehouse, a point-in-time `DataPortal`, feature generation, rule strategies, risk checks, and a simple next-open backtest engine.
 
+The repository also contains Data Platform v2: provider capability/configuration contracts, an
+audited SQLite catalog, immutable raw/staging/published Parquet lifecycle, complete-only versioned
+portal and run-local snapshot, trusted adjusted-price/raw-liquidity features, read-only v1 migration,
+and a deterministic daily update/reporting path.
+
 ## Implemented Capabilities
 
 - Local package skeleton with `fundlab` modules and script entry points under `scripts/`.
@@ -25,6 +30,9 @@ FundLab is a lightweight research and backtesting lab for exchange-traded rule-b
 | --- | --- |
 | `fundlab/common/` | Shared config loading, date normalization, logging, IDs, hashes, and base exceptions. |
 | `fundlab/data/storage/` | `SQLiteStore` and `ParquetStore` wrappers for warehouse access. |
+| `fundlab/data/platform/` | Provider, batch, version, trust, universe, and catalog contracts for v2. |
+| `fundlab/data/migration/` | Read-only v1 bootstrap, quarantine, reconciliation, rollback manifest, and retry behavior. |
+| `fundlab/data/pipeline/` | Deterministic provider preflight, quality gate, feature build, atomic publication, recovery, and reports. |
 | `fundlab/data/loaders/` | Loaders for fund universe, calendar, daily bars, NAV, dividends, index valuations, and computed features. |
 | `fundlab/data/portal/` | `DataPortal`, the read interface used by strategies, risk rules, feature generation, and backtests. |
 | `fundlab/data/processors/` | Symbol normalization and daily-bar quality checks. |
@@ -162,3 +170,8 @@ Additional scripts:
 - Fake data is deterministic and test-oriented, not production market data.
 - Strategy execution is a simple next-open simulation, not a live trading or paper-trading gateway.
 - Risk checks are intentionally lightweight and should be extended before production trading.
+
+V2 intentionally does not add paid/automatic fallback providers, live scheduling services, real
+corporate-action completion, minute data, or a UI. The operator or Codex/cron invokes the CLI. The
+legacy warehouse stays available only as a read-only rollback boundary; new consumers use a pinned
+complete v2 version and explicit raw/adjusted modes.

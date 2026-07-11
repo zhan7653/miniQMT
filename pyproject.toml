@@ -20,4 +20,9 @@ dev = [
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
-
+markers = [
+    "performance: deterministic fixed-local performance regression tests",
+    "system: cross-module failure, recovery, and immutability tests",
+    "real_data: tests requiring the read-only legacy warehouse",
+    "miniqmt: tests requiring a logged-in local MiniQMT service",
+]

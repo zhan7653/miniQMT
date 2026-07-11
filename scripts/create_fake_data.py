@@ -6,6 +6,7 @@ from pathlib import Path
 import os
 
 import pandas as pd
+import pyarrow as pa
 
 from fundlab.common.config import get_path, load_config
 from fundlab.data.loaders import DividendLoader, IndexValuationLoader, NavLoader
@@ -377,6 +378,60 @@ def _guard_fake_data_path(db_path: Path, parquet_root: Path) -> None:
 
 def main() -> None:
     create_fake_data()
+
+
+def create_fake_v2_portal(root: str | Path, version_id: str = "fake-v2"):
+    """Publish an isolated, complete v2 fixture and return its pinned portal."""
+    from datetime import datetime, timezone
+
+    from fundlab.data.platform import (BatchRecord, BatchStatus, DataCatalog, ManifestIdentity, TrustState,
+                                       VersionRecord, VersionStatus)
+    from fundlab.data.portal import DataPortal
+    from fundlab.data.storage import VersionedParquetStore
+
+    root = Path(root)
+    catalog = DataCatalog(root / "catalog.sqlite3")
+    catalog.initialize()
+    store = VersionedParquetStore(root, catalog)
+    if store.published_path(version_id).is_dir():
+        return DataPortal.open_version(store, version_id)
+    days = business_days(date(2026, 1, 2), 30)
+    symbols = tuple(item["symbol"] for item in FAKE_FUNDS)
+    batch_id = f"batch-{version_id}"
+    catalog.create_batch(BatchRecord(batch_id, "fake", days[0], days[-1], symbols, "fake-universe-v1",
+                                     "fake-config", f"request-{version_id}", BatchStatus.PENDING, 0, None))
+    store.begin_version(version_id)
+    rows = []
+    for day_index, trading_day in enumerate(days):
+        for symbol_index, symbol in enumerate(symbols):
+            base = (4.0, 6.0, 5.2)[symbol_index]
+            open_price = round(base + day_index * (0.004 + symbol_index * 0.001), 3)
+            close_price = round(open_price * (1 + 0.001 * ((day_index + symbol_index) % 5 - 2)), 3)
+            rows.append({"date": trading_day.isoformat(), "symbol": symbol, "open": open_price,
+                         "high": max(open_price, close_price) + .025, "low": min(open_price, close_price) - .025,
+                         "close": close_price, "volume": 8_000_000.0, "amount": 40_000_000.0})
+    bars = pa.Table.from_pylist(rows)
+    store.write_table(version_id, "daily_bars_raw", bars)
+    store.write_table(version_id, "daily_bars_adjusted", bars)
+    store.write_table(version_id, "calendar", pa.table({"date": [item.isoformat() for item in days],
+                                                           "is_trading_day": [True] * len(days)}))
+    store.write_table(version_id, "universe", pa.table({"symbol": list(symbols),
+                                                           "effective_date": [days[0].isoformat()] * len(symbols)}))
+    feature_rows = []
+    for day_index, trading_day in enumerate(days):
+        for index, symbol in enumerate(symbols):
+            feature_rows.append({"date": trading_day.isoformat(), "symbol": symbol,
+                                 "ret_20d": .02 + index * .01 + day_index * .001,
+                                 "ret_60d": .04 + index * .01, "amount_avg_20d": 40_000_000.0})
+    store.write_table(version_id, "features", pa.Table.from_pylist(feature_rows))
+    identity = ManifestIdentity("fake", batch_id, version_id, datetime.now(timezone.utc), TrustState.TRUSTED,
+                                f"content-{version_id}", 1, {})
+    manifest = store.prepare_manifest(identity, {})
+    catalog.create_version(VersionRecord(version_id, batch_id, manifest.fingerprint, identity.content_fingerprint,
+                                         VersionStatus.BUILDING, None, None, None))
+    store.finalize_manifest(manifest)
+    catalog.complete_version(version_id)
+    return DataPortal.open_version(store, version_id)
 
 
 if __name__ == "__main__":

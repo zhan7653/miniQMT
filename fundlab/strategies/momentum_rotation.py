@@ -14,7 +14,7 @@ class MomentumRotationStrategy(Strategy):
 
     def on_rebalance(self, date: str, data_portal: DataPortal, context: dict) -> dict[str, float]:
         symbols = data_portal.get_universe(date)
-        features = data_portal.get_features(symbols, date, asof=date)
+        features = data_portal.get_features(symbols, date)
         if features.empty:
             return {"cash": 1.0}
         candidates = features.dropna(subset=["ret_20d", "ret_60d", "amount_avg_20d"]).copy()
@@ -27,4 +27,3 @@ class MomentumRotationStrategy(Strategy):
         targets = {symbol: weight for symbol in selected.index}
         targets["cash"] = self.cash_weight
         return targets
-
