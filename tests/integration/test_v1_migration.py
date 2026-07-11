@@ -8,6 +8,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from fundlab.data.migration import LegacyV1Migrator
 from fundlab.data.migration.v1_migrator import LegacyV1Reader
@@ -16,6 +17,7 @@ from fundlab.data.platform import (
     SymbolResult,
 )
 from fundlab.data.storage import VersionNotVisibleError, VersionedParquetStore
+from scripts import migrate_data_v1_to_v2 as migration_cli
 
 
 ACTIVE = ("510300.SH", "510500.SH", "518880.SH")
@@ -143,3 +145,57 @@ def test_large_unexplained_adjustment_difference_pauses_before_any_catalog_write
         migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash")
     with sqlite3.connect(catalog.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM ingestion_batches").fetchone()[0] == 0
+
+
+def test_confirmed_cli_invocation_is_cwd_independent_and_writes_json_and_markdown(tmp_path, monkeypatch):
+    reader = _legacy_fixture(tmp_path)
+    config_dir = tmp_path / "configuration"
+    config_dir.mkdir()
+    universe_path = config_dir / "universe.yaml"
+    universe_path.write_text(yaml.safe_dump({
+        "version": "fixture", "effective_date": "2026-01-05", "symbols": list(ACTIVE),
+        "benchmarks": [ACTIVE[0]],
+    }), encoding="utf-8")
+    config_path = config_dir / "base.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "paths": {
+            "sqlite_db": str(reader.sqlite_path), "parquet_root": str(reader.parquet_root.parent),
+            "v2_catalog": "../runtime/v2/catalog.sqlite", "v2_raw_root": "../runtime/v2/raw",
+            "v2_staging_root": "../runtime/v2/staging", "v2_published_root": "../runtime/v2/published",
+            "v2_report_root": "../runtime/reports",
+        },
+        "platform": {"timezone": "Asia/Hong_Kong"},
+        "providers": {"enabled": ["xtquant"], "fallback": None},
+        "reviewed_universe": {"config_path": "universe.yaml", "benchmark_symbols": [ACTIVE[0]],
+                              "feature_lookback_days": 120},
+    }), encoding="utf-8")
+    monkeypatch.setattr(migration_cli, "XtQuantSource", lambda: FixtureProvider(_bars(), _bars(.99)))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    json_output, markdown_output = tmp_path / "evidence" / "migration.json", tmp_path / "evidence" / "migration.md"
+
+    exit_code = migration_cli.main([
+        "--config", str(config_path), "--target-date", "2026-01-05",
+        "--json-output", str(json_output), "--markdown-output", str(markdown_output),
+    ])
+
+    assert exit_code == migration_cli.EXIT_SUCCESS
+    payload = __import__("json").loads(json_output.read_text(encoding="utf-8"))
+    assert payload["status"] == "complete" and payload["target_date"] == "2026-01-05"
+    assert payload["legacy"]["backtest_run_count"] == 52 and len(payload["legacy"]["hashes"]) == 5
+    assert len(payload["quarantined"]) == 3
+    assert payload["reconciliation"]["quarantined_rows"] == 3
+    report = markdown_output.read_text(encoding="utf-8")
+    assert "Five legacy v1 hashes" in report and "Legacy backtest runs: `52`" in report
+
+
+def test_cli_configuration_error_has_deterministic_exit_and_reports(tmp_path):
+    json_output, markdown_output = tmp_path / "failure.json", tmp_path / "failure.md"
+    exit_code = migration_cli.main([
+        "--config", str(tmp_path / "missing.yaml"), "--target-date", "2026-01-05",
+        "--json-output", str(json_output), "--markdown-output", str(markdown_output),
+    ])
+    assert exit_code == migration_cli.EXIT_CONFIGURATION_ERROR
+    assert '"status": "failed"' in json_output.read_text(encoding="utf-8")
+    assert "## Failure" in markdown_output.read_text(encoding="utf-8")

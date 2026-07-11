@@ -81,3 +81,15 @@ def test_legacy_facade_rejects_mutation_methods_and_attributes():
         legacy.update_data
     with pytest.raises(AttributeError):
         legacy.new_attribute = 1
+
+
+def test_legacy_constructor_compatibility_is_calendar_only():
+    class SQLite:
+        def read_frame(self, query, params):
+            import pandas as pd
+            return pd.DataFrame({"is_trading_day": [1]})
+    portal = DataPortal(sqlite_store=SQLite(), parquet_store=object())
+    assert portal.data_version is None
+    assert portal.is_trading_day("2026-01-02") is True
+    with pytest.raises(RuntimeError, match="calendar queries only"):
+        portal.snapshot()

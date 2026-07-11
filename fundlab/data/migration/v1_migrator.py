@@ -134,7 +134,7 @@ class LegacyV1Migrator:
 
     def migrate(self, *, active_symbols: Sequence[str], universe_version: str,
                 config_hash: str, expected_hashes: Mapping[str, str] | None = None,
-                expected_backtest_runs: int = 52) -> MigrationResult:
+                expected_backtest_runs: int = 52, target_date: date | None = None) -> MigrationResult:
         symbols = tuple(sorted(set(active_symbols)))
         if not symbols:
             raise ValueError("active_symbols cannot be empty")
@@ -146,6 +146,10 @@ class LegacyV1Migrator:
             raise MigrationError(f"Expected {expected_backtest_runs} legacy backtest runs, found {run_count}")
 
         legacy = self.reader.read_bars()
+        if target_date is not None:
+            legacy = legacy.loc[legacy["date"] <= target_date.isoformat()].copy()
+        if legacy.empty:
+            raise MigrationError("No legacy rows exist on or before target_date")
         contaminated = legacy.apply(lambda row: (row["symbol"], row["date"]) in KNOWN_CONTAMINATION, axis=1)
         quarantined_frame = legacy.loc[contaminated].copy()
         found = set(zip(quarantined_frame["symbol"], quarantined_frame["date"]))
@@ -157,7 +161,8 @@ class LegacyV1Migrator:
         legacy_quality = self.quality_checker.check(trusted_legacy)
         if not legacy_quality.publication_eligible or legacy_quality.blocked_symbols:
             raise MigrationError("Trusted legacy rows failed validation")
-        start_date, end_date = date.fromisoformat(legacy["date"].min()), date.fromisoformat(legacy["date"].max())
+        start_date = date.fromisoformat(legacy["date"].min())
+        end_date = target_date or date.fromisoformat(legacy["date"].max())
         raw = self._fetch(symbols, start_date, end_date, ProviderCapability.DAILY_BARS_RAW)
         adjusted = self._fetch(symbols, start_date, end_date, ProviderCapability.DAILY_BARS_ADJUSTED)
         self._validate_repair(raw, adjusted, symbols)
