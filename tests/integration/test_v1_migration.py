@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import sqlite3
 
@@ -13,9 +13,10 @@ import yaml
 from fundlab.data.migration import LegacyV1Migrator
 from fundlab.data.migration.v1_migrator import LegacyV1Reader
 from fundlab.data.platform import (
-    DataCatalog, PreflightResult, ProviderCapability, ProviderHealth, ProviderResult,
+    DataCatalog, PreflightResult, PriceMode, ProviderCapability, ProviderHealth, ProviderResult,
     SymbolResult,
 )
+from fundlab.data.portal import DataPortal
 from fundlab.data.storage import VersionNotVisibleError, VersionedParquetStore
 from scripts import migrate_data_v1_to_v2 as migration_cli
 
@@ -103,7 +104,7 @@ def test_bootstrap_quarantines_exact_rows_repairs_both_price_modes_and_is_idempo
     assert provider.calls == [ProviderCapability.DAILY_BARS_RAW, ProviderCapability.DAILY_BARS_ADJUSTED]
     raw = store.read_table(result.version_id, "daily_bars_raw").to_pandas()
     adjusted = store.read_table(result.version_id, "daily_bars_adjusted").to_pandas()
-    features = store.read_table(result.version_id, "features_daily").to_pandas()
+    features = store.read_table(result.version_id, "features").to_pandas()
     assert set(raw.loc[raw.symbol.isin(ACTIVE), "price_mode"]) == {"raw"}
     assert set(adjusted.price_mode) == {"adjusted"}
     assert not raw.loc[raw.symbol.isin(ACTIVE), "close"].equals(adjusted.close)
@@ -118,6 +119,32 @@ def test_bootstrap_quarantines_exact_rows_repairs_both_price_modes_and_is_idempo
     assert repeated.status == "already_complete"
     assert repeated.version_id == result.version_id
     assert catalog.latest_complete().version_id == result.version_id
+
+
+def test_migrated_complete_version_is_fully_readable_through_frozen_data_portal(tmp_path):
+    reader = _legacy_fixture(tmp_path)
+    hashes, sizes = reader.hashes(), reader.sizes()
+    migrator, _, store = _migrator(tmp_path, reader, FixtureProvider(_bars(), _bars(.99)))
+    result = migrator.migrate(
+        active_symbols=ACTIVE, universe_version="fixture", config_hash="hash",
+        expected_hashes=hashes, target_date=date(2026, 1, 5),
+        universe_effective_date=date(2026, 1, 2),
+    )
+
+    portal = DataPortal.open_version(store, result.version_id)
+    assert portal.data_version == result.version_id
+    assert portal.get_trading_days("2026-01-02", "2026-01-05") == ["2026-01-02", "2026-01-05"]
+    assert portal.is_trading_day("2026-01-05") is True
+    assert portal.get_universe("2026-01-05") == sorted(ACTIVE)
+    raw = portal.get_daily_bar(ACTIVE, "2026-01-02", "2026-01-05", fields=["close"], price_mode=PriceMode.RAW)
+    adjusted = portal.get_daily_bar(ACTIVE, "2026-01-02", "2026-01-05", fields=["close"], price_mode=PriceMode.ADJUSTED)
+    assert len(raw) == len(adjusted) == 6
+    assert not raw["close"].equals(adjusted["close"])
+    features = portal.get_features(ACTIVE, "2026-01-05", fields=["ret_1d", "price_mode", "provider"])
+    assert list(features.index) == sorted(ACTIVE)
+    assert set(features["price_mode"]) == {"adjusted"}
+    assert set(features["provider"]) == {"xtquant"}
+    assert reader.hashes() == hashes and reader.sizes() == sizes and reader.backtest_run_count() == 52
 
 
 def test_failed_migration_is_visible_as_failed_but_never_published(tmp_path):

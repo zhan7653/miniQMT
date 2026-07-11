@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
                                   store=VersionedParquetStore(v2_root, catalog), report_root=report_root).migrate(
             active_symbols=universe.symbols, universe_version=universe.version, config_hash=universe.config_hash,
             expected_hashes=expected, target_date=target_date,
+            universe_effective_date=universe.effective_date,
         )
         payload.update(result.to_dict())
         payload["target_date"] = target_date.isoformat()

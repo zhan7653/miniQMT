@@ -134,7 +134,8 @@ class LegacyV1Migrator:
 
     def migrate(self, *, active_symbols: Sequence[str], universe_version: str,
                 config_hash: str, expected_hashes: Mapping[str, str] | None = None,
-                expected_backtest_runs: int = 52, target_date: date | None = None) -> MigrationResult:
+                expected_backtest_runs: int = 52, target_date: date | None = None,
+                universe_effective_date: date | None = None) -> MigrationResult:
         symbols = tuple(sorted(set(active_symbols)))
         if not symbols:
             raise ValueError("active_symbols cannot be empty")
@@ -174,6 +175,18 @@ class LegacyV1Migrator:
         published_raw = pd.concat([retained, raw], ignore_index=True).drop_duplicates(["date", "symbol"], keep="last")
         published_raw = published_raw.sort_values(["date", "symbol"]).reset_index(drop=True)
         features = self._features(adjusted, raw)
+        calendar = pd.DataFrame({
+            "date": sorted(published_raw["date"].unique()),
+            "is_trading_day": True,
+        })
+        effective_date = universe_effective_date or start_date
+        universe = pd.DataFrame({
+            "symbol": symbols,
+            "effective_date": effective_date.isoformat(),
+            "universe_version": universe_version,
+            "config_hash": config_hash,
+            "is_active": True,
+        })
         reconciliation = ReconciliationResult(
             legacy_rows=len(legacy), quarantined_rows=len(quarantined_frame), retained_legacy_rows=len(retained),
             repaired_raw_rows=len(raw), repaired_adjusted_rows=len(adjusted), published_raw_rows=len(published_raw),
@@ -181,7 +194,8 @@ class LegacyV1Migrator:
             active_symbol_counts={symbol: int((raw["symbol"] == symbol).sum()) for symbol in symbols},
         )
         content = stable_fingerprint({"source_hashes": before_hashes, "symbols": symbols,
-                                      "raw": len(published_raw), "adjusted": len(adjusted), "features": len(features)})
+                                      "raw": len(published_raw), "adjusted": len(adjusted),
+                                      "calendar": len(calendar), "universe": len(universe), "features": len(features)})
         latest = self.catalog.latest_complete()
         if latest and latest.content_fingerprint == content:
             return MigrationResult("already_complete", latest.version_id, latest.batch_id, reconciliation,
@@ -197,7 +211,8 @@ class LegacyV1Migrator:
         try:
             self.store.begin_version(version_id)
             tables = {"daily_bars_raw": published_raw, "daily_bars_adjusted": adjusted,
-                      "features_daily": features, "quarantine": quarantined_frame}
+                      "calendar": calendar, "universe": universe, "features": features,
+                      "quarantine": quarantined_frame}
             for name, frame in tables.items():
                 self.store.write_table(version_id, name, pa.Table.from_pandas(frame, preserve_index=False))
             row_counts = {name: len(frame) for name, frame in tables.items()}

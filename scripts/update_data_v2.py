@@ -47,7 +47,8 @@ def main(argv: list[str] | None = None) -> int:
             provider_name=config["providers"]["enabled"][0], catalog=catalog,
             store=VersionedParquetStore(root, catalog), universe=universe,
             report_root=get_path(config, "v2_report_root"), config_hash=stable_fingerprint(config))
-        result = runner.run(args.target_date, start_date=args.start_date)
+        result = runner.run(args.target_date, start_date=args.start_date,
+                            backfill_missing=args.backfill_missing)
     except Exception as exc:
         print(f"configuration_error: {exc}", file=sys.stderr)
         return 2

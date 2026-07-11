@@ -80,7 +80,8 @@ class DailyUpdateRunner:
         self.feature_builder = feature_builder or self._build_features
         self.config_hash, self.warmup_days = config_hash, warmup_days
 
-    def run(self, target_date: date, *, start_date: date | None = None) -> UpdateResult:
+    def run(self, target_date: date, *, start_date: date | None = None,
+            backfill_missing: bool = False) -> UpdateResult:
         started = audit_now()
         batch_id = version_id = None
         previous = self.catalog.latest_complete()
@@ -94,7 +95,8 @@ class DailyUpdateRunner:
             if not preflight.available:
                 raise RuntimeError(f"Provider preflight failed: {preflight.health.value}: {preflight.detail or ''}".rstrip())
 
-            scope_start = start_date or self._next_missing_start(previous, target_date)
+            scope_start = start_date or (self._next_missing_start(previous, target_date)
+                                         if backfill_missing else target_date)
             if scope_start > target_date:
                 result = UpdateResult("complete", target_date.isoformat(), self.provider_name,
                                       version_id=previous.version_id if previous else None,
@@ -129,8 +131,11 @@ class DailyUpdateRunner:
             raw = raw[raw["symbol"].isin(eligible)].copy()
             adjusted = adjusted[adjusted["symbol"].isin(eligible)].copy()
             features = self.feature_builder(raw, adjusted, eligible, scope_start.isoformat(), target_date.isoformat())
-            tables = {"calendar": calendar, "daily_bars_raw": raw, "daily_bars_adjusted": adjusted,
-                      "features": features}
+            ingested_tables = {
+                "calendar": calendar, "daily_bars_raw": raw, "daily_bars_adjusted": adjusted,
+                "features": features,
+            }
+            tables = self._merge_predecessor(previous, ingested_tables)
             content = stable_fingerprint({name: self._frame_fingerprint(frame) for name, frame in tables.items()})
             existing = self._version_by_content(content)
             if existing:
@@ -171,7 +176,7 @@ class DailyUpdateRunner:
             self.catalog.create_version(VersionRecord(version_id, batch_id, manifest.fingerprint, content,
                                                        VersionStatus.BUILDING, previous.version_id if previous else None,
                                                        None, None))
-            for name, frame in tables.items():
+            for name, frame in ingested_tables.items():
                 try:
                     self.store.write_raw(batch_id, name, pa.Table.from_pandas(frame.reset_index(drop=True), preserve_index=False))
                 except Exception as exc:
@@ -197,10 +202,34 @@ class DailyUpdateRunner:
             return target
         try:
             frame = self.store.read_table(previous.version_id, "calendar").to_pandas()
-            latest = max(date.fromisoformat(str(value)) for value in frame["date"])
+            latest = max(date.fromisoformat(str(value)[:10]) for value in frame["date"])
             return latest + timedelta(days=1)
         except Exception:
             return target
+
+    def _merge_predecessor(self, previous, incoming: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """Build a full successor snapshot; incoming canonical keys replace predecessor keys."""
+        if previous is None:
+            return incoming
+        merged: dict[str, pd.DataFrame] = {}
+        keys = {"calendar": ["date"], "daily_bars_raw": ["date", "symbol"],
+                "daily_bars_adjusted": ["date", "symbol"], "features": ["date", "symbol"]}
+        for name, new_rows in incoming.items():
+            try:
+                old_rows = self.store.read_table(previous.version_id, name).to_pandas()
+            except Exception:
+                old_rows = pd.DataFrame(columns=new_rows.columns)
+            if old_rows.empty:
+                combined = new_rows.copy()
+            elif new_rows.empty:
+                combined = old_rows.copy()
+            else:
+                columns = list(dict.fromkeys([*old_rows.columns, *new_rows.columns]))
+                combined = pd.concat([old_rows.reindex(columns=columns), new_rows.reindex(columns=columns)],
+                                     ignore_index=True)
+                combined = combined.drop_duplicates(keys[name], keep="last")
+            merged[name] = combined.sort_values(keys[name]).reset_index(drop=True)
+        return merged
 
     def _version_by_content(self, content: str):
         if not self.catalog.path.exists():

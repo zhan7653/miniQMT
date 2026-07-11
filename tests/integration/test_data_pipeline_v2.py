@@ -4,7 +4,8 @@ import pandas as pd
 
 from fundlab.data.pipeline import DailyUpdateRunner
 from fundlab.data.platform import (DataCatalog, PreflightResult, ProviderCapability, ProviderHealth,
-                                   ProviderResult, SymbolResult, UniverseSnapshot)
+                                   PriceMode, ProviderResult, SymbolResult, UniverseSnapshot)
+from fundlab.data.portal import DataPortal
 from fundlab.data.sources.provider_registry import ProviderRegistry
 from fundlab.data.storage import VersionedParquetStore
 
@@ -106,3 +107,36 @@ def test_crash_after_finalize_is_failed_and_retry_uses_new_immutable_attempt(tmp
     assert retried.succeeded and retried.batch_id != failed.batch_id
     assert retried.version_id != failed.version_id
     assert catalog.latest_complete().version_id == retried.version_id
+
+
+def test_successor_is_full_snapshot_and_preserves_excluded_symbol_history(tmp_path):
+    provider = FakeProvider()
+    runner, _ = make_runner(tmp_path, provider)
+    first = runner.run(date(2026, 5, 5), start_date=date(2026, 5, 1))
+    assert first.succeeded
+    provider.bad_symbol = "510500.SH"
+    second = runner.run(date(2026, 5, 7), start_date=date(2026, 5, 6))
+    assert second.succeeded and second.excluded_symbols == ("510500.SH",)
+
+    portal = DataPortal.open_latest_complete(runner.store)
+    bars = portal.get_daily_bar(["510300.SH", "510500.SH"], "2026-05-01", "2026-05-07",
+                                price_mode=PriceMode.RAW).reset_index()
+    eligible_dates = set(bars.loc[bars["symbol"] == "510300.SH", "date"])
+    excluded_dates = set(bars.loc[bars["symbol"] == "510500.SH", "date"])
+    assert {"2026-05-01", "2026-05-07"}.issubset(eligible_dates)
+    assert "2026-05-01" in excluded_dates
+    assert "2026-05-06" not in excluded_dates and "2026-05-07" not in excluded_dates
+
+
+def test_backfill_flag_changes_missing_date_resolution(tmp_path):
+    provider = FakeProvider()
+    runner, _ = make_runner(tmp_path / "off", provider)
+    assert runner.run(date(2026, 5, 5), start_date=date(2026, 5, 5)).succeeded
+    target_only = runner.run(date(2026, 5, 7), backfill_missing=False)
+    assert target_only.missing_dates == ("2026-05-07",)
+
+    provider2 = FakeProvider()
+    runner2, _ = make_runner(tmp_path / "on", provider2)
+    assert runner2.run(date(2026, 5, 5), start_date=date(2026, 5, 5)).succeeded
+    backfilled = runner2.run(date(2026, 5, 7), backfill_missing=True)
+    assert backfilled.missing_dates == ("2026-05-06", "2026-05-07")
