@@ -117,7 +117,9 @@ class VersionedParquetStore:
         record = self.catalog.latest_complete() if version_id is None else self._version_record(version_id)
         if record is None:
             raise VersionNotVisibleError("No complete published data version is available")
-        if record.status is not VersionStatus.COMPLETE:
+        allowed = ({VersionStatus.COMPLETE} if version_id is None
+                   else {VersionStatus.COMPLETE, VersionStatus.SUPERSEDED})
+        if record.status not in allowed:
             raise VersionNotVisibleError(f"Version is not complete and visible: {record.version_id} ({record.status.value})")
         directory = self.published_path(record.version_id)
         if not directory.is_dir():

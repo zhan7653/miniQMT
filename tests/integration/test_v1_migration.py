@@ -13,8 +13,9 @@ import yaml
 from fundlab.data.migration import LegacyV1Migrator
 from fundlab.data.migration.v1_migrator import LegacyV1Reader
 from fundlab.data.platform import (
-    DataCatalog, PreflightResult, PriceMode, ProviderCapability, ProviderHealth, ProviderResult,
-    SymbolResult,
+    BatchRecord, BatchStatus, DataCatalog, ManifestIdentity, PreflightResult, PriceMode,
+    ProviderCapability, ProviderHealth, ProviderResult, SymbolResult, TrustState,
+    VersionRecord, VersionStatus,
 )
 from fundlab.data.portal import DataPortal
 from fundlab.data.storage import VersionNotVisibleError, VersionedParquetStore
@@ -113,12 +114,61 @@ def test_bootstrap_quarantines_exact_rows_repairs_both_price_modes_and_is_idempo
     assert set(features.liquidity_price_mode) == {"raw"}
     assert reader.hashes() == hashes and reader.sizes() == sizes and reader.backtest_run_count() == 52
     assert Path(result.rollback_manifest).is_file()
+    rollback = __import__("json").loads(Path(result.rollback_manifest).read_text(encoding="utf-8"))
+    assert set(rollback["raw_inputs"]) == {"legacy_trusted", "repaired_raw", "repaired_adjusted", "quarantine"}
+    assert all(Path(path).is_file() for path in rollback["raw_inputs"].values())
 
     repeated = migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash",
                                 expected_hashes=hashes)
     assert repeated.status == "already_complete"
     assert repeated.version_id == result.version_id
     assert catalog.latest_complete().version_id == result.version_id
+
+
+def test_same_count_changed_provider_values_create_a_semantic_revision(tmp_path):
+    reader = _legacy_fixture(tmp_path)
+    first_migrator, catalog, store = _migrator(tmp_path, reader, FixtureProvider(_bars(), _bars(.99)))
+    first = first_migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash")
+    second_migrator = LegacyV1Migrator(
+        reader=reader, provider=FixtureProvider(_bars(1.01), _bars(1.00)), catalog=catalog, store=store,
+        report_root=tmp_path / "reports",
+    )
+
+    second = second_migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash")
+
+    assert second.status == "complete" and second.version_id != first.version_id
+    assert catalog.latest_complete().version_id == second.version_id
+    with sqlite3.connect(catalog.path) as connection:
+        rows = connection.execute(
+            "SELECT version_id, content_fingerprint, status FROM published_versions ORDER BY created_at"
+        ).fetchall()
+    assert len({row[1] for row in rows}) == 2
+    assert {row[2] for row in rows} == {"superseded", "complete"}
+
+
+def test_same_bootstrap_rerun_after_later_successor_keeps_latest_pointer_unchanged(tmp_path):
+    reader = _legacy_fixture(tmp_path)
+    provider = FixtureProvider(_bars(), _bars(.99))
+    migrator, catalog, store = _migrator(tmp_path, reader, provider)
+    bootstrap = migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash")
+    successor_id, successor_batch = "daily-successor-v1", "daily-successor-b1"
+    catalog.create_batch(BatchRecord(successor_batch, "xtquant", date(2026, 1, 5), date(2026, 1, 5), ACTIVE,
+                                     "fixture", "hash", "successor-request", BatchStatus.PENDING, 0, None))
+    store.begin_version(successor_id)
+    for table_name in ("daily_bars_raw", "daily_bars_adjusted", "calendar", "universe", "features", "quarantine"):
+        store.write_table(successor_id, table_name, store.read_table(bootstrap.version_id, table_name))
+    identity = ManifestIdentity("xtquant", successor_batch, successor_id, datetime.now().astimezone(),
+                                TrustState.TRUSTED, "successor-content", 1, {})
+    manifest = store.prepare_manifest(identity, {})
+    catalog.create_version(VersionRecord(successor_id, successor_batch, manifest.fingerprint, "successor-content",
+                                         VersionStatus.BUILDING, bootstrap.version_id, None, None))
+    store.finalize_manifest(manifest)
+    catalog.complete_version(successor_id)
+
+    repeated = migrator.migrate(active_symbols=ACTIVE, universe_version="fixture", config_hash="hash")
+
+    assert repeated.status == "already_complete" and repeated.version_id == bootstrap.version_id
+    assert catalog.latest_complete().version_id == successor_id
 
 
 def test_migrated_complete_version_is_fully_readable_through_frozen_data_portal(tmp_path):

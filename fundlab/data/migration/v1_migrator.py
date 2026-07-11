@@ -60,6 +60,7 @@ class RollbackManifest:
     legacy_backtest_run_count: int
     version_id: str
     previous_version_id: str | None
+    raw_inputs: Mapping[str, str]
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -193,13 +194,24 @@ class LegacyV1Migrator:
             published_adjusted_rows=len(adjusted), feature_rows=len(features),
             active_symbol_counts={symbol: int((raw["symbol"] == symbol).sum()) for symbol in symbols},
         )
-        content = stable_fingerprint({"source_hashes": before_hashes, "symbols": symbols,
-                                      "raw": len(published_raw), "adjusted": len(adjusted),
-                                      "calendar": len(calendar), "universe": len(universe), "features": len(features)})
+        canonical_tables = {"daily_bars_raw": published_raw, "daily_bars_adjusted": adjusted,
+                            "calendar": calendar, "universe": universe, "features": features,
+                            "quarantine": quarantined_frame}
+        content = stable_fingerprint({
+            "schema": 1, "provider": self.provider.name, "target_date": end_date.isoformat(),
+            "universe_version": universe_version, "universe_effective_date": effective_date.isoformat(),
+            "config_hash": config_hash, "symbols": symbols, "source_hashes": before_hashes,
+            "tables": {name: self._frame_fingerprint(frame) for name, frame in canonical_tables.items()},
+        })
+        historical = self._historical_bootstrap(content)
+        if historical is not None:
+            return MigrationResult("already_complete", historical[0], historical[1], reconciliation,
+                                   self._quarantine_records(found), str(self.report_root / historical[0] / "rollback.json"))
         latest = self.catalog.latest_complete()
-        if latest and latest.content_fingerprint == content:
-            return MigrationResult("already_complete", latest.version_id, latest.batch_id, reconciliation,
-                                   self._quarantine_records(found), str(self.report_root / latest.version_id / "rollback.json"))
+        if latest and not latest.version_id.startswith("v2-bootstrap-"):
+            raise MigrationError(
+                f"A later complete successor {latest.version_id} exists; bootstrap will not change the latest pointer"
+            )
 
         batch_id, version_id = f"migration-{uuid4().hex}", f"v2-bootstrap-{uuid4().hex}"
         request_fp = stable_fingerprint({"content": content, "attempt": batch_id})
@@ -209,13 +221,20 @@ class LegacyV1Migrator:
         self.catalog.create_version(VersionRecord(version_id, batch_id, "pending", content, VersionStatus.BUILDING,
                                                   latest.version_id if latest else None, None, None))
         try:
+            raw_inputs = {
+                "legacy_trusted": str(self.store.write_raw(batch_id, "legacy_trusted", pa.Table.from_pandas(
+                    trusted_legacy, preserve_index=False))),
+                "repaired_raw": str(self.store.write_raw(batch_id, "repaired_raw", pa.Table.from_pandas(
+                    raw, preserve_index=False))),
+                "repaired_adjusted": str(self.store.write_raw(batch_id, "repaired_adjusted", pa.Table.from_pandas(
+                    adjusted, preserve_index=False))),
+                "quarantine": str(self.store.write_raw(batch_id, "quarantine", pa.Table.from_pandas(
+                    quarantined_frame, preserve_index=False))),
+            }
             self.store.begin_version(version_id)
-            tables = {"daily_bars_raw": published_raw, "daily_bars_adjusted": adjusted,
-                      "calendar": calendar, "universe": universe, "features": features,
-                      "quarantine": quarantined_frame}
-            for name, frame in tables.items():
+            for name, frame in canonical_tables.items():
                 self.store.write_table(version_id, name, pa.Table.from_pandas(frame, preserve_index=False))
-            row_counts = {name: len(frame) for name, frame in tables.items()}
+            row_counts = {name: len(frame) for name, frame in canonical_tables.items()}
             identity = ManifestIdentity(self.provider.name, batch_id, version_id, audit_now(), TrustState.TRUSTED,
                                         content, 1, row_counts)
             manifest = self.store.prepare_manifest(identity, row_counts)
@@ -227,7 +246,7 @@ class LegacyV1Migrator:
             self.catalog.transition_batch(batch_id, BatchStatus.COMPLETE, row_count=sum(row_counts.values()))
             self.catalog.complete_version(version_id)
             rollback = RollbackManifest(audit_now().isoformat(), before_hashes, before_sizes, run_count,
-                                        version_id, latest.version_id if latest else None)
+                                        version_id, latest.version_id if latest else None, raw_inputs)
             rollback_path = self.report_root / version_id / "rollback.json"
             rollback.write(rollback_path)
             self._verify_legacy(before_hashes, before_sizes, run_count)
@@ -301,6 +320,36 @@ class LegacyV1Migrator:
     def _verify_legacy(self, hashes, sizes, runs):
         if self.reader.hashes() != hashes or self.reader.sizes() != sizes or self.reader.backtest_run_count() != runs:
             raise MigrationError("Legacy v1 changed during migration")
+
+    def _historical_bootstrap(self, content_fingerprint: str) -> tuple[str, str] | None:
+        with sqlite3.connect(f"file:{self.catalog.path.resolve().as_posix()}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT version_id, batch_id FROM published_versions "
+                "WHERE version_id LIKE 'v2-bootstrap-%' AND content_fingerprint=? "
+                "AND status IN (?, ?) ORDER BY published_at DESC LIMIT 1",
+                (content_fingerprint, VersionStatus.COMPLETE.value, VersionStatus.SUPERSEDED.value),
+            ).fetchone()
+        return (str(row[0]), str(row[1])) if row else None
+
+    @staticmethod
+    def _frame_fingerprint(frame: pd.DataFrame) -> str:
+        data = frame.copy()
+        data = data.drop(columns=[column for column in ("updated_at", "source_updated_at", "published_at")
+                                  if column in data.columns])
+        columns = sorted(data.columns)
+        data = data.loc[:, columns]
+        if {"date", "symbol"}.issubset(data.columns):
+            data = data.sort_values(["date", "symbol"])
+        elif "date" in data.columns:
+            data = data.sort_values(["date"])
+        elif "symbol" in data.columns:
+            data = data.sort_values(["symbol"])
+        normalized = []
+        for record in data.to_dict(orient="records"):
+            normalized.append({key: (None if pd.isna(value) else value.item() if hasattr(value, "item") else value)
+                               for key, value in record.items()})
+        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return sha256(encoded.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _quarantine_records(keys):

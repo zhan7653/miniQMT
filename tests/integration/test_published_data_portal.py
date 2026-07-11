@@ -93,3 +93,29 @@ def test_legacy_constructor_compatibility_is_calendar_only():
     assert portal.is_trading_day("2026-01-02") is True
     with pytest.raises(RuntimeError, match="calendar queries only"):
         portal.snapshot()
+
+
+def test_pinned_portal_survives_successor_publication_with_uncached_read(tmp_path):
+    store = _published(tmp_path)
+    portal_v1 = DataPortal.open_version(store, "v1")
+    portal_v1.get_daily_bar(["A"], "2026-01-02", "2026-01-02", fields=["close"], price_mode=PriceMode.RAW)
+
+    catalog = store.catalog
+    catalog.create_batch(BatchRecord("b2", "mini_qmt", date(2026, 1, 4), date(2026, 1, 4), ("A",),
+                                     "u1", "cfg", "request-2", BatchStatus.PENDING, 0, None))
+    store.begin_version("v2")
+    store.write_table("v2", "daily_bars_raw",
+                      pa.table({"date": ["2026-01-04"], "symbol": ["A"], "open": [12.0], "close": [12.5]}))
+    identity = ManifestIdentity("mini_qmt", "b2", "v2", datetime.now(timezone.utc), TrustState.TRUSTED,
+                                "content-2", 1, {})
+    manifest = store.prepare_manifest(identity, {"daily_bars_raw": 1})
+    catalog.create_version(VersionRecord("v2", "b2", manifest.fingerprint, "content-2",
+                                         VersionStatus.BUILDING, "v1", None, None))
+    store.finalize_manifest(manifest)
+    catalog.complete_version("v2")
+
+    # Different projection/date forces a new store read rather than a snapshot cache hit.
+    uncached = portal_v1.get_daily_bar(["A"], "2026-01-03", "2026-01-03", fields=["open"],
+                                       price_mode=PriceMode.RAW)
+    assert uncached.iloc[0]["open"] == 11.0
+    assert DataPortal.open_latest_complete(store).data_version == "v2"
