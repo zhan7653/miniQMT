@@ -6,6 +6,11 @@ FundLab treats local warehouse data as research-critical infrastructure. Source 
 
 `xtquant` / MiniQMT is the primary and authoritative source for real market data in this project.
 
+Data Platform v2 enables providers only through explicit reviewed configuration. V1 enables exactly
+`xtquant` and requires `providers.fallback: null`. A provider may be called only for a capability it
+declares. Provider credentials, if future adapters require them, belong in environment variables or
+local secure configuration and must not be committed.
+
 Production or regression-grade real-data refreshes must use the existing `xtquant` path:
 
 - `scripts.update_calendar`
@@ -17,6 +22,10 @@ Production or regression-grade real-data refreshes must use the existing `xtquan
 - `scripts.update_real_data`
 
 If `xtquant` is unavailable, missing from the Python environment, not connected, or MiniQMT is not logged in, the refresh must fail clearly and ask the operator to restore the `xtquant` environment. It must not silently fall back to another provider.
+
+The absence of adjusted prices is also not a fallback condition. Dependent research features remain
+unpublished rather than silently using raw prices. Raw prices remain the sole legal execution,
+cost-basis, and valuation source.
 
 ## Auxiliary Sources
 
@@ -47,3 +56,8 @@ Examples of unacceptable auxiliary use:
 When working on this repository, an agent must not fetch real market data from non-`xtquant` providers by default.
 
 If `xtquant` is unavailable, the agent must stop and tell the user that the real-data refresh requires `xtquant` / MiniQMT. It may suggest an auxiliary comparison workflow only after making clear that the result is not the primary real-data warehouse source.
+
+The tracked v1 SQLite and daily-bar Parquet artifacts are read-only legacy evidence. V2 migration
+must snapshot their hashes, use read-only access, publish only into v2 roots, and verify the hashes
+again. Legacy NAV, premium/discount, valuation, and dividend placeholders are untrusted and must not
+be exposed by default to v2 consumers.

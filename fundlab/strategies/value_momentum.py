@@ -11,22 +11,5 @@ class ValueMomentumStrategy(Strategy):
         self.strategy_id = strategy_id
 
     def on_rebalance(self, date: str, data_portal: DataPortal, context: dict) -> dict[str, float]:
-        symbols = data_portal.get_universe(date)
-        features = data_portal.get_features(symbols, date, asof=date)
-        if features.empty:
-            return {"cash": 1.0}
-        candidates = features.dropna(subset=["valuation_score", "momentum_score", "liquidity_score"]).copy()
-        candidates = candidates[candidates["momentum_score"] > 0.5]
-        if candidates.empty:
-            return {"cash": 1.0}
-        candidates["score"] = (
-            candidates["valuation_score"] * 0.55
-            + candidates["momentum_score"] * 0.35
-            + candidates["liquidity_score"] * 0.10
-        )
-        selected = candidates.sort_values("score", ascending=False).head(self.max_positions)
-        weight = (1 - self.cash_weight) / len(selected)
-        targets = {symbol: weight for symbol in selected.index}
-        targets["cash"] = self.cash_weight
-        return targets
-
+        # Valuation inputs are not part of the trusted v2 feature schema.
+        return {"cash": 1.0}

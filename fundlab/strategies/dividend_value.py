@@ -11,17 +11,5 @@ class DividendValueStrategy(Strategy):
         self.strategy_id = strategy_id
 
     def on_rebalance(self, date: str, data_portal: DataPortal, context: dict) -> dict[str, float]:
-        symbols = data_portal.get_universe(date, filters={"asset_class": "equity"})
-        features = data_portal.get_features(symbols, date, asof=date)
-        if features.empty:
-            return {"cash": 1.0}
-        candidates = features.dropna(subset=["valuation_score", "dividend_yield_12m"]).copy()
-        if candidates.empty:
-            return {"cash": 1.0}
-        candidates["score"] = candidates["valuation_score"] * 0.7 + candidates["dividend_yield_12m"].rank(pct=True) * 0.3
-        selected = candidates.sort_values("score", ascending=False).head(self.max_positions)
-        weight = (1 - self.cash_weight) / len(selected)
-        targets = {symbol: weight for symbol in selected.index}
-        targets["cash"] = self.cash_weight
-        return targets
-
+        # Dividend and valuation inputs are not trusted v2 features yet.
+        return {"cash": 1.0}

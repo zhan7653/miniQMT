@@ -1,25 +1,8 @@
-core_universe:
-  product_types:
-    - ETF
-    - MONEY_ETF
-  management_types:
-    - passive_index
-    - smart_beta
-    - passive_bond
-    - passive_commodity
-    - passive_money_market
-    - cross_border_index
-  asset_classes:
-    - equity
-    - bond
-    - commodity
-    - money_market
-    - cross_border
-
-manual_include:
+version: reviewed-v1
+effective_date: "2026-05-07"
+symbols:
   - 510300.SH
   - 510500.SH
   - 518880.SH
-
-manual_exclude: []
-
+benchmarks:
+  - 510300.SH

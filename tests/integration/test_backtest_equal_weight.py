@@ -1,23 +1,10 @@
 from fundlab.backtest import BacktestEngine
-from fundlab.common.config import get_path, load_config
-from fundlab.data.portal import DataPortal
-from fundlab.data.storage import ParquetStore, SQLiteStore
 from fundlab.strategies import EqualWeightStrategy
-from scripts.create_fake_data import create_fake_data
+from scripts.create_fake_data import create_fake_v2_portal
 
 
-def build_portal() -> DataPortal:
-    create_fake_data()
-    config = load_config()
-    return DataPortal(
-        sqlite_store=SQLiteStore(get_path(config, "sqlite_db")),
-        parquet_store=ParquetStore(get_path(config, "parquet_root")),
-        config=config,
-    )
-
-
-def test_equal_weight_backtest_runs_next_open_execution():
-    portal = build_portal()
+def test_equal_weight_backtest_runs_next_open_execution(tmp_path):
+    portal = create_fake_v2_portal(tmp_path / "v2")
     strategy = EqualWeightStrategy(["510300.SH", "510500.SH", "518880.SH"], cash_weight=0.02)
     recorder = BacktestEngine(
         data_portal=portal,
@@ -41,11 +28,10 @@ def test_equal_weight_backtest_runs_next_open_execution():
     assert orders.iloc[0]["execution_date"] == "2026-01-05"
 
 
-def test_strategy_cannot_access_execution_open_by_design():
-    portal = build_portal()
+def test_strategy_cannot_access_execution_open_by_design(tmp_path):
+    portal = create_fake_v2_portal(tmp_path / "v2")
     strategy = EqualWeightStrategy(["510300.SH"], cash_weight=0.02)
 
     targets = strategy.on_rebalance("2026-01-02", portal, {})
 
     assert targets["510300.SH"] == 0.98
-

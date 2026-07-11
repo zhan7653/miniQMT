@@ -4,7 +4,8 @@ from fundlab.backtest import BacktestEngine
 from fundlab.backtest.persistence import BacktestSQLiteWriter
 from fundlab.common.config import get_path, load_config
 from fundlab.data.portal import DataPortal
-from fundlab.data.storage import ParquetStore, SQLiteStore
+from fundlab.data.platform import DataCatalog
+from fundlab.data.storage import SQLiteStore, VersionedParquetStore
 from fundlab.strategies import EqualWeightStrategy
 
 
@@ -15,7 +16,7 @@ def run_equal_weight_backtest(
     prepare_fake_data: bool = True,
 ):
     if prepare_fake_data:
-        from scripts.create_fake_data import create_fake_data
+        from scripts.create_fake_data import create_fake_data, create_fake_v2_portal
 
         create_fake_data()
     config = load_config()
@@ -28,11 +29,11 @@ def run_equal_weight_backtest(
         end_date = end_date or config.get("data", {}).get("default_end_date", "2026-05-07")
         symbols = symbols or config.get("data", {}).get("validation_symbols", ["510300.SH", "510500.SH", "518880.SH"])
     sqlite_store = SQLiteStore(get_path(config, "sqlite_db"))
-    portal = DataPortal(
-        sqlite_store=sqlite_store,
-        parquet_store=ParquetStore(get_path(config, "parquet_root")),
-        config=config,
-    )
+    if prepare_fake_data:
+        portal = create_fake_v2_portal(get_path(config, "sqlite_db").parent / "fake-v2")
+    else:
+        catalog = DataCatalog(get_path(config, "v2_catalog"))
+        portal = DataPortal.open_latest_complete(VersionedParquetStore(get_path(config, "v2_published_root").parent, catalog))
     strategy = EqualWeightStrategy(symbols, cash_weight=0.02)
     engine = BacktestEngine(
         data_portal=portal,
@@ -50,6 +51,7 @@ def run_equal_weight_backtest(
         end_date=end_date,
         initial_cash=1_000_000,
         config={"strategy": strategy.strategy_id, "rebalance_frequency": "monthly"},
+        data_version=portal.data_version,
     )
     return run_id, recorder, metrics
 

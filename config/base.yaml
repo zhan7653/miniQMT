@@ -1,7 +1,26 @@
 paths:
-  sqlite_db: data/warehouse/sqlite/fundlab.db
-  parquet_root: data/warehouse/parquet
-  log_dir: logs
+  sqlite_db: ../data/warehouse/sqlite/fundlab.db
+  parquet_root: ../data/warehouse/parquet
+  log_dir: ../logs
+  v2_catalog: ../data/warehouse/v2/catalog.sqlite3
+  v2_raw_root: ../data/warehouse/v2/raw
+  v2_staging_root: ../data/warehouse/v2/staging
+  v2_published_root: ../data/warehouse/v2/published
+  v2_report_root: ../data/reports/data_v2
+
+platform:
+  timezone: Asia/Hong_Kong
+
+providers:
+  enabled:
+    - xtquant
+  fallback: null
+
+reviewed_universe:
+  config_path: universe.yaml
+  benchmark_symbols:
+    - 510300.SH
+  feature_lookback_days: 120
 
 data:
   default_feature_version: v1

@@ -5,7 +5,7 @@ FundLab is a lightweight research and backtesting lab for exchange-traded rule-b
 ## Quick Start
 
 ```powershell
-uv sync
+uv sync --dev --frozen --inexact
 uv run python -m scripts.init_db
 uv run python -m scripts.create_fake_data
 uv run python -m scripts.compute_features
@@ -36,6 +36,20 @@ Or run the full data refresh path:
 ```powershell
 python -m scripts.update_real_data
 ```
+
+## Data Platform v2
+
+The production v2 path uses an explicitly configured MiniQMT/`xtquant` provider, immutable ingestion
+batches, atomic complete-only publication, raw/adjusted price separation, and version-pinned reads.
+It does not fall back to another provider. Normal v2 writes stay under ignored
+`data/warehouse/v2/` and `data/reports/data_v2/`; the v1 warehouse is read-only.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.update_data_v2 --config config/base.yaml --target-date 2026-05-08 --json
+.\.venv\Scripts\python.exe -m scripts.benchmark_data_v2 --config config/base.yaml --assert-thresholds
+```
+
+See `docs/data_platform_v2.md` for the operator, recovery, migration, report, and performance contract.
 
 ## Current Scope
 

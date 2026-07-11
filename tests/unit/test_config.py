@@ -1,14 +1,48 @@
 import yaml
+import pytest
 
-from fundlab.common.config import get_path, load_config
+from fundlab.common.config import get_path, load_config, validate_platform_config
 import scripts.update_real_data as update_real_data_module
 
 
 def test_load_base_config():
     config = load_config("config/base.yaml")
 
-    assert get_path(config, "sqlite_db").as_posix() == "data/warehouse/sqlite/fundlab.db"
-    assert get_path(config, "parquet_root").as_posix() == "data/warehouse/parquet"
+    assert get_path(config, "sqlite_db").as_posix().endswith("/data/warehouse/sqlite/fundlab.db")
+    assert get_path(config, "parquet_root").as_posix().endswith("/data/warehouse/parquet")
+
+
+def test_platform_paths_are_cwd_independent(tmp_path, monkeypatch):
+    config_path = tmp_path / "conf" / "base.yaml"
+    config_path.parent.mkdir()
+    (config_path.parent / "universe.yaml").write_text(
+        "version: reviewed-v1\neffective_date: '2026-05-07'\nsymbols: [510300.SH]\nbenchmarks: [510300.SH]\n",
+        encoding="utf-8",
+    )
+    config_path.write_text(
+        yaml.safe_dump({
+            "paths": {
+                "v2_catalog": "../warehouse/catalog.sqlite3", "v2_raw_root": "../warehouse/raw",
+                "v2_staging_root": "../warehouse/staging", "v2_published_root": "../warehouse/published",
+                "v2_report_root": "../reports",
+            },
+            "platform": {"timezone": "Asia/Hong_Kong"},
+            "providers": {"enabled": ["xtquant"]},
+            "reviewed_universe": {"config_path": "universe.yaml", "benchmark_symbols": ["510300.SH"], "feature_lookback_days": 120},
+        }), encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    validate_platform_config(config)
+    assert get_path(config, "v2_catalog") == (config_path.parent / "../warehouse/catalog.sqlite3").resolve()
+
+
+def test_platform_config_rejects_fallback_empty_benchmark_and_wrong_timezone():
+    config = load_config("config/base.yaml")
+    validate_platform_config(config)
+    config["providers"]["enabled"] = ["xtquant", "fallback"]
+    with pytest.raises(ValueError, match="exactly one"):
+        validate_platform_config(config)
 
 
 def test_update_real_data_forwards_config_path(tmp_path, monkeypatch):
@@ -58,4 +92,3 @@ def test_update_real_data_forwards_config_path(tmp_path, monkeypatch):
         "features": config_path.as_posix(),
         "quality": config_path.as_posix(),
     }
-
