@@ -326,9 +326,16 @@ class FullMarketHistoryRunner:
                 expected_day_coverage=day_coverage,
                 coverage_gates_passed=gates_passed,
             )
+            collect_evidence = self._collect_evidence_payload(
+                result, master, calendar, identities,
+            )
+            evidence_digest = stable_fingerprint(collect_evidence)
+            persist_event(throttle.profile, f"collect_evidence_sha256:{evidence_digest}")
             return self._write_report(result, extra={
                 "fund_master": master,
                 "calendar": list(calendar),
+                "collect_evidence": collect_evidence,
+                "collect_evidence_sha256": evidence_digest,
                 "partitions": [self._partition_dict(item) for item in self.catalog.list_partitions(run_id=run_id)],
                 "attempts": {
                     item.fingerprint: [asdict(attempt) for attempt in self.catalog.list_attempts(item.fingerprint)]
@@ -460,7 +467,21 @@ class FullMarketHistoryRunner:
             if start < earliest:
                 quarantine.setdefault(symbol, []).append(f"implausible_listing_date:{raw_listed}")
                 continue
-            end = min(target, date.fromisoformat(str(row["delisted_date"])[:10])) if row.get("delisted_date") else target
+            raw_delisted = str(row["delisted_date"])[:10] if row.get("delisted_date") else None
+            if raw_delisted:
+                try:
+                    delisted = date.fromisoformat(raw_delisted)
+                except ValueError:
+                    quarantine.setdefault(symbol, []).append(f"invalid_delisting_date:{raw_delisted}")
+                    continue
+                if delisted < start:
+                    quarantine.setdefault(symbol, []).append(
+                        f"delisting_before_listing:{raw_listed}:{raw_delisted}"
+                    )
+                    continue
+                end = min(target, delisted)
+            else:
+                end = target
             if start > end:
                 quarantine.setdefault(symbol, []).append("invalid_validity_interval")
                 continue
@@ -633,6 +654,9 @@ class FullMarketHistoryRunner:
                 continue
             raw = pd.concat(frames[PriceMode.RAW], ignore_index=True)
             adjusted = pd.concat(frames[PriceMode.ADJUSTED], ignore_index=True)
+            schema_error = self._raw_adjusted_schema_error(raw, adjusted)
+            if schema_error:
+                quarantine.setdefault(symbol, []).append(schema_error)
             raw_keys = set(zip(raw["date"].astype(str), raw["symbol"].astype(str)))
             adjusted_keys = set(zip(adjusted["date"].astype(str), adjusted["symbol"].astype(str)))
             if raw_keys != adjusted_keys:
@@ -649,6 +673,47 @@ class FullMarketHistoryRunner:
             if coverage < threshold:
                 quarantine.setdefault(symbol, []).append(f"trading_day_coverage:{coverage:.6f}")
         return dict(sorted(missing_by_symbol.items()))
+
+    @staticmethod
+    def _raw_adjusted_schema_error(raw: pd.DataFrame, adjusted: pd.DataFrame) -> str | None:
+        raw_columns, adjusted_columns = set(raw.columns), set(adjusted.columns)
+        if raw_columns != adjusted_columns:
+            return "raw_adjusted_schema_mismatch:" + json.dumps({
+                "raw_only": sorted(raw_columns - adjusted_columns),
+                "adjusted_only": sorted(adjusted_columns - raw_columns),
+            }, sort_keys=True, separators=(",", ":"))
+        incompatible = sorted(
+            column for column in raw_columns
+            if str(raw[column].dtype) != str(adjusted[column].dtype)
+        )
+        if incompatible:
+            return "raw_adjusted_dtype_mismatch:" + ",".join(incompatible)
+        return None
+
+    def _collect_evidence_payload(
+        self, result: FullMarketHistoryResult, master: Sequence[Mapping[str, Any]],
+        calendar: Sequence[str], identities: Sequence[PartitionIdentity],
+    ) -> dict[str, Any]:
+        return self._json_safe({
+            "schema_version": 1,
+            "run_id": result.run_id,
+            "provider": self.provider.name,
+            "config_hash": self.config_hash,
+            "normalization_identity": HISTORY_PARTITION_NORMALIZATION_IDENTITY,
+            "target_date": result.target_date,
+            "fund_master": list(master),
+            "calendar": list(calendar),
+            "selected_symbols": list(result.selected_symbols),
+            "discovered_count": result.discovered_count,
+            "partition_fingerprints": sorted(identity.fingerprint for identity in identities),
+            "quarantined_symbols": result.quarantined_symbols,
+            "missing_dates": result.missing_dates,
+            "instrument_coverage": result.instrument_coverage,
+            "expected_day_coverage": result.expected_day_coverage,
+            "coverage_gates_passed": result.coverage_gates_passed,
+            "legacy_manifest_before": result.legacy_manifest_before,
+            "legacy_manifest_after": result.legacy_manifest_after,
+        })
 
     def _coverage_summary(
         self,
@@ -740,24 +805,31 @@ class FullMarketHistoryRunner:
         batch_id = version_id = None
         try:
             report = self._latest_collect_report()
-            if report.get("status") != "complete" or not report.get("coverage_gates_passed"):
-                raise RuntimeError("Coverage gates are unmet or the collection is incomplete")
-            if report.get("legacy_manifest_before") != report.get("legacy_manifest_after"):
+            authoritative = self._validated_collect_evidence(report)
+            if not authoritative["coverage_gates_passed"]:
+                raise RuntimeError("Coverage gates are unmet")
+            if authoritative["legacy_manifest_before"] != authoritative["legacy_manifest_after"]:
                 raise RuntimeError("Collection evidence records legacy drift")
-            if legacy_before != report.get("legacy_manifest_after"):
+            if legacy_before != authoritative["legacy_manifest_after"]:
                 raise RuntimeError("Legacy v1 SHA-256 manifest drifted after collection")
-            evidence = report.get("evidence") or {}
-            master = [dict(row) for row in evidence.get("fund_master") or ()]
-            calendar_days = [str(day)[:10] for day in evidence.get("calendar") or ()]
+            master = [dict(row) for row in authoritative["fund_master"]]
+            calendar_days = [str(day)[:10] for day in authoritative["calendar"]]
             if not master or not calendar_days:
                 raise RuntimeError("Collection report is missing fund_master or calendar evidence")
-            run_id = str(report["run_id"])
+            run_id = str(authoritative["run_id"])
             quarantine = {
                 str(symbol): tuple(reasons)
-                for symbol, reasons in (report.get("quarantined_symbols") or {}).items()
+                for symbol, reasons in authoritative["quarantined_symbols"].items()
             }
-            usable = sorted(set(report.get("selected_symbols") or ()) - set(quarantine))
-            tables = self._assemble_baseline_tables(run_id, master, calendar_days, quarantine, usable)
+            selected_symbols = tuple(authoritative["selected_symbols"])
+            usable = sorted(set(selected_symbols) - set(quarantine))
+            identities = tuple(
+                self.catalog.get_partition(fingerprint).identity
+                for fingerprint in authoritative["partition_fingerprints"]
+            )
+            tables = self._assemble_baseline_tables(
+                identities, master, calendar_days, quarantine, usable,
+            )
             required = {
                 "daily_bars_raw", "daily_bars_adjusted", "calendar",
                 "fund_master", "universe", "quarantine",
@@ -771,20 +843,20 @@ class FullMarketHistoryRunner:
             if existing is not None:
                 return self._write_report(FullMarketHistoryResult(
                     "complete", spec.phase.value, self.provider.name, run_id,
-                    report.get("target_date"), tuple(report.get("selected_symbols") or ()),
-                    discovered_count=int(report.get("discovered_count") or 0),
+                    authoritative["target_date"], selected_symbols,
+                    discovered_count=int(authoritative["discovered_count"]),
                     quarantined_symbols=quarantine,
-                    missing_dates={k: tuple(v) for k, v in (report.get("missing_dates") or {}).items()},
+                    missing_dates={k: tuple(v) for k, v in authoritative["missing_dates"].items()},
                     latest_complete_before=before_id,
                     latest_complete_after=before_id,
                     legacy_manifest_before=legacy_before,
                     legacy_manifest_after=self._legacy_manifest(),
-                    instrument_coverage=float(report["instrument_coverage"]),
-                    expected_day_coverage=float(report["expected_day_coverage"]),
+                    instrument_coverage=float(authoritative["instrument_coverage"]),
+                    expected_day_coverage=float(authoritative["expected_day_coverage"]),
                     coverage_gates_passed=True, version_id=existing.version_id,
                 ), extra={"publication_decision": "reused_content_identical_version"})
 
-            target = date.fromisoformat(str(report["target_date"])[:10])
+            target = date.fromisoformat(str(authoritative["target_date"])[:10])
             request = stable_fingerprint({"run_id": run_id, "content": content})
             batch_id = "batch-" + request[:16]
             version_id = "version-" + stable_fingerprint({
@@ -831,14 +903,14 @@ class FullMarketHistoryRunner:
                 raise RuntimeError("Legacy v1 SHA-256 manifest changed during publication")
             return self._write_report(FullMarketHistoryResult(
                 "complete", spec.phase.value, self.provider.name, run_id,
-                target.isoformat(), tuple(report.get("selected_symbols") or ()),
-                discovered_count=int(report.get("discovered_count") or 0),
+                target.isoformat(), selected_symbols,
+                discovered_count=int(authoritative["discovered_count"]),
                 quarantined_symbols=quarantine,
-                missing_dates={k: tuple(v) for k, v in (report.get("missing_dates") or {}).items()},
+                missing_dates={k: tuple(v) for k, v in authoritative["missing_dates"].items()},
                 latest_complete_before=before_id, latest_complete_after=version_id,
                 legacy_manifest_before=legacy_before, legacy_manifest_after=legacy_after,
-                instrument_coverage=float(report["instrument_coverage"]),
-                expected_day_coverage=float(report["expected_day_coverage"]),
+                instrument_coverage=float(authoritative["instrument_coverage"]),
+                expected_day_coverage=float(authoritative["expected_day_coverage"]),
                 coverage_gates_passed=True, version_id=version_id,
             ), extra={"publication_decision": "published", "row_counts": row_counts})
         except Exception as exc:
@@ -878,6 +950,102 @@ class FullMarketHistoryRunner:
             raise RuntimeError("Completed collection report is missing")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _validated_collect_evidence(self, report: Mapping[str, Any]) -> dict[str, Any]:
+        evidence_wrapper = report.get("evidence") or {}
+        evidence = evidence_wrapper.get("collect_evidence")
+        stored_digest = evidence_wrapper.get("collect_evidence_sha256")
+        if not isinstance(evidence, Mapping) or not isinstance(stored_digest, str):
+            raise RuntimeError("Collect evidence binding is missing")
+        computed_digest = stable_fingerprint(evidence)
+        if computed_digest != stored_digest:
+            raise RuntimeError("Collect evidence digest mismatch")
+        run_id = str(evidence.get("run_id") or "")
+        run = self.catalog.get_collection_run(run_id)
+        if (
+            run.phase is not CollectionPhase.COLLECT
+            or run.status is not CollectionRunStatus.COMPLETE
+            or run.config_hash != self.config_hash
+            or evidence.get("config_hash") != self.config_hash
+            or evidence.get("provider") != self.provider.name
+            or evidence.get("target_date") != run.target_date.isoformat()
+            or evidence.get("normalization_identity") != HISTORY_PARTITION_NORMALIZATION_IDENTITY
+        ):
+            raise RuntimeError("Collect evidence identity does not match the completed catalog run")
+        anchors = [
+            event.reason.split(":", 1)[1]
+            for event in self.catalog.list_throttle_events(run_id)
+            if event.reason.startswith("collect_evidence_sha256:")
+        ]
+        if anchors != [computed_digest]:
+            raise RuntimeError("Collect evidence is not uniquely anchored in the catalog")
+
+        selected = tuple(str(symbol) for symbol in evidence.get("selected_symbols") or ())
+        master = [dict(row) for row in evidence.get("fund_master") or ()]
+        calendar = tuple(str(day)[:10] for day in evidence.get("calendar") or ())
+        if (
+            not selected or len(selected) != len(set(selected))
+            or set(selected) != {str(row.get("symbol")) for row in master}
+            or int(evidence.get("discovered_count") or 0) != len(master)
+            or not calendar or tuple(sorted(set(calendar))) != calendar
+        ):
+            raise RuntimeError("Collect evidence master/calendar scope is invalid")
+        fingerprints = tuple(str(item) for item in evidence.get("partition_fingerprints") or ())
+        if len(fingerprints) != len(set(fingerprints)):
+            raise RuntimeError("Collect evidence contains duplicate partition identities")
+        identities: list[PartitionIdentity] = []
+        for fingerprint in fingerprints:
+            record = self.catalog.get_partition(fingerprint)
+            identity = record.identity
+            if (
+                identity.fingerprint != fingerprint
+                or identity.provider != self.provider.name
+                or identity.symbol not in selected
+                or identity.source_identity != f"{self.provider.name}:{HISTORY_PARTITION_NORMALIZATION_IDENTITY}"
+            ):
+                raise RuntimeError("Collect partition identity/source drift")
+            if record.status is PartitionStatus.COMPLETE:
+                self.store.validate_partition(
+                    identity, expected_checksum=record.checksum, expected_row_count=record.row_count,
+                )
+            elif record.status is not PartitionStatus.QUARANTINED:
+                raise RuntimeError("Collect evidence references an incomplete partition")
+            identities.append(identity)
+
+        quarantine = {
+            str(symbol): list(reasons)
+            for symbol, reasons in (evidence.get("quarantined_symbols") or {}).items()
+        }
+        recomputed_missing = self._validate_symbols(master, identities, calendar, quarantine)
+        recomputed_quarantine = {
+            key: tuple(sorted(set(value))) for key, value in sorted(quarantine.items())
+        }
+        instrument_coverage, day_coverage, passed = self._coverage_summary(
+            master, identities, calendar, recomputed_quarantine, recomputed_missing,
+        )
+        bound_missing = {
+            str(key): tuple(value) for key, value in (evidence.get("missing_dates") or {}).items()
+        }
+        bound_quarantine = {
+            str(key): tuple(value) for key, value in (evidence.get("quarantined_symbols") or {}).items()
+        }
+        if (
+            recomputed_missing != bound_missing
+            or recomputed_quarantine != bound_quarantine
+            or abs(instrument_coverage - float(evidence.get("instrument_coverage"))) > 1e-12
+            or abs(day_coverage - float(evidence.get("expected_day_coverage"))) > 1e-12
+            or passed is not bool(evidence.get("coverage_gates_passed"))
+        ):
+            raise RuntimeError("Authoritative coverage recomputation differs from bound collect evidence")
+        for field in (
+            "run_id", "target_date", "selected_symbols", "discovered_count",
+            "quarantined_symbols", "missing_dates", "instrument_coverage",
+            "expected_day_coverage", "coverage_gates_passed", "legacy_manifest_before",
+            "legacy_manifest_after",
+        ):
+            if self._json_safe(report.get(field)) != self._json_safe(evidence.get(field)):
+                raise RuntimeError(f"Mutable report field differs from bound evidence: {field}")
+        return dict(evidence)
+
     @staticmethod
     def _result_from_report(path: Path) -> FullMarketHistoryResult:
         if not path.is_file():
@@ -894,11 +1062,12 @@ class FullMarketHistoryRunner:
         return FullMarketHistoryResult(**values)
 
     def _assemble_baseline_tables(
-        self, run_id: str, master: Sequence[Mapping[str, Any]], calendar_days: Sequence[str],
+        self, identities: Sequence[PartitionIdentity], master: Sequence[Mapping[str, Any]], calendar_days: Sequence[str],
         quarantine: Mapping[str, Sequence[str]], usable: Sequence[str],
     ) -> dict[str, pd.DataFrame]:
         frames = {PriceMode.RAW: [], PriceMode.ADJUSTED: []}
-        for record in self.catalog.list_partitions(run_id=run_id):
+        for identity in identities:
+            record = self.catalog.get_partition(identity.fingerprint)
             if record.identity.symbol not in usable:
                 continue
             if record.status is not PartitionStatus.COMPLETE:
@@ -909,6 +1078,9 @@ class FullMarketHistoryRunner:
             frames[record.identity.price_mode].append(self.store.read_partition(record.identity).to_pandas())
         raw = pd.concat(frames[PriceMode.RAW], ignore_index=True) if frames[PriceMode.RAW] else pd.DataFrame()
         adjusted = pd.concat(frames[PriceMode.ADJUSTED], ignore_index=True) if frames[PriceMode.ADJUSTED] else pd.DataFrame()
+        schema_error = self._raw_adjusted_schema_error(raw, adjusted)
+        if schema_error:
+            raise RuntimeError(schema_error)
         raw_keys = set(zip(raw.get("date", ()), raw.get("symbol", ())))
         adjusted_keys = set(zip(adjusted.get("date", ()), adjusted.get("symbol", ())))
         if raw.empty or adjusted.empty or raw_keys != adjusted_keys:

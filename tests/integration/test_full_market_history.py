@@ -225,6 +225,32 @@ def test_collect_uses_all_symbols_and_quarantines_missing_and_epoch_listing_date
     assert result.coverage_gates_passed is False
 
 
+def test_collect_quarantines_bad_delisting_metadata_without_aborting_other_symbols(tmp_path):
+    provider = FixtureProvider()
+    provider.get_instruments = lambda: [
+        {"symbol": "510001.SH", "exchange": "SH", "product_type": "ETF", "is_active": 1,
+         "listed_date": "2024-01-02", "delisted_date": "bad-date", "source": "xtquant"},
+        {"symbol": "510002.SH", "exchange": "SH", "product_type": "ETF", "is_active": 0,
+         "listed_date": "2024-01-02", "delisted_date": "2024-01-01", "source": "xtquant"},
+        {"symbol": "510003.SH", "exchange": "SH", "product_type": "ETF", "is_active": 1,
+         "listed_date": "2024-01-02", "delisted_date": "2030-01-01", "source": "xtquant"},
+        {"symbol": "510004.SH", "exchange": "SH", "product_type": "ETF", "is_active": 1,
+         "listed_date": "2024-01-02", "delisted_date": None, "source": "xtquant"},
+    ]
+    history, _ = runner(tmp_path, provider)
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert result.status == "complete"
+    assert result.scheduled_partitions == 4
+    assert result.quarantined_symbols["510001.SH"] == ("invalid_delisting_date:bad-date",)
+    assert result.quarantined_symbols["510002.SH"] == (
+        "delisting_before_listing:2024-01-02:2024-01-01",
+    )
+    assert "510003.SH" not in result.quarantined_symbols
+    assert "510004.SH" not in result.quarantined_symbols
+
+
 def test_discovery_is_deterministic_and_does_not_create_partitions(tmp_path):
     history, catalog = runner(tmp_path, FixtureProvider())
     first = history.run(HistoryRunSpec(CollectionPhase.DISCOVER, date(2024, 1, 5), minimum_free_bytes=0))
@@ -413,3 +439,70 @@ def test_failed_successor_publication_keeps_previous_latest_complete(tmp_path, m
     assert failed.status == "failed"
     assert failed.latest_complete_before == failed.latest_complete_after == first.version_id
     assert catalog.latest_complete().version_id == first.version_id
+
+
+@pytest.mark.parametrize("mutation", [
+    "coverage", "master", "calendar", "quarantine", "run_id",
+])
+def test_publish_fails_closed_when_bound_collect_report_is_tampered(tmp_path, mutation):
+    history, catalog = runner(tmp_path, FixtureProvider())
+    collected = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    path = pd.io.common.get_handle(collected.report_json, "r", encoding="utf-8").handle
+    try:
+        payload = json.load(path)
+    finally:
+        path.close()
+    bound = payload["evidence"]["collect_evidence"]
+    if mutation == "coverage":
+        payload["coverage_gates_passed"] = False
+    elif mutation == "master":
+        bound["fund_master"][0]["listed_date"] = "2023-01-01"
+    elif mutation == "calendar":
+        bound["calendar"] = bound["calendar"][:-1]
+    elif mutation == "quarantine":
+        bound["quarantined_symbols"] = {"510300.SH": ["tampered"]}
+    else:
+        bound["run_id"] = "history-tampered"
+    with open(collected.report_json, "w", encoding="utf-8", newline="\n") as stream:
+        json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
+        stream.write("\n")
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    assert result.status == "failed"
+    assert catalog.latest_complete() is None
+
+
+@pytest.mark.parametrize("mode", ["extra_column", "dtype"])
+def test_raw_adjusted_schema_or_dtype_mismatch_blocks_trust_and_publication(tmp_path, mode):
+    provider = FixtureProvider()
+    original_fetch = provider.fetch
+
+    def mismatched_fetch(request):
+        frame, result = original_fetch(request)
+        if request.capability is ProviderCapability.DAILY_BARS_ADJUSTED:
+            frame = frame.copy()
+            if mode == "extra_column":
+                frame["unexpected"] = 1
+            else:
+                frame["amount"] = frame["amount"].astype(str)
+        return frame, result
+
+    provider.fetch = mismatched_fetch
+    history, catalog = runner(tmp_path, provider)
+    collected = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    expected = "raw_adjusted_schema_mismatch" if mode == "extra_column" else "raw_adjusted_dtype_mismatch"
+    assert all(
+        any(reason.startswith(expected) for reason in collected.quarantined_symbols[symbol])
+        for symbol in collected.selected_symbols
+    )
+    assert collected.coverage_gates_passed is False
+    published = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    assert published.status == "failed"
+    assert catalog.latest_complete() is None
