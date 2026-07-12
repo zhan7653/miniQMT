@@ -39,7 +39,8 @@ REQUIRED_BAR_COLUMNS = frozenset(
     {"date", "symbol", "open", "high", "low", "close", "volume", "amount", "suspended", "price_mode"}
 )
 HISTORY_PARTITION_NORMALIZATION_IDENTITY = (
-    "daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required"
+    "daily:1d:raw-front:v3:per-request-throttled:strict-interval-10ms-safety:"
+    "provider-suspension-required"
 )
 
 

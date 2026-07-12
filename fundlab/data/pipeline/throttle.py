@@ -6,6 +6,9 @@ from time import monotonic, sleep
 from typing import Callable, Sequence
 
 
+REQUEST_GATE_SAFETY_MARGIN_SECONDS = 0.010
+
+
 @dataclass(frozen=True)
 class SpeedProfile:
     name: str
@@ -73,11 +76,17 @@ class AdaptiveThrottle:
                 raise RuntimeError("Throttle is paused after a provider health failure")
             now = self._clock()
             if self._last_request_at is not None:
-                remaining = self.profile.request_interval_seconds - (now - self._last_request_at)
+                required_interval = (
+                    self.profile.request_interval_seconds + REQUEST_GATE_SAFETY_MARGIN_SECONDS
+                )
+                remaining = required_interval - (now - self._last_request_at)
                 if remaining > 0:
                     self._sleep(remaining)
-            self._last_request_at = self._clock()
             self._emit(f"request_gate:{request_kind}")
+            # Start the next interval only after durable audit emission. This prevents
+            # event-persistence latency from consuming the safety margin before the
+            # external provider call is released.
+            self._last_request_at = self._clock()
 
     def complete_symbol(self) -> None:
         with self._lock:

@@ -6,6 +6,7 @@ from time import monotonic
 
 import pandas as pd
 import pyarrow as pa
+import pytest
 
 from fundlab.data.pipeline import FullMarketHistoryRunner, HistoryRunSpec
 from fundlab.data.platform import (
@@ -125,8 +126,8 @@ def seed_latest(catalog: DataCatalog) -> str:
     return version_id
 
 
-def seed_v1_partitions(history, catalog):
-    run_id = "history-old-v1-provenance"
+def seed_v2_partitions(history, catalog):
+    run_id = "history-old-v2-provenance"
     catalog.create_collection_run(CollectionRunRecord(
         run_id, "xtquant", CollectionPhase.CANARY, date(2024, 1, 5), "old-config",
         "initial", CollectionRunStatus.PENDING,
@@ -137,7 +138,7 @@ def seed_v1_partitions(history, catalog):
         for mode in (PriceMode.RAW, PriceMode.ADJUSTED):
             identity = PartitionIdentity(
                 "xtquant", symbol, mode, date(2024, 1, 2), date(2024, 1, 5),
-                "xtquant:daily:1d:raw-front:v1",
+                "xtquant:daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required",
             )
             frame = pd.DataFrame({
                 "date": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
@@ -225,7 +226,7 @@ def test_every_download_and_raw_adjusted_fetch_has_its_own_throttle_gate(tmp_pat
         "download", "fetch:daily_bars_raw", "fetch:daily_bars_adjusted",
     ]
     timestamps = [timestamp for _, timestamp in provider.external_calls]
-    assert timestamps == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+    assert timestamps == pytest.approx([0.0, 2.01, 4.02, 6.03, 8.04, 10.05, 12.06])
     assert all(later - earlier >= 2.0 for earlier, later in zip(timestamps, timestamps[1:]))
     request_events = [
         event for event in catalog.list_throttle_events(result.run_id)
@@ -237,10 +238,10 @@ def test_every_download_and_raw_adjusted_fetch_has_its_own_throttle_gate(tmp_pat
     assert sum("daily_bars_adjusted" in event.reason for event in request_events) == 2
 
 
-def test_v1_provenance_partitions_are_preserved_but_not_reused_for_v2(tmp_path):
+def test_v2_provenance_partitions_are_preserved_but_not_reused_for_v3(tmp_path):
     provider = FixtureProvider()
     history, catalog = runner(tmp_path, provider)
-    old_artifacts = seed_v1_partitions(history, catalog)
+    old_artifacts = seed_v2_partitions(history, catalog)
     result = history.run(HistoryRunSpec(
         CollectionPhase.CANARY, date(2024, 1, 5), minimum_free_bytes=0,
     ))
@@ -249,11 +250,11 @@ def test_v1_provenance_partitions_are_preserved_but_not_reused_for_v2(tmp_path):
     assert result.scheduled_partitions == result.completed_partitions == 4
     assert provider.download_calls == 2
     partitions = catalog.list_partitions()
-    old = [item for item in partitions if item.identity.source_identity.endswith(":v1")]
-    new = [item for item in partitions if ":v2:" in item.identity.source_identity]
+    old = [item for item in partitions if ":v2:" in item.identity.source_identity]
+    new = [item for item in partitions if ":v3:" in item.identity.source_identity]
     assert len(old) == len(new) == 4
     assert {item.identity.source_identity for item in new} == {
-        "xtquant:daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required"
+        "xtquant:daily:1d:raw-front:v3:per-request-throttled:strict-interval-10ms-safety:provider-suspension-required"
     }
     for old_record in old:
         old_artifact = old_artifacts[(old_record.identity.symbol, old_record.identity.price_mode)]

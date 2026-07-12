@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from fundlab.data.pipeline.throttle import AdaptiveThrottle, SpeedProfile, build_speed_profiles
+from fundlab.data.pipeline.throttle import (
+    REQUEST_GATE_SAFETY_MARGIN_SECONDS, AdaptiveThrottle, SpeedProfile, build_speed_profiles,
+)
 
 
 class FakeTime:
@@ -66,7 +68,7 @@ def test_request_interval_and_symbol_cooldown_are_enforced():
     throttle = AdaptiveThrottle((profile,), sleeper=fake.sleep, clock=fake.clock)
     throttle.before_request(); throttle.before_request()
     throttle.complete_symbol(); throttle.complete_symbol()
-    assert fake.sleeps == [2.0, 60.0]
+    assert fake.sleeps == [2.0 + REQUEST_GATE_SAFETY_MARGIN_SECONDS, 60.0]
 
 
 def test_external_request_gates_do_not_advance_symbol_cooldown():
@@ -80,9 +82,9 @@ def test_external_request_gates_do_not_advance_symbol_cooldown():
     throttle.before_request("raw_fetch")
     throttle.before_request("adjusted_fetch")
     throttle.complete_symbol()
-    assert fake.sleeps == [2.0, 2.0]
+    assert fake.sleeps == [2.01, 2.01]
     throttle.complete_symbol()
-    assert fake.sleeps == [2.0, 2.0, 60.0]
+    assert fake.sleeps == [2.01, 2.01, 60.0]
     assert events.count("scheduled_cooldown") == 1
     assert [item for item in events if item.startswith("request_gate:")] == [
         "request_gate:download", "request_gate:raw_fetch", "request_gate:adjusted_fetch",
@@ -98,8 +100,40 @@ def test_shared_gate_caps_aggregate_rate_with_four_callers():
     )
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda index: throttle.before_request(f"worker-{index}"), range(4)))
-    assert gate_times == [0.0, 0.5, 1.0, 1.5]
+    assert gate_times == pytest.approx([0.0, 0.51, 1.02, 1.53])
     assert all(later - earlier >= 0.5 for earlier, later in zip(gate_times, gate_times[1:]))
+
+
+def test_gate_safety_margin_absorbs_clock_and_scheduler_undershoot():
+    class JitteringTime(FakeTime):
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.now += max(0.0, seconds - 0.0004)
+
+    fake = JitteringTime(); persisted_gate_times = []; released_request_times = []
+    persistence_delays = iter([0.020, 0.0, 0.015, 0.0])
+
+    def persist_gate(_profile, reason):
+        if reason.startswith("request_gate:"):
+            persisted_gate_times.append(fake.clock())
+            fake.now += next(persistence_delays)
+
+    throttle = AdaptiveThrottle(
+        (SpeedProfile("initial", 1, 2.0, 20, 60.0),),
+        sleeper=fake.sleep, clock=fake.clock,
+        event_callback=persist_gate,
+    )
+    for index in range(4):
+        throttle.before_request(f"jitter-{index}")
+        released_request_times.append(fake.clock())
+    persisted_intervals = [
+        later - earlier for earlier, later in zip(persisted_gate_times, persisted_gate_times[1:])
+    ]
+    actual_intervals = [
+        later - earlier for earlier, later in zip(released_request_times, released_request_times[1:])
+    ]
+    assert min(persisted_intervals) >= 2.0
+    assert min(actual_intervals) >= 2.0
 
 
 def test_profiles_reject_more_than_two_requests_per_second():
