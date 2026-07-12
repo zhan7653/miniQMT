@@ -38,6 +38,9 @@ from .throttle import AdaptiveThrottle, SpeedProfile, build_speed_profiles
 REQUIRED_BAR_COLUMNS = frozenset(
     {"date", "symbol", "open", "high", "low", "close", "volume", "amount", "suspended", "price_mode"}
 )
+HISTORY_PARTITION_NORMALIZATION_IDENTITY = (
+    "daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required"
+)
 
 
 @dataclass(frozen=True)
@@ -406,7 +409,7 @@ class FullMarketHistoryRunner:
     ) -> list[PartitionIdentity]:
         identities: list[PartitionIdentity] = []
         years = max(1, int(self.config.get("partition_years", 1)))
-        source_identity = f"{self.provider.name}:daily:1d:raw-front:v1"
+        source_identity = f"{self.provider.name}:{HISTORY_PARTITION_NORMALIZATION_IDENTITY}"
         for row in selected:
             symbol = str(row["symbol"])
             if not row.get("listed_date"):

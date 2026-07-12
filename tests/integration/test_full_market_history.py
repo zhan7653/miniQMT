@@ -5,12 +5,14 @@ import json
 from time import monotonic
 
 import pandas as pd
+import pyarrow as pa
 
 from fundlab.data.pipeline import FullMarketHistoryRunner, HistoryRunSpec
 from fundlab.data.platform import (
-    BatchRecord, BatchStatus, CollectionPhase, DataCatalog, ManifestIdentity, ProviderCapability,
-    ProviderHealth, PreflightResult, ProviderResult, SymbolResult, TrustState, VersionRecord,
-    VersionStatus, stable_fingerprint,
+    BatchRecord, BatchStatus, CollectionPartitionRecord, CollectionPhase, CollectionRunRecord,
+    CollectionRunStatus, DataCatalog, ManifestIdentity, PartitionIdentity, PartitionStatus, PriceMode,
+    ProviderCapability, ProviderHealth, PreflightResult, ProviderResult, SymbolResult, TrustState,
+    VersionRecord, VersionStatus, stable_fingerprint,
 )
 from fundlab.data.storage import VersionedParquetStore
 
@@ -123,6 +125,42 @@ def seed_latest(catalog: DataCatalog) -> str:
     return version_id
 
 
+def seed_v1_partitions(history, catalog):
+    run_id = "history-old-v1-provenance"
+    catalog.create_collection_run(CollectionRunRecord(
+        run_id, "xtquant", CollectionPhase.CANARY, date(2024, 1, 5), "old-config",
+        "initial", CollectionRunStatus.PENDING,
+    ))
+    catalog.transition_collection_run(run_id, CollectionRunStatus.RUNNING)
+    artifacts = {}
+    for symbol in ("160001.SZ", "510300.SH"):
+        for mode in (PriceMode.RAW, PriceMode.ADJUSTED):
+            identity = PartitionIdentity(
+                "xtquant", symbol, mode, date(2024, 1, 2), date(2024, 1, 5),
+                "xtquant:daily:1d:raw-front:v1",
+            )
+            frame = pd.DataFrame({
+                "date": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+                "symbol": [symbol] * 4, "open": [10.0] * 4, "high": [11.0] * 4,
+                "low": [9.0] * 4, "close": [10.5] * 4, "volume": [100.0] * 4,
+                "amount": [1000.0] * 4, "suspended": [False] * 4,
+                "price_mode": [mode.value] * 4,
+            })
+            artifact = history.store.write_partition(
+                identity, pa.Table.from_pandas(frame, preserve_index=False),
+            )
+            catalog.create_partition(CollectionPartitionRecord(
+                identity.fingerprint, run_id, identity, PartitionStatus.PENDING,
+            ))
+            catalog.transition_partition(identity.fingerprint, PartitionStatus.RUNNING)
+            catalog.transition_partition(
+                identity.fingerprint, PartitionStatus.COMPLETE, row_count=artifact.row_count,
+                checksum=artifact.checksum, storage_path=artifact.path,
+            )
+            artifacts[(symbol, mode)] = artifact
+    return artifacts
+
+
 def test_canary_retries_three_attempts_pauses_and_preserves_latest_complete(tmp_path):
     provider = FixtureProvider(transient_download_failures=2)
     history, catalog = runner(tmp_path, provider)
@@ -197,3 +235,38 @@ def test_every_download_and_raw_adjusted_fetch_has_its_own_throttle_gate(tmp_pat
     assert sum("download_daily_bar" in event.reason for event in request_events) == 2
     assert sum("daily_bars_raw" in event.reason for event in request_events) == 2
     assert sum("daily_bars_adjusted" in event.reason for event in request_events) == 2
+
+
+def test_v1_provenance_partitions_are_preserved_but_not_reused_for_v2(tmp_path):
+    provider = FixtureProvider()
+    history, catalog = runner(tmp_path, provider)
+    old_artifacts = seed_v1_partitions(history, catalog)
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.CANARY, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert result.status == "paused"
+    assert result.reused_partitions == 0
+    assert result.scheduled_partitions == result.completed_partitions == 4
+    assert provider.download_calls == 2
+    partitions = catalog.list_partitions()
+    old = [item for item in partitions if item.identity.source_identity.endswith(":v1")]
+    new = [item for item in partitions if ":v2:" in item.identity.source_identity]
+    assert len(old) == len(new) == 4
+    assert {item.identity.source_identity for item in new} == {
+        "xtquant:daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required"
+    }
+    for old_record in old:
+        old_artifact = old_artifacts[(old_record.identity.symbol, old_record.identity.price_mode)]
+        assert history.store.validate_partition(
+            old_record.identity, expected_checksum=old_artifact.checksum,
+            expected_row_count=old_artifact.row_count,
+        ) == old_artifact
+        matching = next(
+            item for item in new
+            if item.identity.symbol == old_record.identity.symbol
+            and item.identity.price_mode is old_record.identity.price_mode
+            and item.identity.start_date == old_record.identity.start_date
+            and item.identity.end_date == old_record.identity.end_date
+        )
+        assert matching.identity.fingerprint != old_record.identity.fingerprint
+        assert history.store.partition_path(matching.identity) != history.store.partition_path(old_record.identity)

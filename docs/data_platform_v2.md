@@ -62,6 +62,12 @@ symbol/date scope, so raw and adjusted reads do not trigger redundant downloads.
 across its interval wait, preserving the aggregate two-requests-per-second maximum if configured
 workers are later used. Cooldowns remain counted by completed symbol, not by provider-call count.
 
+Historical partitions use the explicit normalization identity
+`xtquant:daily:1d:raw-front:v2:per-request-throttled:provider-suspension-required`. This identity
+requires the per-request throttle contract and provider-supplied suspension evidence. Partitions
+written under the older `xtquant:daily:1d:raw-front:v1` identity remain immutable but are not
+eligible for v2 reuse; the content-addressed store schedules and writes a separate v2 partition.
+
 The collector persists run, partition, attempt, and throttle records in the v2 catalog. A restart
 returns to the initial speed profile and reuses a partition only after identity, checksum, and row
 count validation. Transient partition work has at most three attempts with configured backoff.
