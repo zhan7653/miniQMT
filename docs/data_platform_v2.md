@@ -55,6 +55,13 @@ collects calendar-year partitions clipped to listing date, delisting date, and t
 .\.venv\Scripts\python.exe -m scripts.bootstrap_fund_history --config config/base.yaml --phase canary --sample-limit 20 --no-publish --json
 ```
 
+The collector applies the shared aggregate throttle separately to every external history request:
+the calendar read, a required history download, and each raw or front-adjusted read each receive
+their own gate and durable `request_gate` event. A successful download is reused for the matching
+symbol/date scope, so raw and adjusted reads do not trigger redundant downloads. The gate is locked
+across its interval wait, preserving the aggregate two-requests-per-second maximum if configured
+workers are later used. Cooldowns remain counted by completed symbol, not by provider-call count.
+
 The collector persists run, partition, attempt, and throttle records in the v2 catalog. A restart
 returns to the initial speed profile and reuses a partition only after identity, checksum, and row
 count validation. Transient partition work has at most three attempts with configured backoff.

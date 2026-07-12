@@ -68,7 +68,7 @@ def test_preflight_probes_real_client_and_classifies_unavailable_service():
 
 
 def test_raw_and_front_adjusted_reads_use_exact_distinct_sdk_parameters():
-    frame = pd.DataFrame({"open": [4], "high": [5], "low": [3], "close": [4.5], "volume": [1], "amount": [4.5]}, index=["20260102"])
+    frame = pd.DataFrame({"open": [4], "high": [5], "low": [3], "close": [4.5], "volume": [1], "amount": [4.5], "suspendFlag": [0]}, index=["20260102"])
     fake = FakeXtData({"510300.SH": {"510300.SH": frame}})
     source = XtQuantSource(xtdata=fake)
     raw, raw_result = source.fetch(_request(ProviderCapability.DAILY_BARS_RAW))
@@ -81,7 +81,7 @@ def test_raw_and_front_adjusted_reads_use_exact_distinct_sdk_parameters():
 
 
 def test_symbol_errors_are_isolated_and_adjusted_data_is_not_substituted():
-    good = pd.DataFrame({"open": [4], "high": [5], "low": [3], "close": [4.5], "volume": [1], "amount": [4.5]}, index=["20260102"])
+    good = pd.DataFrame({"open": [4], "high": [5], "low": [3], "close": [4.5], "volume": [1], "amount": [4.5], "suspendFlag": [0]}, index=["20260102"])
     class PartialFake(FakeXtData):
         def get_market_data_ex(self, **kwargs):
             self.calls.append(kwargs)
@@ -113,6 +113,7 @@ def test_xtquant_source_normalizes_daily_bar_dict_response():
                 "close": [4.1, 4.2],
                 "volume": [1000, 1100],
                 "amount": [4100, 4620],
+                "suspendFlag": [0, 0],
             },
             index=["20260102", "20260105"],
         )
@@ -138,6 +139,7 @@ def test_xtquant_source_prefers_xtdata_index_date_over_time_column():
                 "close": [4.888],
                 "volume": [18677828],
                 "amount": [9131467000.0],
+                "suspendFlag": [0],
             },
             index=["20260506"],
         )
@@ -159,6 +161,7 @@ def test_xtquant_source_filters_invalid_dates_before_string_cast():
                 "close": [4.1, 4.2],
                 "volume": [1000, 1100],
                 "amount": [4100, 4620],
+                "suspendFlag": [0, 0],
             },
             index=[None, "20260105"],
         )
@@ -345,23 +348,46 @@ def test_download_uses_exact_unadjusted_cache_parameters_without_read_fallback()
     assert fake.calls == []
 
 
-def test_suspension_fields_are_normalized_without_changing_price_mode():
+@pytest.mark.parametrize("suspension_field", ["suspendFlag", "suspend_flag", "suspended"])
+def test_suspension_fields_are_normalized_without_changing_price_mode(suspension_field):
     frame = pd.DataFrame(
         {
-            "open": [1.0, 1.0],
-            "high": [1.0, 1.0],
-            "low": [1.0, 1.0],
-            "close": [1.0, 1.0],
-            "vol": [0, 100],
-            "amount": [0, 100.0],
-            "preClose": [1.0, 1.0],
-            "suspendFlag": ["1", "交易"],
+            "open": [1.0, 1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0, 1.0],
+            "vol": [0, 100, 200, 0],
+            "amount": [0, 100.0, 200.0, 0],
+            "preClose": [1.0, 1.0, 1.0, 1.0],
+            suspension_field: [0, 1, "false", "停牌"],
         },
-        index=["20260102", "20260105"],
+        index=["20260102", "20260105", "20260106", "20260107"],
     )
     source = XtQuantSource()
     data = source._normalize_daily_bar_response({"511990.SH": frame}, price_mode="front")
-    assert data["suspended"].tolist() == [True, False]
-    assert data["volume"].tolist() == [0, 100]
-    assert data["amount"].tolist() == [0.0, 100.0]
+    assert data["suspended"].tolist() == [False, True, False, True]
+    assert data["volume"].tolist() == [0, 100, 200, 0]
+    assert data["amount"].tolist() == [0.0, 100.0, 200.0, 0.0]
     assert data["price_mode"].unique().tolist() == ["adjusted"]
+
+
+def test_missing_suspension_field_becomes_a_symbol_data_error():
+    frame = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [100],
+            "amount": [100.0],
+        },
+        index=["20260102"],
+    )
+    fake = FakeXtData({"510300.SH": {"510300.SH": frame}})
+    source = XtQuantSource(xtdata=fake)
+
+    data, result = source.fetch(_request(ProviderCapability.DAILY_BARS_RAW))
+
+    assert data.empty
+    assert result.symbols[0].rows == 0
+    assert "missing required suspension field" in result.symbols[0].error

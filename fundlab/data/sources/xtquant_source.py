@@ -498,7 +498,7 @@ class XtQuantSource(MarketDataSource):
             data["pre_close"] = data["pre_close"].fillna(data.groupby("symbol")["close"].shift(1))
         data["price_mode"] = "raw" if price_mode == "none" else "adjusted"
         if "suspended" not in data.columns:
-            data["suspended"] = False
+            raise ValueError("MiniQMT daily bars are missing required suspension evidence")
         data["limit_up"] = None
         data["limit_down"] = None
         data["source"] = self.name
@@ -521,6 +521,16 @@ class XtQuantSource(MarketDataSource):
                 data["date"] = data["time"].map(self._normalize_xt_date)
             else:
                 data["date"] = index_dates
+        suspension_columns = ("suspended", "suspendFlag", "suspend_flag")
+        suspension_column = next(
+            (column for column in suspension_columns if column in data.columns), None
+        )
+        if suspension_column is None:
+            raise ValueError(
+                "MiniQMT daily bars are missing required suspension field "
+                "(suspendFlag, suspend_flag, or suspended)"
+            )
+        data["suspended"] = data[suspension_column]
         rename_map = {
             "vol": "volume",
             "amount": "amount",
@@ -529,8 +539,6 @@ class XtQuantSource(MarketDataSource):
             "low": "low",
             "close": "close",
             "preClose": "pre_close",
-            "suspendFlag": "suspended",
-            "suspend_flag": "suspended",
         }
         data = data.rename(columns=rename_map)
         required = ["date", "symbol", "open", "high", "low", "close", "volume", "amount", "pre_close", "suspended"]
@@ -550,19 +558,24 @@ class XtQuantSource(MarketDataSource):
 
     def _normalize_suspended(self, value: Any) -> bool:
         if value is None:
-            return False
+            raise ValueError("MiniQMT suspension field contains a missing value")
+        if isinstance(value, bool):
+            return value
         if isinstance(value, str):
             normalized = value.strip().lower()
-            if normalized in {"", "0", "false", "no", "n", "normal", "交易"}:
+            if normalized in {"0", "false", "no", "n", "normal", "交易"}:
                 return False
             if normalized in {"1", "true", "yes", "y", "suspended", "停牌"}:
                 return True
         try:
-            if pd.isna(value):
-                return False
+            missing = bool(pd.isna(value))
         except (TypeError, ValueError):
-            pass
-        return bool(value)
+            missing = False
+        if missing:
+            raise ValueError("MiniQMT suspension field contains a missing value")
+        if isinstance(value, (int, float)) and value in {0, 1}:
+            return bool(value)
+        raise ValueError(f"MiniQMT suspension field contains unsupported value {value!r}")
 
     def _normalize_xt_date(self, value: Any) -> str | None:
         if value is None:

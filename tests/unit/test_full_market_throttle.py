@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from fundlab.data.pipeline.throttle import AdaptiveThrottle, SpeedProfile, build_speed_profiles
@@ -65,6 +67,39 @@ def test_request_interval_and_symbol_cooldown_are_enforced():
     throttle.before_request(); throttle.before_request()
     throttle.complete_symbol(); throttle.complete_symbol()
     assert fake.sleeps == [2.0, 60.0]
+
+
+def test_external_request_gates_do_not_advance_symbol_cooldown():
+    fake = FakeTime(); events = []
+    profile = SpeedProfile("initial", 1, 2.0, 2, 60.0)
+    throttle = AdaptiveThrottle(
+        (profile,), sleeper=fake.sleep, clock=fake.clock,
+        event_callback=lambda p, r: events.append(r),
+    )
+    throttle.before_request("download")
+    throttle.before_request("raw_fetch")
+    throttle.before_request("adjusted_fetch")
+    throttle.complete_symbol()
+    assert fake.sleeps == [2.0, 2.0]
+    throttle.complete_symbol()
+    assert fake.sleeps == [2.0, 2.0, 60.0]
+    assert events.count("scheduled_cooldown") == 1
+    assert [item for item in events if item.startswith("request_gate:")] == [
+        "request_gate:download", "request_gate:raw_fetch", "request_gate:adjusted_fetch",
+    ]
+
+
+def test_shared_gate_caps_aggregate_rate_with_four_callers():
+    fake = FakeTime(); gate_times = []
+    profile = SpeedProfile("initial", 4, 0.5, 100, 30.0)
+    throttle = AdaptiveThrottle(
+        (profile,), sleeper=fake.sleep, clock=fake.clock,
+        event_callback=lambda p, r: gate_times.append(fake.clock()) if r.startswith("request_gate:") else None,
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda index: throttle.before_request(f"worker-{index}"), range(4)))
+    assert gate_times == [0.0, 0.5, 1.0, 1.5]
+    assert all(later - earlier >= 0.5 for earlier, later in zip(gate_times, gate_times[1:]))
 
 
 def test_profiles_reject_more_than_two_requests_per_second():

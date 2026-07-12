@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+from time import monotonic
 
 import pandas as pd
 
@@ -17,11 +18,14 @@ from fundlab.data.storage import VersionedParquetStore
 class FixtureProvider:
     name = "xtquant"
 
-    def __init__(self, *, transient_download_failures: int = 0, adjusted_missing_last: bool = False):
+    def __init__(self, *, transient_download_failures: int = 0, adjusted_missing_last: bool = False,
+                 clock=lambda: 0.0):
         self.transient_download_failures = transient_download_failures
         self.adjusted_missing_last = adjusted_missing_last
         self.download_calls = 0
         self.fetch_calls = []
+        self.external_calls = []
+        self.clock = clock
 
     def preflight(self):
         return PreflightResult(self.name, ProviderHealth.AVAILABLE, datetime.now().astimezone())
@@ -36,11 +40,13 @@ class FixtureProvider:
 
     def download_daily_bar(self, symbols, start_date, end_date):
         self.download_calls += 1
+        self.external_calls.append(("download", self.clock()))
         if self.download_calls <= self.transient_download_failures:
             raise TimeoutError("fixture timeout")
 
     def fetch(self, request):
         self.fetch_calls.append(request)
+        self.external_calls.append((f"fetch:{request.capability.value}", self.clock()))
         if request.capability is ProviderCapability.TRADING_CALENDAR:
             frame = pd.DataFrame({"date": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]})
         else:
@@ -76,15 +82,28 @@ def config():
     }
 
 
-def runner(tmp_path, provider):
+def runner(tmp_path, provider, *, sleeper=lambda _: None, clock=monotonic):
     catalog = DataCatalog(tmp_path / "v2" / "catalog.sqlite3"); catalog.initialize()
     store = VersionedParquetStore(tmp_path / "v2", catalog)
     legacy = tmp_path / "legacy"; legacy.mkdir(); (legacy / "sentinel.bin").write_bytes(b"legacy-v1")
     return FullMarketHistoryRunner(
         provider=provider, catalog=catalog, store=store, report_root=tmp_path / "reports",
         history_config=config(), config_hash="fixture-config", legacy_paths=(legacy,),
-        sleeper=lambda _: None,
+        sleeper=sleeper, clock=clock,
     ), catalog
+
+
+class FakeTime:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 def seed_latest(catalog: DataCatalog) -> str:
@@ -151,3 +170,30 @@ def test_discovery_is_deterministic_and_does_not_create_partitions(tmp_path):
     second = history.run(HistoryRunSpec(CollectionPhase.DISCOVER, date(2024, 1, 5), minimum_free_bytes=0))
     assert first.selected_symbols == second.selected_symbols == ("510300.SH", "160001.SZ")
     assert catalog.list_partitions() == ()
+
+
+def test_every_download_and_raw_adjusted_fetch_has_its_own_throttle_gate(tmp_path):
+    fake = FakeTime()
+    provider = FixtureProvider(clock=fake.clock)
+    history, catalog = runner(tmp_path, provider, sleeper=fake.sleep, clock=fake.clock)
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.CANARY, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert result.status == "paused"
+    kinds = [kind for kind, _ in provider.external_calls]
+    assert kinds == [
+        "fetch:trading_calendar",
+        "download", "fetch:daily_bars_raw", "fetch:daily_bars_adjusted",
+        "download", "fetch:daily_bars_raw", "fetch:daily_bars_adjusted",
+    ]
+    timestamps = [timestamp for _, timestamp in provider.external_calls]
+    assert timestamps == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+    assert all(later - earlier >= 2.0 for earlier, later in zip(timestamps, timestamps[1:]))
+    request_events = [
+        event for event in catalog.list_throttle_events(result.run_id)
+        if event.reason.startswith("request_gate:")
+    ]
+    assert len(request_events) == len(provider.external_calls)
+    assert sum("download_daily_bar" in event.reason for event in request_events) == 2
+    assert sum("daily_bars_raw" in event.reason for event in request_events) == 2
+    assert sum("daily_bars_adjusted" in event.reason for event in request_events) == 2

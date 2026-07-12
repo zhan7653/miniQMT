@@ -267,10 +267,13 @@ class FullMarketHistoryRunner:
             calendar = self._calendar_for(selected, target, throttle)
             quarantine: dict[str, list[str]] = {}
             identities = self._schedule(run_id, selected, target, quarantine)
+            downloaded_scopes: set[tuple[str, date, date]] = set()
             reused = completed = 0
             for symbol in sorted({item.symbol for item in identities}):
                 for identity in [item for item in identities if item.symbol == symbol]:
-                    outcome = self._collect_partition(run_id, identity, throttle)
+                    outcome = self._collect_partition(
+                        run_id, identity, throttle, downloaded_scopes=downloaded_scopes,
+                    )
                     reused += int(outcome == "reused")
                     completed += int(outcome in {"reused", "complete"})
                     if outcome.startswith("quarantined:"):
@@ -385,7 +388,7 @@ class FullMarketHistoryRunner:
         starts = [date.fromisoformat(str(row["listed_date"])[:10]) for row in selected if row.get("listed_date")]
         if not starts:
             return ()
-        throttle.before_request()
+        throttle.before_request("trading_calendar_fetch")
         started = self._clock()
         frame, result = self.provider.fetch(ProviderRequest(
             (str(selected[0]["symbol"]),), min(starts), target, ProviderCapability.TRADING_CALENDAR,
@@ -431,6 +434,7 @@ class FullMarketHistoryRunner:
 
     def _collect_partition(
         self, run_id: str, identity: PartitionIdentity, throttle: AdaptiveThrottle,
+        *, downloaded_scopes: set[tuple[str, date, date]],
     ) -> str:
         record = self.catalog.get_partition(identity.fingerprint)
         if record.status is PartitionStatus.COMPLETE:
@@ -467,15 +471,23 @@ class FullMarketHistoryRunner:
             })[:24]
             self.catalog.start_attempt(identity.fingerprint, attempt_id)
             try:
-                throttle.before_request()
                 started = self._clock()
-                self.provider.download_daily_bar(
-                    [identity.symbol], identity.start_date.isoformat(), identity.end_date.isoformat(),
-                )
+                download_scope = (identity.symbol, identity.start_date, identity.end_date)
+                if download_scope not in downloaded_scopes:
+                    throttle.before_request(
+                        f"download_daily_bar:{identity.symbol}:{identity.start_date}:{identity.end_date}"
+                    )
+                    self.provider.download_daily_bar(
+                        [identity.symbol], identity.start_date.isoformat(), identity.end_date.isoformat(),
+                    )
+                    downloaded_scopes.add(download_scope)
                 capability = (
                     ProviderCapability.DAILY_BARS_RAW
                     if identity.price_mode is PriceMode.RAW
                     else ProviderCapability.DAILY_BARS_ADJUSTED
+                )
+                throttle.before_request(
+                    f"fetch:{capability.value}:{identity.symbol}:{identity.start_date}:{identity.end_date}"
                 )
                 frame, result = self.provider.fetch(ProviderRequest(
                     (identity.symbol,), identity.start_date, identity.end_date, capability,
