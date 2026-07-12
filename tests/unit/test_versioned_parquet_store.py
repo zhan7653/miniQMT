@@ -5,9 +5,10 @@ import pyarrow as pa
 import pytest
 
 from fundlab.data.platform import (BatchRecord, BatchStatus, DataCatalog, ManifestIdentity, TrustState,
-                                   VersionRecord, VersionStatus)
+                                   PartitionIdentity, PriceMode, VersionRecord, VersionStatus)
 from fundlab.data.storage import (CorruptVersionError, ImmutableVersionError, VersionedParquetStore,
                                   VersionNotVisibleError)
+from fundlab.data.storage.versioned_parquet_store import CorruptPartitionError
 
 
 def _catalog(tmp_path):
@@ -103,3 +104,57 @@ def test_explicit_superseded_pin_remains_readable_but_latest_discovers_successor
     parquet.write_bytes(parquet.read_bytes() + b"corrupt")
     with pytest.raises(CorruptVersionError):
         store.resolve_complete("v1")
+
+
+def test_partition_write_is_checksum_validated_and_reusable(tmp_path):
+    catalog = _catalog(tmp_path)
+    store = VersionedParquetStore(tmp_path / "v2", catalog)
+    identity = PartitionIdentity(
+        "mini_qmt", "510300.SH", PriceMode.RAW, date(2025, 1, 1), date(2025, 12, 31), "xtquant-v1"
+    )
+    table = pa.table({"date": ["2025-01-02"], "symbol": ["510300.SH"], "close": [3.91]})
+
+    first = store.write_partition(identity, table)
+    reused = store.write_partition(identity, table)
+
+    assert reused == first
+    assert first.checksum == sha256((store.partition_path(identity) / "part-0.parquet").read_bytes()).hexdigest()
+    assert store.validate_partition(
+        identity, expected_checksum=first.checksum, expected_row_count=1,
+    ) == first
+    assert store.read_partition(identity).equals(table, check_metadata=False)
+
+
+def test_partition_identity_is_immutable_and_does_not_mutate_latest_pointer(tmp_path):
+    catalog = _catalog(tmp_path)
+    store = VersionedParquetStore(tmp_path / "v2", catalog)
+    manifest_identity = _stage(store)
+    manifest = store.prepare_manifest(manifest_identity, {"daily_bars_raw": 1})
+    catalog.create_version(VersionRecord(
+        "v1", "b1", manifest.fingerprint, "content-1", VersionStatus.BUILDING, None, None, None,
+    ))
+    store.finalize_manifest(manifest)
+    catalog.complete_version("v1")
+    identity = PartitionIdentity(
+        "mini_qmt", "510300.SH", PriceMode.ADJUSTED, date(2025, 1, 1), date(2025, 12, 31), "xtquant-v1"
+    )
+    store.write_partition(identity, pa.table({"close": [3.91]}))
+
+    with pytest.raises(ImmutableVersionError, match="different data"):
+        store.write_partition(identity, pa.table({"close": [4.01]}))
+
+    assert catalog.latest_complete().version_id == "v1"
+
+
+def test_partition_checksum_corruption_is_typed(tmp_path):
+    catalog = _catalog(tmp_path)
+    store = VersionedParquetStore(tmp_path / "v2", catalog)
+    identity = PartitionIdentity(
+        "mini_qmt", "510300.SH", PriceMode.RAW, date(2025, 1, 1), date(2025, 12, 31), "xtquant-v1"
+    )
+    store.write_partition(identity, pa.table({"close": [3.91]}))
+    parquet = store.partition_path(identity) / "part-0.parquet"
+    parquet.write_bytes(parquet.read_bytes() + b"corrupt")
+
+    with pytest.raises(CorruptPartitionError, match="checksum"):
+        store.validate_partition(identity)

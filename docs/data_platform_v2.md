@@ -37,6 +37,43 @@ timestamps, and error details.
 Repeated runs with identical content reuse the complete version. Changed provider content creates
 a new immutable revision whose `previous_version_id` is the current complete version.
 
+## Full-market history bootstrap: phase 1
+
+The bootstrap command is non-interactive and writes runtime state only below the configured v2
+warehouse and report roots. Run preflight and discovery first:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.bootstrap_fund_history --config config/base.yaml --phase preflight --json
+.\.venv\Scripts\python.exe -m scripts.bootstrap_fund_history --config config/base.yaml --phase discover --no-publish --json
+```
+
+Phase 1 canary collection is deliberately capped at 20 deterministic representatives and always
+starts at one worker, a two-second request interval, and the confirmed 20-symbol cooldown. It
+collects calendar-year partitions clipped to listing date, delisting date, and target date:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.bootstrap_fund_history --config config/base.yaml --phase canary --sample-limit 20 --no-publish --json
+```
+
+The collector persists run, partition, attempt, and throttle records in the v2 catalog. A restart
+returns to the initial speed profile and reuses a partition only after identity, checksum, and row
+count validation. Transient partition work has at most three attempts with configured backoff.
+Provider-health failures pause collection; schema, raw/front-adjusted key, OHLC, volume, amount, and
+trading-day coverage failures are recorded as explicit quarantine reasons. Reports contain the
+fund-master discovery evidence, category gaps, exact missing dates, attempts, throttle changes,
+partition checksums, legacy manifests, and publication decision.
+
+`collect` and `publish` are present as stable command phases but are blocked in this implementation
+until the phase-1 evidence has been reviewed and the user explicitly approves the remaining
+full-market run. Phase 1 never changes `latest_complete`; `publish` returns a blocked result even if
+`--no-publish` is omitted. Do not bypass this pause by editing catalog pointers or staging files.
+
+To resume, rerun the exact canary command with the same target and configuration. To investigate a
+pause, inspect the JSON report under `data/reports/data_v2/` and the collection records in the v2
+catalog. Preserve completed immutable partitions. Stop and request direction for legacy hash drift,
+insufficient disk, non-xtquant price requirements, material discovery conflicts, or any need to
+exceed the confirmed throttle maximum.
+
 ## Initial migration and rollback
 
 The migration reads legacy SQLite with read-only URI mode and reads the legacy Parquet tree without

@@ -42,6 +42,35 @@ xtquant:
     - 上证基金
     - 深证基金
 
+full_market_history:
+  partition_years: 1
+  retry:
+    max_attempts: 3
+    backoff_seconds:
+      - 5
+      - 15
+      - 30
+  throttle:
+    initial:
+      workers: 1
+      request_interval_seconds: 2
+      cooldown_every_symbols: 20
+      cooldown_seconds: 60
+    maximum:
+      workers: 4
+      requests_per_second: 2
+      cooldown_every_symbols: 100
+      cooldown_seconds: 30
+  coverage:
+    min_usable_instruments_ratio: 0.95
+    min_expected_days_ratio: 0.98
+    min_symbol_trading_day_ratio: 0.95
+    daily_min_active_ratio: 0.99
+  canary:
+    sample_limit: 20
+  critical_symbols:
+    - 510300.SH
+
 universe:
   include_product_types:
     - ETF

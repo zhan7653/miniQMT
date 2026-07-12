@@ -41,6 +41,36 @@ class VersionStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class CollectionPhase(StrEnum):
+    DISCOVER = "discover"
+    CANARY = "canary"
+    COLLECT = "collect"
+    PUBLISH = "publish"
+    DAILY = "daily"
+
+
+class CollectionRunStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class PartitionStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    QUARANTINED = "quarantined"
+
+
+class AttemptStatus(StrEnum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class TrustState(StrEnum):
     TRUSTED = "trusted"
     QUARANTINED = "quarantined"
@@ -129,3 +159,44 @@ class ManifestIdentity:
             raise ValueError("Manifest schema_version must be positive")
         if any(count < 0 for count in self.row_counts.values()):
             raise ValueError("Manifest row counts cannot be negative")
+
+
+@dataclass(frozen=True)
+class PartitionIdentity:
+    provider: str
+    symbol: str
+    price_mode: PriceMode
+    start_date: date
+    end_date: date
+    source_identity: str
+
+    def __post_init__(self) -> None:
+        if not self.provider or not self.symbol or not self.source_identity:
+            raise ValueError("Partition identity fields cannot be empty")
+        if self.start_date > self.end_date:
+            raise ValueError("Partition start_date must not exceed end_date")
+
+    @property
+    def fingerprint(self) -> str:
+        return stable_fingerprint({
+            "provider": self.provider,
+            "symbol": self.symbol,
+            "price_mode": self.price_mode.value,
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "source_identity": self.source_identity,
+        })
+
+
+@dataclass(frozen=True)
+class PartitionArtifact:
+    identity: PartitionIdentity
+    path: str
+    checksum: str
+    row_count: int
+
+    def __post_init__(self) -> None:
+        if not self.path or not self.checksum:
+            raise ValueError("Partition artifact path and checksum cannot be empty")
+        if self.row_count < 0:
+            raise ValueError("Partition artifact row_count cannot be negative")

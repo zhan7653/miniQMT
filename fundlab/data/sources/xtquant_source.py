@@ -18,6 +18,8 @@ from fundlab.data.sources.base import ProviderUnavailableError
 
 class XtQuantSource(MarketDataSource):
     name = "xtquant"
+    _MONEY_ETF_CODES = frozenset({"159001", "159003", "159005"})
+    _SZ_LOF_PREFIXES = tuple(str(prefix) for prefix in range(160, 170))
     capabilities = frozenset(
         {
             ProviderCapability.TRADING_CALENDAR,
@@ -95,7 +97,7 @@ class XtQuantSource(MarketDataSource):
                     frames.append(symbol_frame)
                     statuses.append(SymbolResult(symbol, len(symbol_frame)))
             except Exception as exc:
-                if isinstance(exc, (ConnectionError, TimeoutError, RuntimeError)):
+                if self._is_system_error(exc):
                     raise ProviderUnavailableError(
                         f"MiniQMT failed while reading {request.capability.value}: {exc}"
                     ) from exc
@@ -109,13 +111,20 @@ class XtQuantSource(MarketDataSource):
 
     def get_instruments(self) -> list[dict]:
         self._require_connection()
-        symbols = self._candidate_fund_symbols()
+        candidates = self._discover_candidate_fund_symbols()
         instruments = []
-        for symbol in symbols:
-            detail = self._get_instrument_detail(symbol)
+        for symbol, discovery_sources in candidates.items():
+            detail, detail_available = self._get_instrument_detail(symbol)
             if not self._looks_like_supported_fund(symbol, detail):
                 continue
-            instruments.append(self._instrument_to_master_row(symbol, detail))
+            instruments.append(
+                self._instrument_to_master_row(
+                    symbol,
+                    detail,
+                    discovery_sources=discovery_sources,
+                    detail_available=detail_available,
+                )
+            )
         return sorted(instruments, key=lambda item: item["symbol"])
 
     def download_daily_bar(self, symbols: Sequence[str], start_date: str, end_date: str) -> None:
@@ -221,55 +230,81 @@ class XtQuantSource(MarketDataSource):
         )
 
     def _candidate_fund_symbols(self) -> list[str]:
+        return list(self._discover_candidate_fund_symbols())
+
+    def _discover_candidate_fund_symbols(self) -> dict[str, tuple[str, ...]]:
         configured_symbols = self.config.get("symbols")
         if configured_symbols:
-            return list(configured_symbols)
+            return {str(symbol).upper(): ("config:symbols",) for symbol in configured_symbols}
 
-        sectors = self.config.get("fund_sectors", ["沪深基金", "上证基金", "深证基金"])
-        symbols: set[str] = set()
+        sectors = self.config.get(
+            "fund_sectors",
+            ["沪深基金", "上证基金", "深证基金", "上证LOF", "深证LOF"],
+        )
+        symbol_sources: dict[str, set[str]] = {}
+        failures: list[tuple[str, Exception]] = []
+        successful_queries = 0
         for sector in sectors:
             try:
-                symbols.update(self.xtdata.get_stock_list_in_sector(sector) or [])
-            except Exception:
+                values = self.xtdata.get_stock_list_in_sector(sector) or []
+                successful_queries += 1
+            except Exception as exc:
+                if self._is_system_error(exc):
+                    raise ProviderUnavailableError(
+                        f"MiniQMT failed while discovering fund sector {sector!r}: {exc}"
+                    ) from exc
+                failures.append((str(sector), exc))
                 continue
-        return sorted(symbols)
+            for symbol in values:
+                normalized = str(symbol).upper()
+                symbol_sources.setdefault(normalized, set()).add(f"sector:{sector}")
+        if not successful_queries and failures:
+            detail = "; ".join(f"{sector}: {error}" for sector, error in failures)
+            raise ProviderUnavailableError(f"MiniQMT fund-sector discovery failed: {detail}")
+        return {
+            symbol: tuple(sorted(symbol_sources[symbol]))
+            for symbol in sorted(symbol_sources)
+        }
 
-    def _get_instrument_detail(self, symbol: str) -> dict[str, Any]:
+    def _get_instrument_detail(self, symbol: str) -> tuple[dict[str, Any], bool]:
         try:
             detail = self.xtdata.get_instrument_detail(symbol) or {}
-        except Exception:
-            detail = {}
-        return detail if isinstance(detail, dict) else {}
+        except Exception as exc:
+            if self._is_system_error(exc):
+                raise ProviderUnavailableError(
+                    f"MiniQMT failed while reading instrument detail for {symbol}: {exc}"
+                ) from exc
+            return {}, False
+        if not isinstance(detail, dict):
+            return {}, False
+        return detail, bool(detail)
 
     def _looks_like_supported_fund(self, symbol: str, detail: dict[str, Any]) -> bool:
         symbol_upper = symbol.upper()
-        name = str(
-            detail.get("InstrumentName")
-            or detail.get("instrument_name")
-            or detail.get("name")
-            or ""
-        )
-        if "ETF" in name.upper() or "交易型开放式" in name or "货币" in name:
-            return True
-        code = symbol_upper.split(".")[0]
-        return symbol_upper.endswith((".SH", ".SZ")) and code.startswith(("51", "56", "58", "15"))
+        code, exchange = self._split_symbol(symbol_upper)
+        name = self._instrument_name(detail, default="")
+        return exchange in {"SH", "SZ"} and self._product_type(code, exchange, name) is not None
 
-    def _instrument_to_master_row(self, symbol: str, detail: dict[str, Any]) -> dict[str, Any]:
-        code, exchange = symbol.split(".") if "." in symbol else (symbol, self._infer_exchange(symbol))
-        name = str(
-            detail.get("InstrumentName")
-            or detail.get("instrument_name")
-            or detail.get("name")
-            or symbol
+    def _instrument_to_master_row(
+        self,
+        symbol: str,
+        detail: dict[str, Any],
+        *,
+        discovery_sources: Sequence[str] = (),
+        detail_available: bool = True,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+        code, exchange = self._split_symbol(symbol)
+        name = self._instrument_name(detail, default=symbol)
+        listed_date, listed_date_source = self._first_normalized_date(
+            detail, ("OpenDate", "CreateDate", "listDate", "listed_date")
         )
-        listed_date = self._normalize_xt_date(
-            detail.get("OpenDate") or detail.get("CreateDate") or detail.get("listDate") or detail.get("listed_date")
-        )
-        delisted_date = self._normalize_xt_date(
-            detail.get("ExpireDate") or detail.get("EndDelivDate") or detail.get("delisted_date")
+        delisted_date, delisted_date_source = self._first_normalized_date(
+            detail, ("ExpireDate", "EndDelivDate", "delistDate", "delisted_date")
         )
         asset_class, category, management_type = self._classify_fund(code, name)
-        product_type = "MONEY_ETF" if asset_class == "money_market" else "ETF"
+        product_type = self._product_type(code, exchange, name)
+        is_active, active_state_source = self._normalize_active_state(detail, delisted_date)
         return {
             "symbol": symbol,
             "raw_symbol": code,
@@ -288,12 +323,114 @@ class XtQuantSource(MarketDataSource):
             "custody_fee": None,
             "lot_size": int(detail.get("VolumeMultiple") or detail.get("lot_size") or 100),
             "price_tick": float(detail.get("PriceTick") or detail.get("price_tick") or 0.001),
-            "is_active": 0 if delisted_date else 1,
+            "is_active": int(is_active),
             "include_in_universe": 1,
             "exclusion_reason": None,
             "source": self.name,
             "source_updated_at": datetime.now().isoformat(timespec="seconds"),
+            "discovery_source": "|".join(discovery_sources) if discovery_sources else None,
+            "instrument_detail_source": "xtquant.get_instrument_detail" if detail_available else None,
+            "listed_date_source": listed_date_source,
+            "delisted_date_source": delisted_date_source,
+            "active_state_source": active_state_source,
         }
+
+    def _split_symbol(self, symbol: str) -> tuple[str, str]:
+        if "." in symbol:
+            code, exchange = symbol.rsplit(".", 1)
+            return code, exchange.upper()
+        return symbol, self._infer_exchange(symbol)
+
+    def _instrument_name(self, detail: dict[str, Any], *, default: str) -> str:
+        return str(
+            detail.get("InstrumentName")
+            or detail.get("instrument_name")
+            or detail.get("name")
+            or default
+        )
+
+    def _product_type(self, code: str, exchange: str, name: str) -> str | None:
+        upper_name = name.upper()
+        money_keywords = ["货币", "现金", "快线", "保证金", "添益", "收益快钱", "财富宝"]
+        if (
+            any(keyword in name for keyword in money_keywords)
+            or code in self._MONEY_ETF_CODES
+            or (exchange == "SH" and code.startswith(("5116", "5117", "5118", "5119")))
+        ):
+            return "MONEY_ETF"
+        if "LOF" in upper_name or "上市型开放式" in name:
+            return "LOF"
+        if exchange == "SH" and code.startswith(("501", "502", "506")):
+            return "LOF"
+        if exchange == "SZ" and code.startswith(self._SZ_LOF_PREFIXES):
+            return "LOF"
+        if "ETF" in upper_name or "交易型开放式" in name:
+            return "ETF"
+        if exchange == "SH" and code.startswith(("51", "56", "58")):
+            return "ETF"
+        if exchange == "SZ" and code.startswith("159"):
+            return "ETF"
+        return None
+
+    def _first_normalized_date(
+        self, detail: dict[str, Any], keys: Sequence[str]
+    ) -> tuple[str | None, str | None]:
+        for key in keys:
+            if key not in detail:
+                continue
+            raw_value = detail.get(key)
+            is_delisting_field = key in {
+                "ExpireDate", "EndDelivDate", "delistDate", "delisted_date"
+            }
+            if is_delisting_field and self._is_open_ended_date_sentinel(raw_value):
+                return None, f"xtquant.instrument_detail.{key}:open_ended"
+            value = self._normalize_xt_date(raw_value)
+            if value is not None:
+                return value, f"xtquant.instrument_detail.{key}"
+        return None, None
+
+    def _is_open_ended_date_sentinel(self, value: Any) -> bool:
+        if value is None:
+            return False
+        text = str(value).strip()
+        if text.endswith(".0"):
+            text = text[:-2]
+        digits = text.replace("-", "").replace("/", "")
+        return digits == "99999999"
+
+    def _normalize_active_state(
+        self, detail: dict[str, Any], delisted_date: str | None
+    ) -> tuple[bool, str]:
+        if delisted_date is not None:
+            return False, "derived:delisted_date"
+        listing_status_keys = (
+            "ListingStatus",
+            "listing_status",
+            "ListStatus",
+            "list_status",
+            "DelistingStatus",
+            "delisting_status",
+        )
+        inactive_listing_statuses = {
+            "DELISTED",
+            "EXPIRED",
+            "TERMINATED",
+            "TERMINATED_LISTING",
+            "退市",
+            "已退市",
+            "到期",
+            "终止上市",
+        }
+        for key in listing_status_keys:
+            if key not in detail or detail[key] is None:
+                continue
+            status = str(detail[key]).strip().upper()
+            if status in inactive_listing_statuses:
+                return False, f"xtquant.instrument_detail.{key}"
+        return True, "derived:no_known_delisting_date"
+
+    def _is_system_error(self, exc: Exception) -> bool:
+        return isinstance(exc, (ConnectionError, TimeoutError, RuntimeError, OSError))
 
     def _classify_fund(self, code: str, name: str) -> tuple[str, str, str]:
         money_keywords = ["货币", "现金", "快线", "保证金", "添益", "收益快钱", "财富宝"]
@@ -393,6 +530,7 @@ class XtQuantSource(MarketDataSource):
             "close": "close",
             "preClose": "pre_close",
             "suspendFlag": "suspended",
+            "suspend_flag": "suspended",
         }
         data = data.rename(columns=rename_map)
         required = ["date", "symbol", "open", "high", "low", "close", "volume", "amount", "pre_close", "suspended"]
@@ -403,12 +541,28 @@ class XtQuantSource(MarketDataSource):
         for column in ["open", "high", "low", "close", "volume", "amount"]:
             data[column] = pd.to_numeric(data[column], errors="coerce")
         data["pre_close"] = pd.to_numeric(data["pre_close"], errors="coerce")
-        data["suspended"] = pd.to_numeric(data["suspended"], errors="coerce").fillna(0).astype(int).astype(bool)
+        data["suspended"] = data["suspended"].map(self._normalize_suspended)
         data = data.dropna(subset=["date", "symbol", "open", "high", "low", "close"])
         data = data[data["date"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}$")]
         data["date"] = data["date"].astype(str)
         data["symbol"] = data["symbol"].astype(str)
         return data
+
+    def _normalize_suspended(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"", "0", "false", "no", "n", "normal", "交易"}:
+                return False
+            if normalized in {"1", "true", "yes", "y", "suspended", "停牌"}:
+                return True
+        try:
+            if pd.isna(value):
+                return False
+        except (TypeError, ValueError):
+            pass
+        return bool(value)
 
     def _normalize_xt_date(self, value: Any) -> str | None:
         if value is None:

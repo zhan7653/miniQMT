@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import tempfile
 from typing import Mapping, Sequence
 
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from fundlab.data.platform import DataCatalog, ManifestIdentity, VersionStatus
+from fundlab.data.platform import (DataCatalog, ManifestIdentity, PartitionArtifact, PartitionIdentity,
+                                   VersionStatus)
 
 from .manifest import PublishedManifest, build_manifest, checksum_file
 
@@ -32,6 +35,10 @@ class CorruptVersionError(StorageError):
     pass
 
 
+class CorruptPartitionError(StorageError):
+    pass
+
+
 class VersionedParquetStore:
     """Immutable same-volume staging and published Parquet storage."""
 
@@ -39,11 +46,12 @@ class VersionedParquetStore:
         self.root = Path(root)
         self.catalog = catalog
         self.raw_root = self.root / "raw"
+        self.partition_root = self.raw_root / "partitions"
         self.staging_root = self.root / "staging"
         self.published_root = self.root / "published"
 
     def initialize(self) -> None:
-        for directory in (self.raw_root, self.staging_root, self.published_root):
+        for directory in (self.raw_root, self.partition_root, self.staging_root, self.published_root):
             directory.mkdir(parents=True, exist_ok=True)
 
     def staging_path(self, version_id: str) -> Path:
@@ -79,6 +87,107 @@ class VersionedParquetStore:
         path = target / "part-0.parquet"
         pq.write_table(table, path)
         return path
+
+    def partition_path(self, identity: PartitionIdentity) -> Path:
+        fingerprint = identity.fingerprint
+        return self.partition_root / fingerprint[:2] / fingerprint[2:]
+
+    def write_partition(self, identity: PartitionIdentity, table: pa.Table) -> PartitionArtifact:
+        """Write or reuse an immutable partition identified by its complete source scope."""
+        self.initialize()
+        target = self.partition_path(identity)
+        if target.exists():
+            artifact = self.validate_partition(identity)
+            if self.read_partition(identity).equals(table, check_metadata=False):
+                return artifact
+            raise ImmutableVersionError(f"Partition identity already contains different data: {identity.fingerprint}")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
+        try:
+            parquet_path = temporary / "part-0.parquet"
+            pq.write_table(table, parquet_path)
+            checksum = checksum_file(parquet_path)
+            metadata = {
+                "schema_version": 1,
+                "identity": {
+                    "provider": identity.provider,
+                    "symbol": identity.symbol,
+                    "price_mode": identity.price_mode.value,
+                    "start_date": identity.start_date.isoformat(),
+                    "end_date": identity.end_date.isoformat(),
+                    "source_identity": identity.source_identity,
+                    "fingerprint": identity.fingerprint,
+                },
+                "file": "part-0.parquet",
+                "checksum": checksum,
+                "row_count": table.num_rows,
+            }
+            (temporary / "partition.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+            )
+            try:
+                os.replace(temporary, target)
+            except OSError:
+                if not target.exists():
+                    raise
+                artifact = self.validate_partition(identity)
+                if self.read_partition(identity).equals(table, check_metadata=False):
+                    return artifact
+                raise ImmutableVersionError(
+                    f"Partition identity was concurrently written with different data: {identity.fingerprint}"
+                )
+            return PartitionArtifact(identity, str(target), checksum, table.num_rows)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+    def validate_partition(
+        self, identity: PartitionIdentity, *, expected_checksum: str | None = None,
+        expected_row_count: int | None = None,
+    ) -> PartitionArtifact:
+        target = self.partition_path(identity)
+        metadata_path = target / "partition.json"
+        if not metadata_path.is_file():
+            raise CorruptPartitionError(f"Partition metadata is missing: {identity.fingerprint}")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CorruptPartitionError(f"Partition metadata is invalid: {identity.fingerprint}") from exc
+        stored_identity = metadata.get("identity", {})
+        expected_identity = {
+            "provider": identity.provider,
+            "symbol": identity.symbol,
+            "price_mode": identity.price_mode.value,
+            "start_date": identity.start_date.isoformat(),
+            "end_date": identity.end_date.isoformat(),
+            "source_identity": identity.source_identity,
+            "fingerprint": identity.fingerprint,
+        }
+        if stored_identity != expected_identity:
+            raise CorruptPartitionError(f"Partition identity mismatch: {identity.fingerprint}")
+        file_name = metadata.get("file")
+        checksum = metadata.get("checksum")
+        row_count = metadata.get("row_count")
+        if not isinstance(file_name, str) or not isinstance(checksum, str) or not isinstance(row_count, int):
+            raise CorruptPartitionError(f"Partition metadata fields are invalid: {identity.fingerprint}")
+        parquet_path = target / file_name
+        if not parquet_path.is_file() or checksum_file(parquet_path) != checksum:
+            raise CorruptPartitionError(f"Partition checksum mismatch: {identity.fingerprint}")
+        if pq.read_metadata(parquet_path).num_rows != row_count:
+            raise CorruptPartitionError(f"Partition row count mismatch: {identity.fingerprint}")
+        if expected_checksum is not None and checksum != expected_checksum:
+            raise CorruptPartitionError(f"Partition checksum differs from catalog: {identity.fingerprint}")
+        if expected_row_count is not None and row_count != expected_row_count:
+            raise CorruptPartitionError(f"Partition row count differs from catalog: {identity.fingerprint}")
+        return PartitionArtifact(identity, str(target), checksum, row_count)
+
+    def read_partition(
+        self, identity: PartitionIdentity, *, columns: Sequence[str] | None = None,
+    ) -> pa.Table:
+        artifact = self.validate_partition(identity)
+        projected = list(columns) if columns is not None else None
+        return pq.read_table(Path(artifact.path) / "part-0.parquet", columns=projected)
 
     def finalize(self, identity: ManifestIdentity, row_counts: Mapping[str, int]) -> PublishedManifest:
         source = self.staging_path(identity.version_id)
