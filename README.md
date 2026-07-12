@@ -51,6 +51,23 @@ It does not fall back to another provider. Normal v2 writes stay under ignored
 
 See `docs/data_platform_v2.md` for the operator, recovery, migration, report, and performance contract.
 
+## ETF Paper Trading
+
+The paper-trading core persists isolated rule-strategy accounts in its own ignored SQLite ledger.
+Commands are non-interactive and emit one JSON result, so an operator, Codex, or cron can call the
+same interface. Bootstrap is idempotent and creates the reviewed-universe equal-weight and momentum
+accounts with CNY 1,000,000 each:
+
+```powershell
+uv run --project D:\Code\miniQMT python D:\Code\miniQMT\scripts\manage_paper_accounts.py bootstrap
+uv run --project D:\Code\miniQMT python D:\Code\miniQMT\scripts\run_paper_daily.py --date 2026-05-07
+uv run --project D:\Code\miniQMT python D:\Code\miniQMT\scripts\run_paper_daily.py --start-date 2026-05-01 --target-date 2026-05-07
+```
+
+These absolute examples are intentionally independent of the caller's working directory. No
+production cron task is created by this repository. See `docs/paper_trading_core.md` for lifecycle,
+timing, replay, report, and recovery details.
+
 ## Current Scope
 
 - Local Python package skeleton using `uv` and Python 3.11+.
@@ -59,6 +76,8 @@ See `docs/data_platform_v2.md` for the operator, recovery, migration, report, an
 - Fake local test data plus real `xtquant` update scripts for trading calendar, ETF universe, daily bars, NAV placeholders, dividends, index valuations, and generated features.
 - Point-in-time `DataPortal` for universe, calendar, daily bars, NAV, dividends, index valuations, and features.
 - Rule strategies, risk checks, feature generation, backtest execution, metrics, and backtest persistence.
+- Durable multi-account ETF paper trading, lifecycle management, backfill, replay versions, and
+  canonical JSON/CSV/Markdown reports.
 
 See `docs/current_implementation.md` for a detailed implementation map, workflows, and known limitations.
 See `docs/data_source_policy.md` for the project data-source policy.

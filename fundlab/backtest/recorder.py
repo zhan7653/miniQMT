@@ -7,12 +7,16 @@ from fundlab.backtest.models import Account, Order, OrderIntent, Trade
 
 class BacktestRecorder:
     def __init__(self):
+        self.decisions: list[object] = []
         self.intents: list[OrderIntent] = []
         self.orders: list[Order] = []
         self.trades: list[Trade] = []
         self.account_daily: list[dict] = []
         self.position_daily: list[dict] = []
         self.account_events: list[dict] = []
+
+    def record_decision(self, decision: object) -> None:
+        self.decisions.append(decision)
 
     def record_intents(self, intents: list[OrderIntent]) -> None:
         self.intents.extend(intents)

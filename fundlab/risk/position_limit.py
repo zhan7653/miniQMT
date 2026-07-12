@@ -15,11 +15,4 @@ class PositionLimit:
         return RiskCheckResult(True, order)
 
     def check_target_weights(self, target_weights: dict[str, float], account: Account, date: str, data_portal: DataPortal) -> dict[str, float]:
-        adjusted = dict(target_weights)
-        for symbol, weight in list(adjusted.items()):
-            if symbol != "cash" and weight > self.max_weight_per_symbol:
-                adjusted[symbol] = self.max_weight_per_symbol
-        symbol_total = sum(weight for symbol, weight in adjusted.items() if symbol != "cash")
-        adjusted["cash"] = max(adjusted.get("cash", 0.0), 1 - symbol_total)
-        return adjusted
-
+        return dict(target_weights)

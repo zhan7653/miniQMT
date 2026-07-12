@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass
@@ -14,6 +14,7 @@ class OrderIntent:
     symbol: str
     target_weight: float
     reason: str = ""
+    validation_codes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -27,9 +28,11 @@ class Order:
     quantity: int
     signal_date: str
     execution_date: str
-    status: Literal["pending", "filled", "partial_filled", "rejected"] = "pending"
+    status: Literal["pending", "filled", "partial-filled", "partial_filled", "rejected", "cancelled"] = "pending"
     reason: str = ""
     reject_reason: str | None = None
+    requested_quantity: int | None = None
+    risk_result: Any | None = None
 
 
 @dataclass

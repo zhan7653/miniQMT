@@ -13,6 +13,7 @@ class RiskCheckResult:
     passed: bool
     adjusted_order: Order | None = None
     reason: str | None = None
+    requested_quantity: int | None = None
 
 
 class RiskRule(Protocol):
@@ -23,4 +24,3 @@ class RiskRule(Protocol):
 
     def check_target_weights(self, target_weights: dict[str, float], account: Account, date: str, data_portal: DataPortal) -> dict[str, float]:
         return target_weights
-

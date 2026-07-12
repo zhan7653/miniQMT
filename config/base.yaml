@@ -7,6 +7,8 @@ paths:
   v2_staging_root: ../data/warehouse/v2/staging
   v2_published_root: ../data/warehouse/v2/published
   v2_report_root: ../data/reports/data_v2
+  paper_db: ../data/warehouse/v2/paper_trading.sqlite3
+  paper_report_root: ../data/reports/data_v2/paper_trading
 
 platform:
   timezone: Asia/Hong_Kong

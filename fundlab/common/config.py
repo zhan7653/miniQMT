@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
+from dataclasses import dataclass
 
 
 DEFAULT_CONFIG_PATH = Path("config/base.yaml")
@@ -73,3 +74,44 @@ def validate_platform_config(config: dict[str, Any]) -> None:
     snapshot = load_universe_snapshot(resolve_config_path(config, universe["config_path"]))
     if tuple(sorted(universe["benchmark_symbols"])) != snapshot.benchmarks:
         raise ValueError("Configured benchmarks must match the reviewed universe snapshot")
+
+
+@dataclass(frozen=True)
+class PaperPaths:
+    database: Path
+    report_root: Path
+
+
+@dataclass(frozen=True)
+class PaperTradingConfig:
+    paths: PaperPaths
+    default_initial_cash: float
+    default_benchmark: str
+    risk_free_rate: float
+    execution_profiles: Mapping[str, "ExecutionProfile"]
+    risk_profiles: Mapping[str, "ResearchRiskProfile"]
+
+
+def load_paper_trading_config(path: str | Path = "config/paper_trading.yaml") -> PaperTradingConfig:
+    from types import MappingProxyType
+
+    from fundlab.trading.profiles import ExecutionProfile, ResearchRiskProfile
+
+    raw = load_config(path)
+    paper = raw.get("paper_trading", {})
+    paths = PaperPaths(database=get_path(raw, "paper_db"), report_root=get_path(raw, "paper_report_root"))
+    initial_cash = float(paper.get("default_initial_cash", 1_000_000))
+    if initial_cash <= 0:
+        raise ValueError("paper_trading.default_initial_cash must be positive")
+    return PaperTradingConfig(
+        paths=paths,
+        default_initial_cash=initial_cash,
+        default_benchmark=str(paper.get("default_benchmark", "510300.SH")),
+        risk_free_rate=float(paper.get("risk_free_rate", 0.0)),
+        execution_profiles=MappingProxyType({
+            key: ExecutionProfile(**value) for key, value in raw.get("execution_profiles", {}).items()
+        }),
+        risk_profiles=MappingProxyType({
+            key: ResearchRiskProfile(**value) for key, value in raw.get("risk_profiles", {}).items()
+        }),
+    )
