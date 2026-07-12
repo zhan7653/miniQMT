@@ -56,15 +56,38 @@ class DataSnapshot:
         query_date = normalize_date(effective_date)
         key = ("universe", query_date)
         if key not in self._cache:
-            predicate = ds.field("effective_date") <= query_date
-            table = self._store.read_table(self.data_version, "universe", columns=["symbol", "effective_date"],
-                                           filters=predicate)
-            frame = table.to_pandas()
-            if frame.empty:
-                value: tuple[str, ...] = ()
+            try:
+                master = self._store.read_table(self.data_version, "fund_master").to_pandas()
+            except StorageError:
+                master = None
+            if master is not None:
+                if master.empty:
+                    value = ()
+                else:
+                    listed = master["listed_date"].astype("string").str[:10]
+                    if "delisted_date" in master:
+                        delisted = master["delisted_date"].astype("string").str[:10]
+                        valid_end = master["delisted_date"].isna() | (delisted >= query_date)
+                    else:
+                        valid_end = pd.Series(True, index=master.index)
+                    trusted = (
+                        master["trust_state"].astype(str).eq("trusted")
+                        if "trust_state" in master else pd.Series(True, index=master.index)
+                    )
+                    valid = listed.notna() & (listed <= query_date) & valid_end & trusted
+                    value = tuple(sorted(master.loc[valid, "symbol"].astype(str).unique()))
             else:
-                latest = frame["effective_date"].max()
-                value = tuple(sorted(frame.loc[frame["effective_date"] == latest, "symbol"].unique()))
+                predicate = ds.field("effective_date") <= query_date
+                table = self._store.read_table(
+                    self.data_version, "universe", columns=["symbol", "effective_date"],
+                    filters=predicate,
+                )
+                frame = table.to_pandas()
+                if frame.empty:
+                    value = ()
+                else:
+                    latest = frame["effective_date"].max()
+                    value = tuple(sorted(frame.loc[frame["effective_date"] == latest, "symbol"].unique()))
             self._cache[key] = value
         return list(self._cache[key])  # type: ignore[arg-type]
 

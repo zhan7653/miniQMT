@@ -200,7 +200,29 @@ def test_raw_adjusted_key_mismatch_quarantines_symbol_and_reports_missing_dates(
     assert result.status == "paused"
     assert all("raw_adjusted_key_mismatch" in result.quarantined_symbols[symbol]
                for symbol in result.selected_symbols)
-    assert result.missing_dates["510300.SH"] == ()
+    assert result.missing_dates["510300.SH"] == ("2024-01-05",)
+
+
+def test_collect_uses_all_symbols_and_quarantines_missing_and_epoch_listing_dates(tmp_path):
+    provider = FixtureProvider()
+    provider.get_instruments = lambda: [
+        *FixtureProvider().get_instruments(),
+        {"symbol": "511000.SH", "exchange": "SH", "product_type": "MONEY_ETF",
+         "is_active": 1, "listed_date": None, "delisted_date": None, "source": "xtquant"},
+        {"symbol": "512000.SH", "exchange": "SH", "product_type": "ETF",
+         "is_active": 1, "listed_date": "1970-01-01", "delisted_date": None, "source": "xtquant"},
+    ]
+    history, _ = runner(tmp_path, provider)
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert result.status == "complete"
+    assert result.selected_symbols == ("160001.SZ", "510300.SH", "511000.SH", "512000.SH")
+    assert result.scheduled_partitions == 4
+    assert result.quarantined_symbols["511000.SH"] == ("missing_listing_date",)
+    assert result.quarantined_symbols["512000.SH"] == ("implausible_listing_date:1970-01-01",)
+    assert result.latest_complete_before == result.latest_complete_after is None
+    assert result.coverage_gates_passed is False
 
 
 def test_discovery_is_deterministic_and_does_not_create_partitions(tmp_path):
@@ -271,3 +293,123 @@ def test_v2_provenance_partitions_are_preserved_but_not_reused_for_v3(tmp_path):
         )
         assert matching.identity.fingerprint != old_record.identity.fingerprint
         assert history.store.partition_path(matching.identity) != history.store.partition_path(old_record.identity)
+
+
+def test_full_collection_publishes_only_on_separate_explicit_call_and_is_content_idempotent(tmp_path):
+    provider = FixtureProvider()
+    history, catalog = runner(tmp_path, provider)
+    collected = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert collected.status == "complete" and collected.coverage_gates_passed
+    assert catalog.latest_complete() is None
+    calls_after_collect = len(provider.external_calls)
+    repeated_collect = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    assert repeated_collect.run_id == collected.run_id
+    assert len(provider.external_calls) == calls_after_collect
+
+    published = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    assert published.status == "complete"
+    assert published.version_id == published.latest_complete_after
+    assert len(provider.external_calls) == calls_after_collect
+    resolved, manifest = history.store.resolve_complete()
+    assert resolved == published.version_id
+    assert {item.path.split("/", 1)[0] for item in manifest.files} == {
+        "daily_bars_raw", "daily_bars_adjusted", "calendar",
+        "fund_master", "universe", "quarantine",
+    }
+
+    repeated = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    assert repeated.status == "complete"
+    assert repeated.version_id == published.version_id
+    assert repeated.latest_complete_before == repeated.latest_complete_after == published.version_id
+
+
+def test_publish_rejects_corrupt_partition_and_preserves_pointer(tmp_path):
+    provider = FixtureProvider()
+    history, catalog = runner(tmp_path, provider)
+    collected = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0,
+    ))
+    record = next(iter(catalog.list_partitions(run_id=collected.run_id)))
+    path = history.store.partition_path(record.identity) / "part-0.parquet"
+    path.write_bytes(path.read_bytes() + b"corrupt")
+    result = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    assert result.status == "failed"
+    assert "checksum" in result.error.lower()
+    assert catalog.latest_complete() is None
+
+
+def test_coverage_thresholds_accept_exact_95_percent_instruments_and_98_percent_days(tmp_path):
+    history, _ = runner(tmp_path, FixtureProvider())
+    selected = [
+        {"symbol": f"{index:06d}.SH", "listed_date": "2024-01-01", "delisted_date": None}
+        for index in range(20)
+    ]
+    identities = [
+        PartitionIdentity(
+            "xtquant", row["symbol"], PriceMode.RAW, date(2024, 1, 1), date(2024, 1, 5), "fixture",
+        )
+        for row in selected
+    ]
+    missing = {row["symbol"]: () for row in selected}
+    missing[selected[0]["symbol"]] = ("2024-01-04", "2024-01-05")
+    quarantine = {selected[-1]["symbol"]: ("fixture_quarantine",)}
+    instruments, days, passed = history._coverage_summary(
+        selected, identities,
+        ("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"),
+        quarantine, missing,
+    )
+    assert instruments == pytest.approx(0.95)
+    assert days == pytest.approx(0.98)
+    assert passed
+
+    missing[selected[1]["symbol"]] = ("2024-01-05",)
+    assert history._coverage_summary(
+        selected, identities,
+        ("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"),
+        quarantine, missing,
+    )[2] is False
+
+
+def test_failed_successor_publication_keeps_previous_latest_complete(tmp_path, monkeypatch):
+    provider = FixtureProvider()
+    history, catalog = runner(tmp_path, provider)
+    history.run(HistoryRunSpec(CollectionPhase.COLLECT, date(2024, 1, 5), minimum_free_bytes=0))
+    first = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 5), publish=True, minimum_free_bytes=0,
+    ))
+    original_fetch = provider.fetch
+
+    def changed_fetch(request):
+        frame, result = original_fetch(request)
+        if request.capability in {
+            ProviderCapability.DAILY_BARS_RAW, ProviderCapability.DAILY_BARS_ADJUSTED,
+        }:
+            frame = frame.copy()
+            frame["amount"] += 1.0
+        return frame, result
+
+    provider.fetch = changed_fetch
+    second_collect = history.run(HistoryRunSpec(
+        CollectionPhase.COLLECT, date(2024, 1, 6), minimum_free_bytes=0,
+    ))
+    assert second_collect.status == "complete"
+    monkeypatch.setattr(
+        catalog, "complete_version",
+        lambda version_id: (_ for _ in ()).throw(RuntimeError("fixture pointer failure")),
+    )
+    failed = history.run(HistoryRunSpec(
+        CollectionPhase.PUBLISH, date(2024, 1, 6), publish=True, minimum_free_bytes=0,
+    ))
+    assert failed.status == "failed"
+    assert failed.latest_complete_before == failed.latest_complete_after == first.version_id
+    assert catalog.latest_complete().version_id == first.version_id

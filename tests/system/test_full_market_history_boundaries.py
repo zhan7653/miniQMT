@@ -41,7 +41,7 @@ def test_phase_one_rejects_publication_before_any_pointer_change(tmp_path):
     history, catalog = build_runner(tmp_path)
     result = history.run(HistoryRunSpec(CollectionPhase.PUBLISH, date(2024, 1, 5), minimum_free_bytes=0))
     assert result.status == "blocked"
-    assert "unavailable in phase 1" in result.error
+    assert "explicit publish=True" in result.error
     assert catalog.latest_complete() is None
 
 

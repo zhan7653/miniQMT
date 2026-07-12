@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 from time import monotonic, sleep
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -16,20 +17,27 @@ import pyarrow as pa
 from fundlab.common.dates import audit_now
 from fundlab.data.platform import (
     AttemptStatus,
+    BatchRecord,
+    BatchStatus,
     CollectionPartitionRecord,
     CollectionPhase,
     CollectionRunRecord,
     CollectionRunStatus,
     DataCatalog,
+    ManifestIdentity,
     PartitionIdentity,
     PartitionStatus,
     PriceMode,
     ProviderCapability,
     ProviderRequest,
     ThrottleEventRecord,
+    TrustState,
+    VersionRecord,
+    VersionStatus,
     stable_fingerprint,
 )
 from fundlab.data.sources.base import ProviderUnavailableError
+from fundlab.data.storage.manifest import checksum_file
 from fundlab.data.storage.versioned_parquet_store import CorruptPartitionError, VersionedParquetStore
 
 from .throttle import AdaptiveThrottle, SpeedProfile, build_speed_profiles
@@ -81,6 +89,10 @@ class FullMarketHistoryResult:
     legacy_manifest_after: Mapping[str, str] = field(default_factory=dict)
     report_json: str | None = None
     report_markdown: str | None = None
+    instrument_coverage: float | None = None
+    expected_day_coverage: float | None = None
+    coverage_gates_passed: bool | None = None
+    version_id: str | None = None
     error: str | None = None
 
     @property
@@ -142,7 +154,7 @@ class FullMarketHistoryResult:
 
 
 class FullMarketHistoryRunner:
-    """Resumable phase-1 collector. Publication remains deliberately unavailable."""
+    """Resumable canary/full-baseline collector with separately authorized publication."""
 
     def __init__(
         self,
@@ -196,15 +208,9 @@ class FullMarketHistoryRunner:
 
     def run(self, spec: HistoryRunSpec) -> FullMarketHistoryResult:
         if spec.phase is CollectionPhase.PUBLISH:
-            return self._blocked_publication(spec)
+            return self._publish_baseline(spec)
         if spec.phase not in {CollectionPhase.DISCOVER, CollectionPhase.CANARY, CollectionPhase.COLLECT}:
             raise ValueError(f"Unsupported historical phase: {spec.phase.value}")
-        if spec.phase is CollectionPhase.COLLECT:
-            return FullMarketHistoryResult(
-                "blocked", spec.phase.value, self.provider.name,
-                error="Full-market collection requires the mandatory post-canary user approval and TASK-6",
-            )
-
         latest_before = self.catalog.latest_complete()
         legacy_before = self._legacy_manifest()
         run_id: str | None = None
@@ -219,7 +225,10 @@ class FullMarketHistoryRunner:
             master = self._discover()
             if not master:
                 raise RuntimeError("Fund discovery returned no supported instruments")
-            selected, gaps = self.select_canary(master, spec.sample_limit)
+            selected, gaps = (
+                self.select_canary(master, spec.sample_limit)
+                if spec.phase is not CollectionPhase.COLLECT else ([dict(row) for row in master], ())
+            )
             if spec.phase is CollectionPhase.DISCOVER:
                 return self._write_report(FullMarketHistoryResult(
                     "complete", spec.phase.value, self.provider.name, target_date=target.isoformat(),
@@ -244,6 +253,10 @@ class FullMarketHistoryRunner:
             if run.status in {CollectionRunStatus.PENDING, CollectionRunStatus.PAUSED}:
                 self.catalog.transition_collection_run(run_id, CollectionRunStatus.RUNNING)
             elif run.status is CollectionRunStatus.COMPLETE:
+                if spec.phase is CollectionPhase.COLLECT:
+                    return self._result_from_report(
+                        self.report_root / f"full-market-collect-{run_id}.json"
+                    )
                 raise RuntimeError("A completed phase-1 run cannot be reopened")
 
             event_counter = len(self.catalog.list_throttle_events(run_id))
@@ -295,22 +308,41 @@ class FullMarketHistoryRunner:
             after_id = latest_after.version_id if latest_after else None
             if after_id != before_id:
                 raise RuntimeError("Phase 1 changed latest_complete")
-            self.catalog.transition_collection_run(run_id, CollectionRunStatus.PAUSED)
+            instrument_coverage, day_coverage, gates_passed = self._coverage_summary(
+                selected, identities, calendar, quarantine, missing,
+            )
+            terminal = (
+                CollectionRunStatus.COMPLETE
+                if spec.phase is CollectionPhase.COLLECT else CollectionRunStatus.PAUSED
+            )
+            self.catalog.transition_collection_run(run_id, terminal)
             result = FullMarketHistoryResult(
-                "paused", spec.phase.value, self.provider.name, run_id, target.isoformat(),
+                "complete" if spec.phase is CollectionPhase.COLLECT else "paused",
+                spec.phase.value, self.provider.name, run_id, target.isoformat(),
                 tuple(row["symbol"] for row in selected), gaps, len(master), len(identities), completed,
                 reused, {key: tuple(sorted(set(value))) for key, value in quarantine.items()},
                 missing, before_id, after_id, legacy_before, legacy_after,
+                instrument_coverage=instrument_coverage,
+                expected_day_coverage=day_coverage,
+                coverage_gates_passed=gates_passed,
             )
             return self._write_report(result, extra={
                 "fund_master": master,
+                "calendar": list(calendar),
                 "partitions": [self._partition_dict(item) for item in self.catalog.list_partitions(run_id=run_id)],
                 "attempts": {
                     item.fingerprint: [asdict(attempt) for attempt in self.catalog.list_attempts(item.fingerprint)]
                     for item in identities
                 },
                 "throttle_events": [asdict(item) for item in self.catalog.list_throttle_events(run_id)],
-                "publication_decision": "forbidden_phase_1",
+                "coverage_denominator": {
+                    "instruments": "all discovered supported instruments",
+                    "expected_days": "trading-calendar days inside valid listing/delisting intervals",
+                },
+                "publication_decision": (
+                    "collected_not_published" if spec.phase is CollectionPhase.COLLECT
+                    else "forbidden_phase_1"
+                ),
             })
         except Exception as exc:
             if run_id is not None:
@@ -416,7 +448,18 @@ class FullMarketHistoryRunner:
             if not row.get("listed_date"):
                 quarantine.setdefault(symbol, []).append("missing_listing_date")
                 continue
-            start = date.fromisoformat(str(row["listed_date"])[:10])
+            raw_listed = str(row["listed_date"])[:10]
+            try:
+                start = date.fromisoformat(raw_listed)
+            except ValueError:
+                quarantine.setdefault(symbol, []).append(f"invalid_listing_date:{raw_listed}")
+                continue
+            earliest = date.fromisoformat(str(
+                self.config.get("earliest_plausible_listing_date", "1990-01-01")
+            )[:10])
+            if start < earliest:
+                quarantine.setdefault(symbol, []).append(f"implausible_listing_date:{raw_listed}")
+                continue
             end = min(target, date.fromisoformat(str(row["delisted_date"])[:10])) if row.get("delisted_date") else target
             if start > end:
                 quarantine.setdefault(symbol, []).append("invalid_validity_interval")
@@ -577,6 +620,9 @@ class FullMarketHistoryRunner:
         for row in selected:
             symbol = str(row["symbol"])
             symbol_ids = [item for item in identities if item.symbol == symbol]
+            if not symbol_ids and symbol in quarantine:
+                missing_by_symbol[symbol] = ()
+                continue
             frames: dict[PriceMode, list[pd.DataFrame]] = {PriceMode.RAW: [], PriceMode.ADJUSTED: []}
             for identity in symbol_ids:
                 record = self.catalog.get_partition(identity.fingerprint)
@@ -594,13 +640,45 @@ class FullMarketHistoryRunner:
             start = str(row["listed_date"])[:10]
             end = min(str(row.get("delisted_date") or "9999-12-31")[:10], max(calendar, default="0001-01-01"))
             expected = tuple(day for day in calendar if start <= day <= end)
-            actual = {day for day, key_symbol in raw_keys if key_symbol == symbol}
+            actual = {
+                day for day, key_symbol in (raw_keys & adjusted_keys) if key_symbol == symbol
+            }
             missing = tuple(day for day in expected if day not in actual)
             missing_by_symbol[symbol] = missing
             coverage = len(actual & set(expected)) / len(expected) if expected else 0.0
             if coverage < threshold:
                 quarantine.setdefault(symbol, []).append(f"trading_day_coverage:{coverage:.6f}")
         return dict(sorted(missing_by_symbol.items()))
+
+    def _coverage_summary(
+        self,
+        selected: Sequence[Mapping[str, Any]],
+        identities: Sequence[PartitionIdentity],
+        calendar: Sequence[str],
+        quarantine: Mapping[str, Sequence[str]],
+        missing: Mapping[str, Sequence[str]],
+    ) -> tuple[float, float, bool]:
+        symbols = {str(row["symbol"]) for row in selected}
+        usable = symbols - set(quarantine)
+        instrument_ratio = len(usable) / len(symbols) if symbols else 0.0
+        expected_total = actual_total = 0
+        rows = {str(row["symbol"]): row for row in selected}
+        for symbol in sorted({identity.symbol for identity in identities}):
+            row = rows[symbol]
+            start = str(row["listed_date"])[:10]
+            end = min(
+                str(row.get("delisted_date") or "9999-12-31")[:10],
+                max(calendar, default="0001-01-01"),
+            )
+            expected = sum(start <= day <= end for day in calendar)
+            expected_total += expected
+            actual_total += max(0, expected - len(missing.get(symbol, ())))
+        day_ratio = actual_total / expected_total if expected_total else 0.0
+        coverage = self.config.get("coverage", {})
+        min_instruments = float(coverage.get("min_instrument_ratio", 0.95))
+        min_days = float(coverage.get("min_expected_trading_day_ratio", 0.98))
+        passed = instrument_ratio >= min_instruments and day_ratio >= min_days
+        return instrument_ratio, day_ratio, passed
 
     def _guard_disk(self, minimum_free_bytes: int) -> None:
         self.store.initialize()
@@ -647,12 +725,230 @@ class FullMarketHistoryRunner:
             **asdict(result), "report_json": str(json_path), "report_markdown": str(markdown_path),
         })
 
-    def _blocked_publication(self, spec: HistoryRunSpec) -> FullMarketHistoryResult:
-        return self._write_report(FullMarketHistoryResult(
-            "blocked", spec.phase.value, self.provider.name,
-            target_date=spec.target_date.isoformat() if spec.target_date else None,
-            error="Publication is unavailable in phase 1; latest_complete was not modified",
-        ))
+    def _publish_baseline(self, spec: HistoryRunSpec) -> FullMarketHistoryResult:
+        """Publish the latest completed full collection without making provider calls."""
+        latest_before = self.catalog.latest_complete()
+        before_id = latest_before.version_id if latest_before else None
+        legacy_before = self._legacy_manifest()
+        if not spec.publish:
+            return self._write_report(FullMarketHistoryResult(
+                "blocked", spec.phase.value, self.provider.name,
+                latest_complete_before=before_id, latest_complete_after=before_id,
+                legacy_manifest_before=legacy_before, legacy_manifest_after=legacy_before,
+                error="Publication requires explicit publish=True authorization",
+            ))
+        batch_id = version_id = None
+        try:
+            report = self._latest_collect_report()
+            if report.get("status") != "complete" or not report.get("coverage_gates_passed"):
+                raise RuntimeError("Coverage gates are unmet or the collection is incomplete")
+            if report.get("legacy_manifest_before") != report.get("legacy_manifest_after"):
+                raise RuntimeError("Collection evidence records legacy drift")
+            if legacy_before != report.get("legacy_manifest_after"):
+                raise RuntimeError("Legacy v1 SHA-256 manifest drifted after collection")
+            evidence = report.get("evidence") or {}
+            master = [dict(row) for row in evidence.get("fund_master") or ()]
+            calendar_days = [str(day)[:10] for day in evidence.get("calendar") or ()]
+            if not master or not calendar_days:
+                raise RuntimeError("Collection report is missing fund_master or calendar evidence")
+            run_id = str(report["run_id"])
+            quarantine = {
+                str(symbol): tuple(reasons)
+                for symbol, reasons in (report.get("quarantined_symbols") or {}).items()
+            }
+            usable = sorted(set(report.get("selected_symbols") or ()) - set(quarantine))
+            tables = self._assemble_baseline_tables(run_id, master, calendar_days, quarantine, usable)
+            required = {
+                "daily_bars_raw", "daily_bars_adjusted", "calendar",
+                "fund_master", "universe", "quarantine",
+            }
+            if set(tables) != required:
+                raise RuntimeError("Complete baseline table set is missing")
+            content = stable_fingerprint({
+                name: self._frame_fingerprint(frame) for name, frame in sorted(tables.items())
+            })
+            existing = self._complete_version_by_content(content)
+            if existing is not None:
+                return self._write_report(FullMarketHistoryResult(
+                    "complete", spec.phase.value, self.provider.name, run_id,
+                    report.get("target_date"), tuple(report.get("selected_symbols") or ()),
+                    discovered_count=int(report.get("discovered_count") or 0),
+                    quarantined_symbols=quarantine,
+                    missing_dates={k: tuple(v) for k, v in (report.get("missing_dates") or {}).items()},
+                    latest_complete_before=before_id,
+                    latest_complete_after=before_id,
+                    legacy_manifest_before=legacy_before,
+                    legacy_manifest_after=self._legacy_manifest(),
+                    instrument_coverage=float(report["instrument_coverage"]),
+                    expected_day_coverage=float(report["expected_day_coverage"]),
+                    coverage_gates_passed=True, version_id=existing.version_id,
+                ), extra={"publication_decision": "reused_content_identical_version"})
+
+            target = date.fromisoformat(str(report["target_date"])[:10])
+            request = stable_fingerprint({"run_id": run_id, "content": content})
+            batch_id = "batch-" + request[:16]
+            version_id = "version-" + stable_fingerprint({
+                "content": content, "previous": before_id,
+            })[:16]
+            batch = self.catalog.create_batch(BatchRecord(
+                batch_id, self.provider.name, min(date.fromisoformat(day) for day in calendar_days),
+                target, tuple(usable), "full-market", self.config_hash, request,
+                BatchStatus.PENDING, 0, None,
+            ))
+            if batch.status is BatchStatus.PENDING:
+                self.catalog.transition_batch(batch_id, BatchStatus.RUNNING)
+            self.store.begin_version(version_id)
+            for name, frame in tables.items():
+                self.store.write_table(
+                    version_id, name,
+                    pa.Table.from_pandas(frame.reset_index(drop=True), preserve_index=False),
+                )
+            row_counts = {name: len(frame) for name, frame in tables.items()}
+            identity = ManifestIdentity(
+                self.provider.name, batch_id, version_id, audit_now(), TrustState.TRUSTED,
+                content, 1, row_counts,
+            )
+            manifest = self.store.prepare_manifest(identity, row_counts)
+            self.catalog.create_version(VersionRecord(
+                version_id, batch_id, manifest.fingerprint, content, VersionStatus.BUILDING,
+                before_id, None, None,
+            ))
+            self.store.finalize_manifest(manifest)
+            published = self.store.published_path(version_id)
+            for item in manifest.files:
+                path = published / item.path
+                if not path.is_file() or path.stat().st_size != item.size or checksum_file(path) != item.sha256:
+                    raise RuntimeError(f"Finalized version checksum validation failed: {item.path}")
+            if self._legacy_manifest() != legacy_before:
+                raise RuntimeError("Legacy v1 SHA-256 manifest changed before pointer update")
+            self.catalog.transition_batch(
+                batch_id, BatchStatus.COMPLETE, row_count=sum(row_counts.values()),
+            )
+            self.catalog.complete_version(version_id)
+            self.store.resolve_complete(version_id)
+            legacy_after = self._legacy_manifest()
+            if legacy_after != legacy_before:
+                raise RuntimeError("Legacy v1 SHA-256 manifest changed during publication")
+            return self._write_report(FullMarketHistoryResult(
+                "complete", spec.phase.value, self.provider.name, run_id,
+                target.isoformat(), tuple(report.get("selected_symbols") or ()),
+                discovered_count=int(report.get("discovered_count") or 0),
+                quarantined_symbols=quarantine,
+                missing_dates={k: tuple(v) for k, v in (report.get("missing_dates") or {}).items()},
+                latest_complete_before=before_id, latest_complete_after=version_id,
+                legacy_manifest_before=legacy_before, legacy_manifest_after=legacy_after,
+                instrument_coverage=float(report["instrument_coverage"]),
+                expected_day_coverage=float(report["expected_day_coverage"]),
+                coverage_gates_passed=True, version_id=version_id,
+            ), extra={"publication_decision": "published", "row_counts": row_counts})
+        except Exception as exc:
+            if version_id:
+                try:
+                    self.catalog.fail_version(version_id, str(exc))
+                except Exception:
+                    pass
+                self.store.discard_staging(version_id)
+            if batch_id:
+                try:
+                    self.catalog.transition_batch(batch_id, BatchStatus.FAILED, error=str(exc))
+                except Exception:
+                    pass
+            latest_after = self.catalog.latest_complete()
+            return self._write_report(FullMarketHistoryResult(
+                "failed", spec.phase.value, self.provider.name,
+                latest_complete_before=before_id,
+                latest_complete_after=latest_after.version_id if latest_after else None,
+                legacy_manifest_before=legacy_before,
+                legacy_manifest_after=self._legacy_manifest(),
+                error=f"{type(exc).__name__}: {exc}",
+            ))
+
+    def _latest_collect_report(self) -> dict[str, Any]:
+        with sqlite3.connect(f"file:{self.catalog.path.as_posix()}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT run_id FROM collection_runs WHERE phase=? AND status=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (CollectionPhase.COLLECT.value, CollectionRunStatus.COMPLETE.value),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("No completed full-market collection is available")
+        path = self.report_root / f"full-market-collect-{row['run_id']}.json"
+        if not path.is_file():
+            raise RuntimeError("Completed collection report is missing")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _result_from_report(path: Path) -> FullMarketHistoryResult:
+        if not path.is_file():
+            raise RuntimeError(f"Completed collection report is missing: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        fields = FullMarketHistoryResult.__dataclass_fields__
+        values = {key: value for key, value in payload.items() if key in fields}
+        for key in ("selected_symbols", "unrepresented_categories"):
+            values[key] = tuple(values.get(key) or ())
+        for key in ("quarantined_symbols", "missing_dates"):
+            values[key] = {
+                str(name): tuple(items) for name, items in (values.get(key) or {}).items()
+            }
+        return FullMarketHistoryResult(**values)
+
+    def _assemble_baseline_tables(
+        self, run_id: str, master: Sequence[Mapping[str, Any]], calendar_days: Sequence[str],
+        quarantine: Mapping[str, Sequence[str]], usable: Sequence[str],
+    ) -> dict[str, pd.DataFrame]:
+        frames = {PriceMode.RAW: [], PriceMode.ADJUSTED: []}
+        for record in self.catalog.list_partitions(run_id=run_id):
+            if record.identity.symbol not in usable:
+                continue
+            if record.status is not PartitionStatus.COMPLETE:
+                raise RuntimeError(f"Incomplete partition for usable symbol: {record.partition_id}")
+            self.store.validate_partition(
+                record.identity, expected_checksum=record.checksum, expected_row_count=record.row_count,
+            )
+            frames[record.identity.price_mode].append(self.store.read_partition(record.identity).to_pandas())
+        raw = pd.concat(frames[PriceMode.RAW], ignore_index=True) if frames[PriceMode.RAW] else pd.DataFrame()
+        adjusted = pd.concat(frames[PriceMode.ADJUSTED], ignore_index=True) if frames[PriceMode.ADJUSTED] else pd.DataFrame()
+        raw_keys = set(zip(raw.get("date", ()), raw.get("symbol", ())))
+        adjusted_keys = set(zip(adjusted.get("date", ()), adjusted.get("symbol", ())))
+        if raw.empty or adjusted.empty or raw_keys != adjusted_keys:
+            raise RuntimeError("Published raw/adjusted tables are empty or key-mismatched")
+        master_frame = pd.DataFrame(master)
+        master_frame["trust_state"] = master_frame["symbol"].map(
+            lambda symbol: "quarantined" if symbol in quarantine else "trusted"
+        )
+        quarantine_frame = pd.DataFrame(
+            [{"symbol": symbol, "reasons": json.dumps(list(reasons), ensure_ascii=False)}
+             for symbol, reasons in sorted(quarantine.items())],
+            columns=["symbol", "reasons"],
+        )
+        target = max(calendar_days)
+        return {
+            "daily_bars_raw": raw.sort_values(["date", "symbol"]).reset_index(drop=True),
+            "daily_bars_adjusted": adjusted.sort_values(["date", "symbol"]).reset_index(drop=True),
+            "calendar": pd.DataFrame({"date": sorted(set(calendar_days)), "is_trading_day": True}),
+            "fund_master": master_frame.sort_values("symbol").reset_index(drop=True),
+            "universe": pd.DataFrame({"symbol": sorted(usable), "effective_date": target}),
+            "quarantine": quarantine_frame,
+        }
+
+    def _complete_version_by_content(self, content: str):
+        with sqlite3.connect(f"file:{self.catalog.path.as_posix()}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM published_versions WHERE content_fingerprint=? AND status IN (?, ?) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (content, VersionStatus.COMPLETE.value, VersionStatus.SUPERSEDED.value),
+            ).fetchone()
+        return self.catalog._version(row) if row else None
+
+    @staticmethod
+    def _frame_fingerprint(frame: pd.DataFrame) -> str:
+        normalized = frame.copy().reindex(sorted(frame.columns), axis=1)
+        order = [column for column in ("date", "symbol") if column in normalized]
+        if order:
+            normalized = normalized.sort_values(order).reset_index(drop=True)
+        return sha256(normalized.to_json(orient="table", date_format="iso").encode("utf-8")).hexdigest()
 
     @staticmethod
     def _partition_dict(record: CollectionPartitionRecord) -> dict[str, Any]:
