@@ -21,6 +21,8 @@ def isolated_fundlab_config(tmp_path, monkeypatch):
             "v2_staging_root": (test_root / "v2" / "staging").as_posix(),
             "v2_published_root": (test_root / "v2" / "published").as_posix(),
             "v2_report_root": (test_root / "reports").as_posix(),
+            "paper_db": (test_root / "v2" / "paper_trading.sqlite3").as_posix(),
+            "paper_report_root": (test_root / "reports" / "paper_trading").as_posix(),
         },
         "platform": {"timezone": "Asia/Hong_Kong"},
         "providers": {"enabled": ["xtquant"], "fallback": None},

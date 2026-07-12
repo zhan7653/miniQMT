@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
+import json
 
 import pandas as pd
 
@@ -11,7 +13,11 @@ from fundlab.backtest.models import Account
 from fundlab.backtest.recorder import BacktestRecorder
 from fundlab.data.portal import DataPortal
 from fundlab.data.platform import PriceMode
-from fundlab.risk import CashCheck, PositionLimit, PremiumDiscountCheck, RiskEngine, UniverseCheck
+from fundlab.risk import PremiumDiscountCheck, RiskEngine, UniverseCheck
+from fundlab.common.ids import new_id
+from fundlab.trading.decision import build_decision_envelope, DecisionValidationContext
+from fundlab.trading.models import DecisionSourceType
+from fundlab.trading.profiles import ResearchRiskProfile
 from fundlab.strategies.base import Strategy
 
 
@@ -37,7 +43,7 @@ class BacktestEngine:
         self.execution_planner = ExecutionPlanner()
         self.recorder = BacktestRecorder()
         self.risk_engine = risk_engine or RiskEngine(
-            [UniverseCheck(), PositionLimit(max_weight_per_symbol=0.50), CashCheck(), PremiumDiscountCheck()]
+            [UniverseCheck(), PremiumDiscountCheck()]
         )
 
     def run(self) -> BacktestRecorder:
@@ -70,15 +76,33 @@ class BacktestEngine:
                 if execution_date is None:
                     continue
                 target_weights = self.strategy.on_rebalance(current_date, run_portal, {"account": self.account})
-                target_weights = self.risk_engine.check_target_weights(
-                    target_weights, self.account, current_date, run_portal
+                if not target_weights:
+                    continue
+                validation = self.risk_engine.validate_target_weights(target_weights, self.account,
+                                                                      current_date, run_portal)
+                original_json = json.dumps(target_weights, sort_keys=True, separators=(",", ":"))
+                decision = build_decision_envelope(
+                    decision_id=new_id("decision"), account_id=self.account.account_id,
+                    source_type=DecisionSourceType.RULE_STRATEGY, source_id=self.strategy.strategy_id,
+                    config_version="backtest-v1", decision_date=date.fromisoformat(current_date),
+                    target_weights=target_weights, reason="strategy_rebalance",
+                    data_version=str(run_portal.data_version),
+                    observation_hash=hashlib.sha256(original_json.encode("utf-8")).hexdigest(),
+                    context=DecisionValidationContext(frozenset(run_portal.get_universe(current_date))),
+                    profile=ResearchRiskProfile("backtest", "v1"),
                 )
+                if validation != decision.validation:
+                    decision = decision.__class__(**{**decision.__dict__, "validation": validation})
+                self.recorder.record_decision(decision)
+                if not validation.accepted:
+                    continue
                 intents = self.execution_planner.create_intents(
                     account_id=self.account.account_id,
                     strategy_id=self.strategy.strategy_id,
                     signal_date=current_date,
                     execution_date=execution_date,
                     target_weights=target_weights,
+                    held_symbols=tuple(self.account.positions),
                 )
                 self.recorder.record_intents(intents)
 

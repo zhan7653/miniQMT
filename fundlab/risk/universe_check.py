@@ -21,6 +21,4 @@ class UniverseCheck:
     def check_target_weights(self, target_weights: dict[str, float], account: Account, date: str, data_portal: DataPortal) -> dict[str, float]:
         if not self.allow_universe_only:
             return target_weights
-        universe = set(data_portal.get_universe(date))
-        return {symbol: weight for symbol, weight in target_weights.items() if symbol == "cash" or symbol in universe}
-
+        return dict(target_weights)

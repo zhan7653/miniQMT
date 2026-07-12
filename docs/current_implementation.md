@@ -11,6 +11,11 @@ audited SQLite catalog, immutable raw/staging/published Parquet lifecycle, compl
 portal and run-local snapshot, trusted adjusted-price/raw-liquidity features, read-only v1 migration,
 and a deterministic daily update/reporting path.
 
+It also contains the durable ETF paper-trading core. This subsystem uses a separate versioned
+SQLite ledger, immutable account/profile bindings, pinned complete v2 reads, T-close decisions,
+T+1 raw-open fills, raw-close valuation, account-level failure isolation, date-batch rollback,
+idempotent backfill, explicit replay versions, and canonical machine/human reports.
+
 ## Implemented Capabilities
 
 - Local package skeleton with `fundlab` modules and script entry points under `scripts/`.
@@ -41,6 +46,7 @@ and a deterministic daily update/reporting path.
 | `fundlab/strategies/` | Rule strategy implementations. |
 | `fundlab/risk/` | Target-weight and order-level risk checks. |
 | `fundlab/backtest/` | Account/order/trade models, execution planner, broker, accounting, recorder, metrics, and persistence. |
+| `fundlab/paper/` | Paper-account lifecycle, append-only ledger, daily runner, metrics, and reports. |
 | `scripts/` | Setup, fake-data creation, feature computation, quality checks, data update helpers, and sample backtest runner. |
 | `tests/` | Unit, integration, and regression coverage for the implemented behavior. |
 
@@ -161,6 +167,10 @@ Additional scripts:
 - `scripts.update_nav`, `scripts.update_dividends`, and `scripts.update_index_valuation` use `xtquant` source methods; NAV currently uses close-derived neutral placeholders where true NAV is unavailable.
 - `scripts.check_data_quality` writes a daily-bar quality report to `data/reports/quality/daily_bar_quality.csv`.
 - `scripts.update_real_data` orchestrates the real-data refresh, feature generation, and quality report.
+- `scripts.manage_paper_accounts` bootstraps, creates, queries, pauses, resumes, closes, and explicitly
+  replays paper accounts through a non-interactive JSON interface.
+- `scripts.run_paper_daily` runs one date or an ascending missing-date backfill and writes canonical
+  JSON, CSV, and Markdown reports.
 
 ## Current Limitations
 
@@ -170,6 +180,8 @@ Additional scripts:
 - Fake data is deterministic and test-oriented, not production market data.
 - Strategy execution is a simple next-open simulation, not a live trading or paper-trading gateway.
 - Risk checks are intentionally lightweight and should be extended before production trading.
+- Paper trading is an end-of-day research simulator, not MiniQMT order routing. Real ETF corporate
+  actions remain incomplete, so its reports explicitly describe returns as incomplete price returns.
 
 V2 intentionally does not add paid/automatic fallback providers, live scheduling services, real
 corporate-action completion, minute data, or a UI. The operator or Codex/cron invokes the CLI. The

@@ -32,7 +32,7 @@ class BacktestBroker:
             amount = price * order.quantity
             fee = self.cost_model.calculate(amount)
 
-        order.status = "partial_filled" if order.reason and "scaled" in order.reason else "filled"
+        order.status = "partial-filled" if order.quantity != (order.requested_quantity or order.quantity) else "filled"
         return Trade(
             trade_id=new_id("trade"),
             order_id=order.order_id,

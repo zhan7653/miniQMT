@@ -3,21 +3,24 @@ from __future__ import annotations
 from fundlab.backtest.models import Account, Position, Trade
 from fundlab.data.platform import PriceMode
 from fundlab.data.portal import DataPortal
+from fundlab.trading.accounting import apply_fill
 
 
 class Accounting:
     def apply_trade(self, account: Account, trade: Trade) -> None:
         position = account.positions.get(trade.symbol, Position(symbol=trade.symbol))
+        result = apply_fill(cash=account.cash, position_quantity=position.quantity, side=trade.side,
+                            quantity=trade.quantity, amount=trade.amount, commission=trade.fee)
         if trade.side == "buy":
             total_cost_before = position.avg_cost * position.quantity
             total_cost_after = total_cost_before + trade.amount + trade.fee
             position.quantity += trade.quantity
             position.avg_cost = total_cost_after / position.quantity if position.quantity else 0.0
-            account.cash -= trade.amount + trade.fee
+            account.cash = result.cash_after
         else:
             sell_quantity = min(position.quantity, trade.quantity)
             position.quantity -= sell_quantity
-            account.cash += trade.amount - trade.fee
+            account.cash = result.cash_after
             if position.quantity == 0:
                 position.avg_cost = 0.0
 
