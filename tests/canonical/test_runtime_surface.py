@@ -6,22 +6,33 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "module_name,replacement",
+    "module_name",
     (
-        ("fundlab.backtest", "fundlab.trading"),
-        ("fundlab.paper", "fundlab.trading"),
-        ("fundlab.data", "fundlab.marketdata"),
-        ("fundlab.features", "canonical snapshots"),
-        ("fundlab.risk", "fundlab.trading.intent"),
-        ("fundlab.strategies", "PortfolioIntent"),
+        "fundlab.backtest",
+        "fundlab.paper",
+        "fundlab.data",
+        "fundlab.features",
+        "fundlab.risk",
     ),
 )
-def test_removed_runtime_surfaces_fail_with_the_canonical_replacement(
-    module_name: str,
-    replacement: str,
-):
-    with pytest.raises(ModuleNotFoundError, match=replacement):
+def test_removed_runtime_surfaces_stay_removed(module_name: str):
+    with pytest.raises(ModuleNotFoundError):
         importlib.import_module(module_name)
+
+
+def test_strategies_package_exposes_only_intent_sources():
+    strategies = importlib.import_module("fundlab.strategies")
+
+    assert set(strategies.__all__) == {
+        "AgentDecision",
+        "AgentDecisionError",
+        "FileIntentSource",
+        "StaticAllocationSource",
+        "load_agent_decision",
+    }
+    from fundlab.trading import IntentSource
+
+    assert isinstance(strategies.StaticAllocationSource({"600000.SH": 1}), IntentSource)
 
 
 @pytest.mark.parametrize(

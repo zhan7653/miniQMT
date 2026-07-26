@@ -15,13 +15,15 @@ from fundlab.trading.repository import (
 )
 from fundlab.trading.runtime import (
     DailyClock, HistoricalClock, IntentSource, SimulationOutcome, SimulationService,
-    StaticAllocationSource,
 )
 from fundlab.trading.reporting import SimulationFeedback, build_simulation_feedback
 from fundlab.trading.state import (
     Entitlement, ExecutionPolicy, ExecutionStatus, Fill, IntentResult, LedgerEvent, Order,
     PortfolioState, PositionLot, SessionResult, Side, Valuation,
 )
+
+# Compatibility re-export: the class now lives with the other intent sources.
+from fundlab.strategies.static import StaticAllocationSource
 
 __all__ = [
     "AccountRecord", "AccountStatus", "RebalanceFrequency", "is_rebalance_day",

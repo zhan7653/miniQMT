@@ -1,8 +1,0 @@
-version: reviewed-v1
-effective_date: "2026-05-07"
-symbols:
-  - 510300.SH
-  - 510500.SH
-  - 518880.SH
-benchmarks:
-  - 510300.SH
