@@ -37,11 +37,12 @@ from fundlab.marketdata import (
     default_reconciliation_policy,
     source_statuses,
 )
+from fundlab.pipeline import DailyPipeline
 from fundlab.settings import FoundationSettings, load_foundation_settings
+from fundlab.strategies import StaticAllocationSource
 from fundlab.trading import (
     PortfolioState,
     SimulationService,
-    StaticAllocationSource,
     TradingRepository,
     build_simulation_feedback,
 )
@@ -210,6 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
     show = account_commands.add_parser("show")
     show.add_argument("--account-id", required=True)
 
+    daily = commands.add_parser("daily", help="Automated daily cycle: extend the snapshot, advance paper accounts")
+    daily_commands = daily.add_subparsers(dest="daily_command", required=True)
+    daily_run = daily_commands.add_parser("run", help="Run one idempotent daily cycle")
+    daily_run.add_argument("--target-date", type=date.fromisoformat)
+    daily_run.add_argument("--skip-data", action="store_true")
+    daily_run.add_argument("--skip-accounts", action="store_true")
+    daily_commands.add_parser("status", help="Show snapshot head, account heads, and configuration")
+
     simulate = commands.add_parser("simulate", help="Run the shared kernel with a static PortfolioIntent source")
     simulate.add_argument("--account-id", required=True)
     simulate.add_argument("--snapshot-id")
@@ -234,6 +243,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _account(args, settings)
         if args.command == "simulate":
             return _simulate(args, settings)
+        if args.command == "daily":
+            return _daily(args, settings)
         raise AssertionError(args.command)
     except Exception as exc:
         print(canonical_json({
@@ -553,6 +564,54 @@ def _data(args, settings: FoundationSettings) -> int:
         }))
         return 0
     raise AssertionError(args.data_command)
+
+
+def _daily(args, settings: FoundationSettings) -> int:
+    if args.daily_command == "run":
+        result = DailyPipeline(settings).run(
+            target_date=args.target_date,
+            skip_data=args.skip_data,
+            skip_accounts=args.skip_accounts,
+        )
+        print(canonical_json({
+            "status": result.status,
+            "target_date": result.target_date,
+            "snapshot_id": result.snapshot_id,
+            "stages": [to_primitive(item) for item in result.stages],
+            "accounts": result.accounts,
+            "report": result.report_path,
+        }))
+        return result.exit_code
+    if args.daily_command == "status":
+        warehouse = MarketDataWarehouse(settings.paths.market_data)
+        snapshot = warehouse.load_snapshot(warehouse.current_snapshot_id())
+        scope = snapshot.plan.universe_scope
+        repository = TradingRepository(settings.paths.trading_database)
+        accounts = []
+        for item in settings.daily.accounts:
+            entry: dict = {"account_id": item.account_id, "strategy": item.strategy}
+            try:
+                repository.account(item.account_id)
+                _, selected_parent = repository.selected_state(item.account_id)
+                entry["exists"] = True
+                entry["head"] = (
+                    None if selected_parent is None
+                    else repository.run(selected_parent).binding.end_date
+                )
+            except Exception:
+                entry["exists"] = False
+            accounts.append(entry)
+        print(canonical_json({
+            "status": "ok",
+            "snapshot_id": snapshot.snapshot_id,
+            "published_end": None if scope is None else scope.history_end,
+            "instruments": 0 if scope is None else len(scope.instrument_ids),
+            "accounts": accounts,
+            "agent_decision_dir": settings.daily.agent_decision_root,
+            "session_cutoff_local": settings.daily.session_cutoff.isoformat(timespec="minutes"),
+        }))
+        return 0
+    raise AssertionError(args.daily_command)
 
 
 def _account(args, settings: FoundationSettings) -> int:

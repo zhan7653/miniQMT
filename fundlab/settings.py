@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,11 +23,38 @@ class FoundationPaths:
 
 
 @dataclass(frozen=True)
+class DailyAccountSettings:
+    account_id: str
+    name: str
+    initial_cash: Decimal
+    strategy: str
+    weights: Mapping[str, Decimal] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.strategy not in {"static", "agent-file"}:
+            raise ValueError(f"Unknown daily strategy: {self.strategy}")
+        if self.strategy == "static" and not self.weights:
+            raise ValueError(f"Static daily account needs weights: {self.account_id}")
+
+
+@dataclass(frozen=True)
+class DailySettings:
+    session_cutoff: time
+    agent_decision_root: Path
+    report_root: Path
+    accounts: tuple[DailyAccountSettings, ...]
+    source_pair: tuple[str, str] = ("tickflow", "xtquant")
+    adjudicator: str = "baostock"
+    batch_size: int = 100
+
+
+@dataclass(frozen=True)
 class FoundationSettings:
     paths: FoundationPaths
     execution_policy: ExecutionPolicy
     risk_policy: RiskPolicy
     fee_schedule: FeeSchedule
+    daily: DailySettings
 
 
 def load_foundation_settings(path: str | Path = "config/fundlab.yaml") -> FoundationSettings:
@@ -71,7 +98,38 @@ def load_foundation_settings(path: str | Path = "config/fundlab.yaml") -> Founda
         bool(raw_fees.get("trusted_for_simulation", False)),
         str(raw_fees.get("verification_note", "")),
     )
-    return FoundationSettings(paths, execution, risk, fee_schedule)
+    daily = _daily_settings(payload.get("daily"), base)
+    return FoundationSettings(paths, execution, risk, fee_schedule, daily)
+
+
+def _daily_settings(raw: Any, base: Path) -> DailySettings:
+    raw = raw if isinstance(raw, dict) else {}
+    accounts = []
+    for item in raw.get("accounts", ()):
+        if not isinstance(item, dict):
+            raise ValueError("Daily account entries must be mappings")
+        accounts.append(DailyAccountSettings(
+            str(item["account_id"]),
+            str(item.get("name", item["account_id"])),
+            Decimal(str(item.get("initial_cash", "1000000"))),
+            str(item.get("strategy", "static")),
+            {
+                str(symbol): Decimal(str(weight))
+                for symbol, weight in (item.get("weights") or {}).items()
+            },
+        ))
+    def _path(key: str, default: str) -> Path:
+        value = Path(str(raw.get(key, default)))
+        return value.resolve() if value.is_absolute() else (base / value).resolve()
+    return DailySettings(
+        session_cutoff=time.fromisoformat(str(raw.get("session_cutoff_local", "19:00"))),
+        agent_decision_root=_path("agent_decision_dir", "../data/agent/decisions"),
+        report_root=_path("report_dir", "../data/reports/daily"),
+        accounts=tuple(accounts),
+        source_pair=tuple(map(str, raw.get("source_pair", ("tickflow", "xtquant")))),
+        adjudicator=str(raw.get("adjudicator", "baostock")),
+        batch_size=int(raw.get("batch_size", 100)),
+    )
 
 
 def _fee_rule(payload: Mapping[str, Any]) -> FeeRule:

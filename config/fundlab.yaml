@@ -9,6 +9,28 @@ paths:
   protected_legacy_database: ../data/warehouse/sqlite/fundlab.db
   protected_legacy_bars: ../data/warehouse/parquet/fund_daily_bar
 
+daily:
+  # A session counts as completed only after this local time; before it the
+  # pipeline targets the previous open session.
+  session_cutoff_local: "19:00"
+  agent_decision_dir: ../data/agent/decisions
+  report_dir: ../data/reports/daily
+  source_pair: [tickflow, xtquant]
+  adjudicator: baostock
+  batch_size: 100
+  accounts:
+    - account_id: paper-1
+      name: "Paper 1 (static ETF mix)"
+      initial_cash: "1000000"
+      strategy: static
+      weights:
+        510300.SH: "0.6"
+        511010.SH: "0.4"
+    - account_id: paper-agent
+      name: "Paper Agent (file decisions)"
+      initial_cash: "1000000"
+      strategy: agent-file
+
 execution:
   policy_id: cn-daily-conservative
   version: "2026-07-18"
