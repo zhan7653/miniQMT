@@ -1,5 +1,1 @@
-from fundlab.backtest.engine import BacktestEngine
-from fundlab.backtest.models import Account, Order, OrderIntent, Position, Trade
-
-__all__ = ["Account", "BacktestEngine", "Order", "OrderIntent", "Position", "Trade"]
-
+raise ModuleNotFoundError("fundlab.backtest was removed; use fundlab.trading")

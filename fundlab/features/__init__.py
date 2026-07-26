@@ -1,3 +1,1 @@
-from fundlab.features.feature_engine import FeatureEngine
-
-__all__ = ["FeatureEngine"]
+raise ModuleNotFoundError("fundlab.features was removed; future features must consume canonical snapshots")

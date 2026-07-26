@@ -1,0 +1,89 @@
+paths:
+  # Runtime remains under the repository-approved ignored v2 directory during safe cutover;
+  # public code and commands use canonical names and do not expose a v1/v2 API split.
+  market_data: ../data/warehouse/v2/canonical
+  trading_database: ../data/warehouse/v2/trading.sqlite3
+  report_root: ../data/reports/data_v2/canonical
+  legacy_market_data: ../data/warehouse/v2
+  legacy_reports: ../data/reports/data_v2
+  protected_legacy_database: ../data/warehouse/sqlite/fundlab.db
+  protected_legacy_bars: ../data/warehouse/parquet/fund_daily_bar
+
+execution:
+  policy_id: cn-daily-conservative
+  version: "2026-07-18"
+  maximum_participation: "0.05"
+  base_slippage_bps: "2"
+  impact_bps_at_max_participation: "20"
+  block_at_price_limit: true
+  allow_partial_fills: true
+  subscribe_rights: false
+
+risk:
+  policy_id: local-long-only
+  version: "1"
+  max_position_weight: "1"
+  minimum_cash_weight: "0"
+  allowed_asset_types: [stock, etf]
+
+fees:
+  schedule_id: cn-simulation-reference
+  version: "2026-07-18"
+  # This is a versioned simulation assumption, not a claim about a real broker account.
+  # Live or broker-parity work must supply a separately verified account schedule.
+  trusted_for_simulation: true
+  verification_note: Public taxes plus an explicit 0.03%/CNY 5 minimum commission model for reproducible simulation.
+  rules:
+    - effective_from: "2015-08-01"
+      effective_to: "2022-04-28"
+      asset_types: [stock]
+      exchanges: [SH, SZ]
+      broker_commission_rate: "0.0003"
+      minimum_commission: "5"
+      stamp_duty_sell_rate: "0.001"
+      transfer_fee_rate: "0.00002"
+      exchange_handling_rate: "0"
+      regulatory_levy_rate: "0"
+      evidence: "ChinaClear 2015-07-09 notice: unified SH/SZ A-share transfer fee at 0.02 per mille from 2015-08-01; pre-2023 sell stamp duty 0.1%."
+    - effective_from: "2022-04-29"
+      effective_to: "2023-08-27"
+      asset_types: [stock]
+      exchanges: [SH, SZ]
+      broker_commission_rate: "0.0003"
+      minimum_commission: "5"
+      stamp_duty_sell_rate: "0.001"
+      transfer_fee_rate: "0.00001"
+      exchange_handling_rate: "0"
+      regulatory_levy_rate: "0"
+      evidence: "ChinaClear 2022-04-28 notice: SH/SZ A-share transfer fee reduced to 0.01 per mille from 2022-04-29; pre-2023 sell stamp duty 0.1%."
+    - effective_from: "2023-08-28"
+      asset_types: [stock]
+      exchanges: [SH, SZ]
+      broker_commission_rate: "0.0003"
+      minimum_commission: "5"
+      stamp_duty_sell_rate: "0.0005"
+      transfer_fee_rate: "0.00001"
+      exchange_handling_rate: "0"
+      regulatory_levy_rate: "0"
+      evidence: "Public tax rates plus an explicit simulation commission assumption; not a broker-account claim."
+    - effective_from: "2015-08-01"
+      effective_to: "2023-08-27"
+      asset_types: [etf]
+      exchanges: [SH, SZ]
+      broker_commission_rate: "0.0003"
+      minimum_commission: "5"
+      stamp_duty_sell_rate: "0"
+      transfer_fee_rate: "0"
+      exchange_handling_rate: "0"
+      regulatory_levy_rate: "0"
+      evidence: "Explicit ETF simulation commission assumption; no stock stamp duty or A-share transfer fee."
+    - effective_from: "2023-08-28"
+      asset_types: [etf]
+      exchanges: [SH, SZ]
+      broker_commission_rate: "0.0003"
+      minimum_commission: "5"
+      stamp_duty_sell_rate: "0"
+      transfer_fee_rate: "0"
+      exchange_handling_rate: "0"
+      regulatory_levy_rate: "0"
+      evidence: "Explicit ETF simulation commission assumption; not a broker-account claim."
