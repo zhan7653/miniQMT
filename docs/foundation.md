@@ -189,9 +189,30 @@ The protected warehouse therefore remains read-only. No legacy data was copied, 
 was published, and no old source path was deleted. The importer can preserve the report-bound rows as
 an explicitly incomplete observation, but doing so requires `--allow-incomplete-source`.
 
+## Daily pipeline
+
+`fundlab/pipeline/daily.py` is the routine driver for everything below. `uv run fundlab daily run`
+performs one idempotent cycle: capture and cross-check the BaoStock and Sina exchange calendars into
+one validated canonical calendar observation, resolve the latest completed session against the
+configured cutoff, and — when the published snapshot is behind — run the increment path end to end
+(two-source history build with a BaoStock adjudicator, automatic no-trade consensus for full-window
+suspensions, current-research derivation, xtquant/BaoStock status collection, action and factor
+evidence collection, candidate composition, increment validation, atomic componentized publish).
+Afterwards every account configured under `daily:` in `config/fundlab.yaml` is advanced session by
+session to the published head with its intent source (`static` weights or `agent-file` decisions).
+
+The manual commands below remain the underlying, individually auditable machinery; the pipeline only
+orchestrates them and inherits every fail-closed gate. A blocked stage exits 2 with a structured
+reason and writes an ops report under `data/reports/daily/`; re-running resumes from the durable
+observation warehouse.
+
 ## Commands
 
 ```powershell
+# One idempotent daily cycle (data extension + account advancement) and its status
+uv run fundlab daily run
+uv run fundlab daily status
+
 # Show channels, backend identities, capabilities and whether their clients are importable
 uv run fundlab data sources
 

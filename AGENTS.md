@@ -6,9 +6,9 @@
 
 ## Data and environment safety
 
-- Treat `data/warehouse/sqlite/fundlab.db` and `data/warehouse/parquet/fund_daily_bar/**` as read-only legacy artifacts unless the user explicitly authorizes a legacy-data mutation.
-- Put Data Platform v2 runtime artifacts under ignored `data/warehouse/v2/` and reports under `data/reports/data_v2/`.
+- Treat `data/warehouse/sqlite/fundlab.db` and `data/warehouse/parquet/fund_daily_bar/**` as read-only legacy artifacts unless the user explicitly authorizes a legacy-data mutation. They are no longer tracked by git but remain protected evidence on disk.
+- Put Data Platform v2 runtime artifacts under ignored `data/warehouse/v2/` and reports under `data/reports/data_v2/`; daily ops reports go under ignored `data/reports/daily/`.
 - `xtquant` is externally installed and is not locked in `uv.lock`. Use `uv sync --dev --frozen --inexact` when syncing so the environment does not remove it.
-- Do not run legacy real-data update scripts during v2 migration or validation when they could modify the tracked v1 warehouse.
-- Routine canonical publication must use the componentized incremental path. Do not restore or call a full-history simulation builder for a weekly update.
+- Routine canonical publication must use the componentized incremental path, driven by `uv run fundlab daily run` (`fundlab/pipeline/daily.py`). Do not restore or call a full-history simulation builder for a routine update, and do not hand-relay observation IDs through ad-hoc scripts — extend the pipeline instead.
 - A historical correction requires an exact instrument/date/field dependency scope. If the affected scope cannot be proven, fail closed instead of rebuilding all history.
+- Strategy and agent decisions enter the kernel only as `PortfolioIntent` through `fundlab.strategies` intent sources; external agents use the JSON decision-file contract described in README.md.

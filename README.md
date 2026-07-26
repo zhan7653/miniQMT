@@ -27,6 +27,59 @@ uv run pytest tests/canonical
 
 `--inexact` is required because `xtquant` is installed outside `uv.lock` in this workspace.
 
+## Daily operations
+
+One idempotent command runs the whole daily cycle — validate the two-source exchange calendar,
+extend the published simulation snapshot through the componentized increment path, then advance
+every configured paper account:
+
+```powershell
+uv run fundlab daily run
+uv run fundlab daily status
+```
+
+Accounts, the session cutoff, and the agent decision directory live in the `daily:` section of
+`config/fundlab.yaml`. Exit code 0 means ok or already up to date; exit code 2 means a fail-closed
+gate blocked the run — the reason is in the console JSON and in the ops report under
+`data/reports/daily/`. Re-running after a block resumes from the durable observation warehouse;
+nothing partial is ever published.
+
+Schedule it on weekdays at 20:00 with catch-up and retries:
+
+```powershell
+pwsh -File scripts/register-daily-task.ps1
+```
+
+Operational requirement: the local MiniQMT client must be running so the `xtquant` provider can
+serve data. If it is offline the data stage blocks cleanly and the next run resumes. The account
+stage still advances to the last published session even when the data stage is blocked.
+
+## Agent integration
+
+The trading kernel accepts strategy decisions only as immutable `PortfolioIntent` objects through
+the `fundlab.trading.IntentSource` protocol. Two implementations ship in `fundlab.strategies`:
+
+- `StaticAllocationSource` — fixed target weights (the `strategy: static` account type).
+- `FileIntentSource` — the out-of-process agent socket (the `strategy: agent-file` account type).
+
+An external agent — any language, any LLM harness — participates by writing one JSON file per
+account per session before the daily run, at `data/agent/decisions/<account_id>/<YYYY-MM-DD>.json`:
+
+```json
+{
+  "account_id": "paper-agent",
+  "decision_date": "2026-07-27",
+  "target_weights": {"510300.SH": "0.6", "511010.SH": "0.4"},
+  "reason": "why the agent wants this allocation",
+  "agent_id": "my-agent"
+}
+```
+
+No file means hold current positions — silence is a first-class outcome. A present-but-invalid
+file (wrong account, wrong date, negative weight, missing reason) fails the account's run instead
+of degrading to a hold, and the decision content is bound into the run's strategy config hash so a
+replay cannot silently execute a different decision.
+
 ## Trusted data canary
 
 The current direct channels are TickFlow, Eastmoney through Efinance, BaoStock, and the explicitly
@@ -173,5 +226,6 @@ commission with a CNY 5 minimum. It is trusted for reproducible simulation but d
 a real broker account. Live or broker-parity work must bind a separately verified account schedule.
 
 See [docs/foundation.md](docs/foundation.md) for contracts, timing, realism boundaries, migration state,
-and operating commands. Runtime consumers use only `fundlab.marketdata` and `fundlab.trading`; legacy
-warehouse files remain read-only evidence and are not a second runtime path.
+and operating commands. Runtime consumers use only `fundlab.marketdata`, `fundlab.trading`,
+`fundlab.strategies`, and the `fundlab.pipeline` orchestrator; legacy warehouse files remain read-only
+evidence and are not a second runtime path.
