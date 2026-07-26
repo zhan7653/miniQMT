@@ -11,6 +11,8 @@ observation warehouse.
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -58,6 +60,50 @@ from fundlab.trading import (
 PIPELINE_VERSION = "daily-pipeline-v1"
 CALENDAR_PROVIDERS = ("baostock", "sina-calendar")
 NO_TRADE_PROVIDERS = ("tickflow", "xtquant", "baostock")
+
+
+class DailyRunInProgress(RuntimeError):
+    """Another process already holds the daily-run lock."""
+
+
+@contextmanager
+def _exclusive_daily_lock(path: Path):
+    """One daily run at a time across processes (web trigger vs scheduled task).
+
+    Uses OS-level file locking, so the lock dies with the process and can
+    never go stale after a crash.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise DailyRunInProgress(str(path)) from exc
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise DailyRunInProgress(str(path)) from exc
+            yield
+    finally:
+        handle.close()
 
 
 class DailyPipelineBlocked(RuntimeError):
@@ -121,44 +167,60 @@ class DailyPipeline:
         snapshot_id: str | None = None
         resolved_target: date | None = None
         status = "ok"
+        lock_path = Path(self.settings.paths.market_data) / "builds" / ".locks" / "daily-run.lock"
         try:
-            predecessor = self.warehouse.load_snapshot(self.warehouse.current_snapshot_id())
-            previous_scope = predecessor.plan.universe_scope
-            if previous_scope is None:
-                raise DailyPipelineBlocked("resolve", "current snapshot has no universe scope")
-            calendar_obs, calendar_frame = self._validated_calendar(
-                previous_scope.history_start,
-            )
-            resolved_target = target_date or self._latest_completed_session(calendar_frame)
-            stages.append(DailyStage("resolve", "ok", {
-                "predecessor_snapshot_id": predecessor.snapshot_id,
-                "predecessor_end": previous_scope.history_end.isoformat(),
-                "calendar_observation_id": calendar_obs,
-                "target_date": resolved_target.isoformat(),
+            with _exclusive_daily_lock(lock_path):
+                predecessor = self.warehouse.load_snapshot(self.warehouse.current_snapshot_id())
+                previous_scope = predecessor.plan.universe_scope
+                if previous_scope is None:
+                    raise DailyPipelineBlocked("resolve", "current snapshot has no universe scope")
+
+                if skip_data:
+                    # Fully offline: no provider is contacted; accounts advance
+                    # against whatever is already published.
+                    resolved_target = target_date
+                    snapshot_id = predecessor.snapshot_id
+                    stages.append(DailyStage("resolve", "ok", {
+                        "predecessor_snapshot_id": predecessor.snapshot_id,
+                        "predecessor_end": previous_scope.history_end.isoformat(),
+                        "calendar": "skipped (--skip-data)",
+                    }))
+                    stages.append(DailyStage("data", "skipped", {"reason": "--skip-data"}))
+                else:
+                    calendar_obs, calendar_frame = self._validated_calendar(
+                        previous_scope.history_start,
+                    )
+                    resolved_target = target_date or self._latest_completed_session(calendar_frame)
+                    stages.append(DailyStage("resolve", "ok", {
+                        "predecessor_snapshot_id": predecessor.snapshot_id,
+                        "predecessor_end": previous_scope.history_end.isoformat(),
+                        "calendar_observation_id": calendar_obs,
+                        "target_date": resolved_target.isoformat(),
+                    }))
+                    if resolved_target <= previous_scope.history_end:
+                        stages.append(DailyStage("data", "up_to_date", {
+                            "published_end": previous_scope.history_end.isoformat(),
+                        }))
+                        snapshot_id = predecessor.snapshot_id
+                    else:
+                        snapshot_id = self._extend_data(
+                            stages,
+                            predecessor=predecessor,
+                            previous_scope=previous_scope,
+                            calendar_observation_id=calendar_obs,
+                            calendar_frame=calendar_frame,
+                            target=resolved_target,
+                        )
+
+                if skip_accounts:
+                    stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
+                else:
+                    accounts = self._advance_accounts(stages)
+        except DailyRunInProgress:
+            status = "blocked"
+            stages.append(DailyStage("lock", "blocked", {
+                "reason": "another daily run is already in progress",
             }))
-
-            if skip_data:
-                stages.append(DailyStage("data", "skipped", {"reason": "--skip-data"}))
-                snapshot_id = predecessor.snapshot_id
-            elif resolved_target <= previous_scope.history_end:
-                stages.append(DailyStage("data", "up_to_date", {
-                    "published_end": previous_scope.history_end.isoformat(),
-                }))
-                snapshot_id = predecessor.snapshot_id
-            else:
-                snapshot_id = self._extend_data(
-                    stages,
-                    predecessor=predecessor,
-                    previous_scope=previous_scope,
-                    calendar_observation_id=calendar_obs,
-                    calendar_frame=calendar_frame,
-                    target=resolved_target,
-                )
-
-            if skip_accounts:
-                stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
-            else:
-                accounts = self._advance_accounts(stages)
         except DailyPipelineBlocked as exc:
             status = "blocked"
             stages.append(DailyStage(exc.stage, "blocked", {
@@ -764,11 +826,18 @@ class DailyPipeline:
             risk_policy=self.settings.risk_policy,
             fee_schedule=self.settings.fee_schedule,
         )
-        published_end = market.all_trading_days()[-1]
+        published_days = market.all_trading_days()
+        published_end = published_days[-1]
+        # The snapshot calendar ends at the published head, so an intent decided
+        # exactly there can never schedule its T+1 order (next_trading_day is
+        # None past the calendar).  The account clock therefore stays one
+        # session behind publication: deciding at T-1 close schedules for T,
+        # and tomorrow's publication executes it with real T prices.
+        execution_head = published_days[-2] if len(published_days) >= 2 else published_end
         results = []
         for account in configured:
             results.append(self._advance_one_account(
-                account, market, repository, service, published_end,
+                account, market, repository, service, execution_head,
             ))
         blocked = [item for item in results if item["status"] == "blocked"]
         stages.append(DailyStage(
@@ -777,6 +846,7 @@ class DailyPipeline:
             {
                 "snapshot_id": market.snapshot_id,
                 "published_end": published_end.isoformat(),
+                "execution_head": execution_head.isoformat(),
                 "advanced": sum(1 for item in results if item["status"] == "ok"),
                 "blocked": [item["account_id"] for item in blocked],
             },
@@ -789,7 +859,7 @@ class DailyPipeline:
         market: CanonicalMarketData,
         repository: TradingRepository,
         service: SimulationService,
-        published_end: date,
+        execution_head: date,
     ) -> dict[str, Any]:
         try:
             try:
@@ -802,14 +872,14 @@ class DailyPipeline:
                 )
             _, selected_parent = repository.selected_state(account.account_id)
             if selected_parent is None:
-                sessions = (published_end,)
+                sessions = (execution_head,)
             else:
                 head = repository.run(selected_parent).binding.end_date
-                if head >= published_end:
+                if head >= execution_head:
                     sessions = ()
                 else:
                     sessions = market.trading_days(
-                        head + timedelta(days=1), published_end,
+                        head + timedelta(days=1), execution_head,
                     )
             last_run_id = selected_parent
             for session in sessions:
@@ -824,7 +894,11 @@ class DailyPipeline:
                 "status": "ok",
                 "strategy": account.strategy,
                 "sessions_advanced": len(sessions),
-                "head": published_end.isoformat(),
+                "head": max(
+                    execution_head,
+                    date.min if selected_parent is None else
+                    repository.run(selected_parent).binding.end_date,
+                ).isoformat(),
             }
             if last_run_id is not None:
                 feedback = build_simulation_feedback(repository, last_run_id)

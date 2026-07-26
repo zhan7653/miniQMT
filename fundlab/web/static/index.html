@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FundLab 模拟盘</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/echarts.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">FundLab <span>模拟盘控制台</span></div>
+  <div class="topbar-status" id="topbar-status">加载中…</div>
+  <button class="btn ghost" id="refresh-btn" title="刷新全部数据">刷新</button>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="overview">总览</button>
+  <button class="tab" data-tab="accounts">账户</button>
+  <button class="tab" data-tab="runs">运行记录</button>
+  <button class="tab" data-tab="schedule">计划任务</button>
+  <button class="tab" data-tab="agent">Agent 决策</button>
+</nav>
+
+<main>
+  <section class="panel active" id="panel-overview">
+    <div class="cards" id="overview-cards"></div>
+    <h2>账户概览</h2>
+    <div class="cards" id="overview-accounts"></div>
+    <h2>最近一次运行</h2>
+    <div id="overview-last-run" class="boxed"></div>
+  </section>
+
+  <section class="panel" id="panel-accounts">
+    <div class="row">
+      <label>选择账户</label>
+      <select id="account-select"></select>
+    </div>
+    <div id="account-detail">
+      <div class="cards" id="account-metrics"></div>
+      <h2>净值曲线</h2>
+      <div id="equity-chart" class="chart"></div>
+      <div class="grid-2col">
+        <div>
+          <h2>当前持仓</h2>
+          <div id="positions-table"></div>
+        </div>
+        <div>
+          <h2>挂单</h2>
+          <div id="orders-table"></div>
+        </div>
+      </div>
+      <h2>最近事件</h2>
+      <div id="events-table"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-runs">
+    <div id="runs-table"></div>
+    <div id="run-detail" class="boxed hidden"></div>
+  </section>
+
+  <section class="panel" id="panel-schedule">
+    <div class="cards" id="schedule-cards"></div>
+    <div class="boxed">
+      <h2>设置每日自动运行</h2>
+      <div class="row">
+        <label>运行时间（周一至周五）</label>
+        <input type="time" id="schedule-time" value="20:00">
+        <button class="btn" id="schedule-save">保存计划任务</button>
+        <button class="btn ghost" id="schedule-toggle"></button>
+        <button class="btn danger" id="schedule-delete">删除任务</button>
+      </div>
+      <p class="hint">计划任务由 Windows 任务计划程序执行，本页面关闭后依然生效。要求运行时段
+        MiniQMT 客户端在线。</p>
+      <div id="schedule-message" class="message"></div>
+    </div>
+    <div class="boxed">
+      <h2>立即运行一次</h2>
+      <div class="row">
+        <label><input type="checkbox" id="run-skip-data"> 跳过数据更新</label>
+        <label><input type="checkbox" id="run-skip-accounts"> 跳过账户推进</label>
+        <button class="btn" id="run-now">立即运行</button>
+      </div>
+      <div id="run-status" class="message"></div>
+      <pre id="run-log" class="log hidden"></pre>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-agent">
+    <div class="row">
+      <label>Agent 账户</label>
+      <select id="agent-account-select"></select>
+    </div>
+    <div class="grid-2col">
+      <div class="boxed">
+        <h2>投递新决策</h2>
+        <div class="row"><label>决策日期</label><input type="date" id="decision-date"></div>
+        <div id="weight-rows"></div>
+        <button class="btn ghost small" id="add-weight">+ 添加标的</button>
+        <div class="row"><label>决策理由</label></div>
+        <textarea id="decision-reason" rows="3" placeholder="为什么要这个配置（必填，写入审计账本）"></textarea>
+        <div class="row">
+          <label><input type="checkbox" id="decision-overwrite"> 覆盖同日已有决策</label>
+          <button class="btn" id="decision-submit">投递决策</button>
+        </div>
+        <div id="decision-message" class="message"></div>
+      </div>
+      <div>
+        <h2>决策历史</h2>
+        <div id="decisions-table"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

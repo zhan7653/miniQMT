@@ -51,8 +51,24 @@ pwsh -File scripts/register-daily-task.ps1
 ```
 
 Operational requirement: the local MiniQMT client must be running so the `xtquant` provider can
-serve data. If it is offline the data stage blocks cleanly and the next run resumes. The account
-stage still advances to the last published session even when the data stage is blocked.
+serve data. If it is offline the data stage blocks cleanly and the next run resumes.
+
+The account clock intentionally stays one trading session behind the published data head: an
+intent decided at the close of T-1 schedules its T+1 order inside the pinned snapshot calendar,
+and the next evening's publication executes it with real T prices. Deciding exactly at the head
+would leave every order unschedulable, because the snapshot calendar ends there.
+
+## Dashboard
+
+```powershell
+uv run fundlab web
+```
+
+Starts a localhost dashboard (default `http://127.0.0.1:8600`, change with `--port`) with five
+views: overview, per-account equity curve / positions / orders / ledger events, daily run reports
+with stage-level detail, Windows scheduled-task management plus a manual "run now" trigger with
+live log tail, and agent decision submission with the same validation the account run applies.
+The dashboard binds to localhost only and manages nothing that the CLI does not already own.
 
 ## Agent integration
 

@@ -128,7 +128,13 @@ def test_daily_run_is_idempotent_and_advances_static_account(tmp_path):
     repository = TradingRepository(settings.paths.trading_database)
     _, head_run = repository.selected_state("paper-1")
     assert head_run is not None
-    assert repository.run(head_run).binding.end_date == DAYS[-1]
+    # The account clock stays one session behind publication so that the
+    # close-of-day intent can schedule its T+1 order inside the snapshot
+    # calendar; a paper account that can never place an order is pointless.
+    assert repository.run(head_run).binding.end_date == DAYS[-2]
+    final = repository.final_state(head_run)
+    assert final.pending_orders, "the static intent must actually schedule an order"
+    assert final.pending_orders[0].execution_date == DAYS[-1]
 
     second = pipeline.run()
     assert second.status == "ok"
@@ -205,6 +211,28 @@ def test_cutoff_targets_previous_session_before_evening(tmp_path):
 
     assert result.status == "ok"
     assert result.target_date == DAYS[-2]
+
+
+def test_concurrent_daily_runs_are_excluded_by_the_lock(tmp_path):
+    from fundlab.pipeline.daily import _exclusive_daily_lock
+
+    ready_market(tmp_path / "market")
+    settings = build_settings(tmp_path, ())
+    pipeline = DailyPipeline(
+        settings,
+        registry=registry_with_calendars(),
+        now_fn=lambda: evening_of(DAYS[-1]),
+    )
+    lock_path = tmp_path / "market" / "builds" / ".locks" / "daily-run.lock"
+
+    with _exclusive_daily_lock(lock_path):
+        result = pipeline.run(skip_data=True, skip_accounts=True)
+
+    assert result.status == "blocked" and result.exit_code == 2
+    assert result.stages[-1].name == "lock"
+
+    released = pipeline.run(skip_data=True, skip_accounts=True)
+    assert released.status == "ok"
 
 
 def test_scoped_events_and_missing_source_reasons():

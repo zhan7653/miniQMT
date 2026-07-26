@@ -211,6 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
     show = account_commands.add_parser("show")
     show.add_argument("--account-id", required=True)
 
+    web = commands.add_parser("web", help="Serve the local dashboard (accounts, runs, schedule, agent decisions)")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8600)
+    web.add_argument("--no-browser", action="store_true")
+
     daily = commands.add_parser("daily", help="Automated daily cycle: extend the snapshot, advance paper accounts")
     daily_commands = daily.add_subparsers(dest="daily_command", required=True)
     daily_run = daily_commands.add_parser("run", help="Run one idempotent daily cycle")
@@ -245,6 +250,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _simulate(args, settings)
         if args.command == "daily":
             return _daily(args, settings)
+        if args.command == "web":
+            return _web(args, settings)
         raise AssertionError(args.command)
     except Exception as exc:
         print(canonical_json({
@@ -564,6 +571,28 @@ def _data(args, settings: FoundationSettings) -> int:
         }))
         return 0
     raise AssertionError(args.data_command)
+
+
+def _web(args, settings: FoundationSettings) -> int:
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    from fundlab.web import create_app
+
+    config_path = Path(args.config).resolve()
+    app = create_app(
+        settings,
+        repo_root=config_path.parent.parent,
+        config_path=config_path,
+    )
+    url = f"http://{args.host}:{args.port}"
+    print(canonical_json({"status": "ok", "dashboard": url}))
+    if not args.no_browser:
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
 
 
 def _daily(args, settings: FoundationSettings) -> int:
