@@ -175,18 +175,36 @@ class IncrementalCanonicalPublisher:
         ordinal = max((item.ordinal for item in refs), default=-1) + 1
         added_ids = tuple(sorted(target_ids - previous_ids))
 
+        # The canonical calendar carries exchange-announced future sessions, so
+        # the component is sliced to everything the observation knows from the
+        # increment start on — not capped at the new data head.  Successive daily
+        # increments therefore overlap in the future region; the overlay resolves
+        # that by (priority, ordinal), and each run's additions are recorded above
+        # every predecessor component, so the newest announcement always wins
+        # while published history (before ``increment_start``) is never touched.
         calendar_frame = self._read_observation_slice(
             calendar_observation_id,
             MarketTable.CALENDAR,
-            start_date=increment_start,
-            end_date=universe_scope.history_end,
+        )
+        calendar_frame = calendar_frame.loc[
+            calendar_frame["session_date"].astype(str) >= increment_start.isoformat()
+        ].reset_index(drop=True)
+        if calendar_frame.empty or (
+            str(calendar_frame["session_date"].astype(str).max())[:10]
+            < universe_scope.history_end.isoformat()
+        ):
+            raise SnapshotNotReadyError(
+                "Increment calendar must cover through the new history end"
+            )
+        calendar_end = date.fromisoformat(
+            str(calendar_frame["session_date"].astype(str).max())[:10]
         )
         additions = self._materialized_components(
             MarketTable.CALENDAR,
             calendar_frame,
             instrument_ids=(),
             start_date=increment_start,
-            end_date=universe_scope.history_end,
+            end_date=calendar_end,
             priority=ordinal + 100,
             ordinal=ordinal,
         )
@@ -271,9 +289,9 @@ class IncrementalCanonicalPublisher:
         plan_selections.append(SourceSlice(
             calendar_observation_id,
             MarketTable.CALENDAR,
-            f"componentized calendar increment {increment_start}..{universe_scope.history_end}",
+            f"componentized calendar increment {increment_start}..{calendar_end}",
             start_date=increment_start,
-            end_date=universe_scope.history_end,
+            end_date=calendar_end,
             priority=100,
         ))
         for manifest in manifests:
@@ -302,9 +320,20 @@ class IncrementalCanonicalPublisher:
                     100,
                 ))
 
+        # Successive increments overlap in the future calendar region; only
+        # sessions the predecessor did not already carry add composed rows.
+        previous_calendar = self.warehouse.query_loaded_snapshot_table(
+            predecessor, MarketTable.CALENDAR,
+        )
+        previous_calendar_keys = set(map(tuple, previous_calendar[
+            ["exchange", "session_date"]
+        ].astype(str).to_numpy()))
+        incoming_calendar_keys = set(map(tuple, calendar_frame[
+            ["exchange", "session_date"]
+        ].astype(str).to_numpy()))
         quality = self._increment_quality(
             predecessor,
-            calendar_frame=calendar_frame,
+            calendar_added_rows=len(incoming_calendar_keys - previous_calendar_keys),
             increment_frames=increment_frames,
             added_count=len(added_ids),
         )
@@ -839,12 +868,12 @@ class IncrementalCanonicalPublisher:
     def _increment_quality(
         predecessor: SnapshotManifest,
         *,
-        calendar_frame: pd.DataFrame,
+        calendar_added_rows: int,
         increment_frames: Mapping[MarketTable, list[pd.DataFrame]],
         added_count: int,
     ) -> QualityReport:
         counts = dict(predecessor.quality.row_counts)
-        counts[MarketTable.CALENDAR.value] = int(counts[MarketTable.CALENDAR.value]) + len(calendar_frame)
+        counts[MarketTable.CALENDAR.value] = int(counts[MarketTable.CALENDAR.value]) + calendar_added_rows
         counts[MarketTable.INSTRUMENTS.value] = int(counts[MarketTable.INSTRUMENTS.value]) + added_count
         for table in (
             MarketTable.DAILY_BARS,

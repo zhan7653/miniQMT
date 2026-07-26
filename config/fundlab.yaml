@@ -18,6 +18,10 @@ daily:
   source_pair: [tickflow, xtquant]
   adjudicator: baostock
   batch_size: 100
+  # The canonical calendar carries exchange-announced sessions this many days
+  # past today (both calendar sources must agree over the full window), so an
+  # intent decided at the published data head can schedule its T+1 order.
+  calendar_horizon_days: 60
   accounts:
     - account_id: paper-1
       name: "Paper 1 (static ETF mix)"

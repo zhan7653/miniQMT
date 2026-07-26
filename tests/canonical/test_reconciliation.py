@@ -22,7 +22,13 @@ from fundlab.marketdata import (
     SourceSlice,
     default_reconciliation_policy,
 )
-from tests.canonical.fixtures import DAYS, fixture_universe_scope, market_frames, observation
+from tests.canonical.fixtures import (
+    DAYS,
+    FUTURE_DAYS,
+    fixture_universe_scope,
+    market_frames,
+    observation,
+)
 
 
 def test_two_independent_backends_win_field_level_conflict_and_keep_lineage(tmp_path):
@@ -194,7 +200,11 @@ def test_provider_factor_ids_do_not_duplicate_one_semantic_event(tmp_path):
                 table,
                 True,
                 None if table is MarketTable.INSTRUMENTS else DAYS[0],
-                None if table is MarketTable.INSTRUMENTS else DAYS[-1],
+                (
+                    None if table is MarketTable.INSTRUMENTS
+                    else FUTURE_DAYS[-1] if table is MarketTable.CALENDAR
+                    else DAYS[-1]
+                ),
                 ("600000.SH",) if "instrument_id" in frame.columns else (),
             ) for table, frame in frames.items()),
         )
@@ -254,7 +264,11 @@ def test_adjusted_history_is_derived_only_from_factors_visible_as_of(tmp_path):
             table,
             True,
             None if table is MarketTable.INSTRUMENTS else DAYS[0],
-            None if table is MarketTable.INSTRUMENTS else DAYS[-1],
+            (
+                None if table is MarketTable.INSTRUMENTS
+                else FUTURE_DAYS[-1] if table is MarketTable.CALENDAR
+                else DAYS[-1]
+            ),
             ("600000.SH",) if "instrument_id" in frame.columns else (),
         ) for table, frame in frames.items()),
         {

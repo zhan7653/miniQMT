@@ -234,9 +234,18 @@ class DailyPipeline:
     # ------------------------------------------------------- calendar/target
 
     def _validated_calendar(self, history_start: date) -> tuple[str, pd.DataFrame]:
-        """Capture both calendar channels, require exact agreement, record one canonical observation."""
+        """Capture both calendar channels, require exact agreement, record one canonical observation.
 
-        capture_end = self.now_fn().date()
+        The capture window deliberately reaches ``calendar_horizon_days`` past
+        today: exchanges publish their calendars ahead of time, and carrying
+        those future sessions in the canonical snapshot is what lets an intent
+        decided at the published data head schedule its T+1 order.  Agreement
+        between both sources is required over the full window, future included.
+        """
+
+        capture_end = self.now_fn().date() + timedelta(
+            days=self.settings.daily.calendar_horizon_days,
+        )
         request = ProviderRequest(
             ProviderCapability.TRADING_CALENDAR,
             history_start,
@@ -826,18 +835,19 @@ class DailyPipeline:
             risk_policy=self.settings.risk_policy,
             fee_schedule=self.settings.fee_schedule,
         )
-        published_days = market.all_trading_days()
-        published_end = published_days[-1]
-        # The snapshot calendar ends at the published head, so an intent decided
-        # exactly there can never schedule its T+1 order (next_trading_day is
-        # None past the calendar).  The account clock therefore stays one
-        # session behind publication: deciding at T-1 close schedules for T,
-        # and tomorrow's publication executes it with real T prices.
-        execution_head = published_days[-2] if len(published_days) >= 2 else published_end
+        scope = market.manifest.plan.universe_scope
+        if scope is None:
+            raise DailyPipelineBlocked("accounts", "published snapshot has no universe scope")
+        # The snapshot calendar carries exchange-announced future sessions, so
+        # an intent decided exactly at the published data head can schedule its
+        # T+1 order; tomorrow's publication executes it with real T+1 prices.
+        # The calendar itself extends past the head, so the data head — not the
+        # calendar end — is the account clock boundary.
+        published_end = scope.history_end
         results = []
         for account in configured:
             results.append(self._advance_one_account(
-                account, market, repository, service, execution_head,
+                account, market, repository, service, published_end,
             ))
         blocked = [item for item in results if item["status"] == "blocked"]
         stages.append(DailyStage(
@@ -846,7 +856,6 @@ class DailyPipeline:
             {
                 "snapshot_id": market.snapshot_id,
                 "published_end": published_end.isoformat(),
-                "execution_head": execution_head.isoformat(),
                 "advanced": sum(1 for item in results if item["status"] == "ok"),
                 "blocked": [item["account_id"] for item in blocked],
             },
@@ -859,7 +868,7 @@ class DailyPipeline:
         market: CanonicalMarketData,
         repository: TradingRepository,
         service: SimulationService,
-        execution_head: date,
+        published_end: date,
     ) -> dict[str, Any]:
         try:
             try:
@@ -872,14 +881,14 @@ class DailyPipeline:
                 )
             _, selected_parent = repository.selected_state(account.account_id)
             if selected_parent is None:
-                sessions = (execution_head,)
+                sessions = (published_end,)
             else:
                 head = repository.run(selected_parent).binding.end_date
-                if head >= execution_head:
+                if head >= published_end:
                     sessions = ()
                 else:
                     sessions = market.trading_days(
-                        head + timedelta(days=1), execution_head,
+                        head + timedelta(days=1), published_end,
                     )
             last_run_id = selected_parent
             for session in sessions:
@@ -895,7 +904,7 @@ class DailyPipeline:
                 "strategy": account.strategy,
                 "sessions_advanced": len(sessions),
                 "head": max(
-                    execution_head,
+                    published_end,
                     date.min if selected_parent is None else
                     repository.run(selected_parent).binding.end_date,
                 ).isoformat(),

@@ -23,7 +23,7 @@ from fundlab.marketdata import (
     UniverseScope,
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
 )
-from tests.canonical.fixtures import DAYS, fixture_universe_scope, observation
+from tests.canonical.fixtures import DAYS, FUTURE_DAYS, fixture_universe_scope, observation
 
 
 def _publish_if_current_worker(root, expected, successor, start, results):
@@ -68,8 +68,8 @@ def test_observation_snapshot_and_point_in_time_portal_are_immutable(tmp_path):
         warehouse.snapshot_path(snapshot.snapshot_id) / "manifest.json"
     ]
     assert snapshot.quality.row_counts == {
-        "adjustment_factors": 0, "calendar": 4, "corporate_actions": 0,
-        "daily_bars": 8, "instruments": 1,
+        "adjustment_factors": 0, "calendar": len(DAYS) + len(FUTURE_DAYS),
+        "corporate_actions": 0, "daily_bars": 8, "instruments": 1,
     }
     warehouse.publish(snapshot.snapshot_id)
     portal = CanonicalMarketData.open(

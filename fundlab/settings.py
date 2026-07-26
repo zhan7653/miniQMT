@@ -46,6 +46,14 @@ class DailySettings:
     source_pair: tuple[str, str] = ("tickflow", "xtquant")
     adjudicator: str = "baostock"
     batch_size: int = 100
+    # How far past today the canonical calendar carries exchange-announced
+    # future sessions, so a head-of-data intent can always schedule its T+1
+    # order inside the published snapshot calendar.
+    calendar_horizon_days: int = 60
+
+    def __post_init__(self) -> None:
+        if self.calendar_horizon_days < 1:
+            raise ValueError("calendar_horizon_days must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -129,6 +137,7 @@ def _daily_settings(raw: Any, base: Path) -> DailySettings:
         source_pair=tuple(map(str, raw.get("source_pair", ("tickflow", "xtquant")))),
         adjudicator=str(raw.get("adjudicator", "baostock")),
         batch_size=int(raw.get("batch_size", 100)),
+        calendar_horizon_days=int(raw.get("calendar_horizon_days", 60)),
     )
 
 

@@ -53,10 +53,11 @@ pwsh -File scripts/register-daily-task.ps1
 Operational requirement: the local MiniQMT client must be running so the `xtquant` provider can
 serve data. If it is offline the data stage blocks cleanly and the next run resumes.
 
-The account clock intentionally stays one trading session behind the published data head: an
-intent decided at the close of T-1 schedules its T+1 order inside the pinned snapshot calendar,
-and the next evening's publication executes it with real T prices. Deciding exactly at the head
-would leave every order unschedulable, because the snapshot calendar ends there.
+The canonical calendar carries exchange-announced future sessions (`daily.calendar_horizon_days`
+past today, both calendar sources agreeing over the full window), so the account clock advances
+all the way to the published data head: an intent decided at the close of T schedules its T+1
+order inside the pinned snapshot calendar, and the next evening's publication executes it with
+real T+1 prices.
 
 ## Dashboard
 

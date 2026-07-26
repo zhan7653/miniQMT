@@ -28,6 +28,10 @@ from fundlab.marketdata.schema import (
 
 
 DAYS = (date(2026, 7, 13), date(2026, 7, 14), date(2026, 7, 15), date(2026, 7, 16))
+# Exchange-announced future sessions past the data head.  The canonical calendar
+# carries them so a close-of-head intent can schedule its T+1 order; bars exist
+# only for DAYS.
+FUTURE_DAYS = (date(2026, 7, 17), date(2026, 7, 20))
 
 
 def fixture_universe_scope() -> UniverseScope:
@@ -65,7 +69,7 @@ def market_frames(
     }])
     calendar = pd.DataFrame([
         {"exchange": "SH", "session_date": day.isoformat(), "is_open": True, "source_payload": None}
-        for day in DAYS
+        for day in (*DAYS, *FUTURE_DAYS)
     ])
     rows = []
     for index, day in enumerate(DAYS):
@@ -131,7 +135,11 @@ def observation(
             table,
             complete,
             DAYS[0] if table is not MarketTable.INSTRUMENTS else None,
-            DAYS[-1] if table is not MarketTable.INSTRUMENTS else None,
+            (
+                None if table is MarketTable.INSTRUMENTS
+                else FUTURE_DAYS[-1] if table is MarketTable.CALENDAR
+                else DAYS[-1]
+            ),
             ("600000.SH",) if table in {MarketTable.DAILY_BARS, MarketTable.CORPORATE_ACTIONS} else (),
         )
         for table in MarketTable

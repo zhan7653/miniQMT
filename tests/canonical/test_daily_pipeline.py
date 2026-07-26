@@ -24,7 +24,7 @@ from fundlab.settings import (
     FoundationSettings,
 )
 from fundlab.trading import TradingRepository
-from tests.canonical.fixtures import DAYS, market_frames, ready_market
+from tests.canonical.fixtures import DAYS, FUTURE_DAYS, market_frames, ready_market
 from tests.canonical.test_trading_kernel import fees, policies
 
 
@@ -128,13 +128,13 @@ def test_daily_run_is_idempotent_and_advances_static_account(tmp_path):
     repository = TradingRepository(settings.paths.trading_database)
     _, head_run = repository.selected_state("paper-1")
     assert head_run is not None
-    # The account clock stays one session behind publication so that the
-    # close-of-day intent can schedule its T+1 order inside the snapshot
-    # calendar; a paper account that can never place an order is pointless.
-    assert repository.run(head_run).binding.end_date == DAYS[-2]
+    # The account clock advances to the published data head; the snapshot
+    # calendar carries exchange-announced future sessions, so the close-of-head
+    # intent schedules its T+1 order into the first future trading day.
+    assert repository.run(head_run).binding.end_date == DAYS[-1]
     final = repository.final_state(head_run)
     assert final.pending_orders, "the static intent must actually schedule an order"
-    assert final.pending_orders[0].execution_date == DAYS[-1]
+    assert final.pending_orders[0].execution_date == FUTURE_DAYS[0]
 
     second = pipeline.run()
     assert second.status == "ok"
@@ -146,7 +146,7 @@ def test_daily_run_blocks_when_calendar_sources_disagree(tmp_path):
     settings = build_settings(tmp_path, ())
     pipeline = DailyPipeline(
         settings,
-        registry=registry_with_calendars(calendar_frame(extra_open=date(2026, 7, 17))),
+        registry=registry_with_calendars(calendar_frame(extra_open=date(2026, 7, 21))),
         now_fn=lambda: evening_of(DAYS[-1]),
     )
 

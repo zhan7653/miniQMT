@@ -29,6 +29,7 @@ from fundlab.marketdata.incremental import (
 )
 from tests.canonical.fixtures import (
     DAYS,
+    FUTURE_DAYS,
     commit_test_snapshot,
     fixture_universe_scope,
     market_frames,
@@ -397,6 +398,142 @@ def test_real_increment_audit_measures_every_prior_daily_open(tmp_path, monkeypa
         price_mode="raw",
     )
     assert rows.iloc[0]["close"] == 13.0
+
+
+def test_successive_increments_overlay_overlapping_future_calendar(tmp_path):
+    """Two consecutive daily increments overlap in the future calendar region.
+
+    The overlay must keep component keys unique, let the newest exchange
+    announcement win for a revised future session, and keep the quality row
+    count at the number of composed rows rather than double-counting overlap.
+    """
+
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    source = warehouse.record_observation(observation())
+    previous_scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[1], DAYS[0], DAYS[1],
+        survivorship_bias=True,
+        instrument_ids=("600000.SH",),
+    )
+    predecessor = IncrementalCanonicalPublisher(warehouse).bootstrap(
+        commit_test_snapshot(warehouse, SnapshotPlan(
+            tuple(SourceSlice(
+                source.observation_id,
+                table,
+                "predecessor fixture",
+                start_date=None if table is MarketTable.INSTRUMENTS else DAYS[0],
+                end_date=None if table is MarketTable.INSTRUMENTS else DAYS[1],
+            ) for table in MarketTable),
+            "predecessor fixture",
+            readiness=ReadinessProfile.SIMULATION,
+            universe_scope=previous_scope,
+        )).snapshot_id,
+    )
+
+    def increment_for(day, calendar_observation_id, second):
+        frames = market_frames()
+        tables = {
+            MarketTable.INSTRUMENTS: frames[MarketTable.INSTRUMENTS],
+            MarketTable.DAILY_BARS: frames[MarketTable.DAILY_BARS].loc[
+                frames[MarketTable.DAILY_BARS]["session_date"].eq(day.isoformat())
+            ],
+            MarketTable.CORPORATE_ACTIONS: frames[MarketTable.CORPORATE_ACTIONS],
+            MarketTable.ADJUSTMENT_FACTORS: frames[MarketTable.ADJUSTMENT_FACTORS],
+        }
+        return warehouse.record_observation(ObservationPayload(
+            "fixture-increment",
+            datetime(2026, 7, 18, 0, 0, second, tzinfo=timezone.utc),
+            ProviderRequest(
+                ProviderCapability.DAILY_BARS_RAW, day, day, ("600000.SH",),
+            ),
+            tables,
+            tuple(CoverageClaim(
+                table,
+                True,
+                None if table is MarketTable.INSTRUMENTS else day,
+                None if table is MarketTable.INSTRUMENTS else day,
+                ("600000.SH",) if table is not MarketTable.ADJUSTMENT_FACTORS else (),
+            ) for table in tables),
+            {
+                "kind": "field_level_reconciliation",
+                "reconciliation_ready": True,
+                "partition_quality": {
+                    "validated": True,
+                    "validator_version": SIMULATION_PARTITION_VALIDATOR_VERSION,
+                    "readiness": ReadinessProfile.SIMULATION.value,
+                    "calendar_observation_id": calendar_observation_id,
+                    "start_date": day.isoformat(),
+                    "end_date": day.isoformat(),
+                    "universe_as_of": day.isoformat(),
+                    "instrument_ids": ["600000.SH"],
+                },
+            },
+        ))
+
+    publisher = IncrementalCanonicalPublisher(warehouse)
+    first, _ = publisher.extend(
+        predecessor_snapshot_id=predecessor.snapshot_id,
+        calendar_observation_id=source.observation_id,
+        increment_observation_ids=(
+            increment_for(DAYS[2], source.observation_id, 1).observation_id,
+        ),
+        universe_scope=UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            DAYS[2], DAYS[0], DAYS[2],
+            survivorship_bias=True,
+            instrument_ids=("600000.SH",),
+        ),
+        description="first daily increment with future calendar",
+    )
+
+    # The next day the exchange revises its announcement: the furthest future
+    # session is no longer open.  The newer overlapping window must win.
+    revised_frames = market_frames()
+    revised_calendar = revised_frames[MarketTable.CALENDAR]
+    revised_calendar.loc[
+        revised_calendar["session_date"].eq(FUTURE_DAYS[-1].isoformat()), "is_open",
+    ] = False
+    revised_source = warehouse.record_observation(ObservationPayload(
+        "fixture-revised-calendar",
+        datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.TRADING_CALENDAR, DAYS[0], FUTURE_DAYS[-1],
+        ),
+        {MarketTable.CALENDAR: revised_calendar},
+        (CoverageClaim(MarketTable.CALENDAR, True, DAYS[0], FUTURE_DAYS[-1]),),
+        {"kind": "field_level_reconciliation", "reconciliation_ready": True},
+    ))
+    second, _ = publisher.extend(
+        predecessor_snapshot_id=first.snapshot_id,
+        calendar_observation_id=revised_source.observation_id,
+        increment_observation_ids=(
+            increment_for(DAYS[3], revised_source.observation_id, 2).observation_id,
+        ),
+        universe_scope=UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            DAYS[3], DAYS[0], DAYS[3],
+            survivorship_bias=True,
+            instrument_ids=("600000.SH",),
+        ),
+        description="second daily increment with revised future calendar",
+    )
+
+    calendar = warehouse.query_snapshot_table(second.snapshot_id, MarketTable.CALENDAR)
+    keys = list(map(tuple, calendar[["exchange", "session_date"]].to_numpy()))
+    assert len(keys) == len(set(keys)), "overlapping windows must compose to unique keys"
+    assert set(calendar["session_date"]) == {
+        day.isoformat() for day in (*DAYS, *FUTURE_DAYS)
+    }
+    revised_row = calendar.loc[
+        calendar["session_date"].eq(FUTURE_DAYS[-1].isoformat())
+    ]
+    assert not revised_row["is_open"].any(), "the newest announcement must win"
+    untouched = calendar.loc[
+        calendar["session_date"] <= DAYS[-1].isoformat(), "is_open",
+    ]
+    assert untouched.all(), "published history must never be rewritten"
+    assert int(second.quality.row_counts["calendar"]) == len(DAYS) + len(FUTURE_DAYS)
 
 
 def test_scoped_rule_correction_reuses_facts_and_only_changes_declared_view(tmp_path):

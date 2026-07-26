@@ -132,7 +132,7 @@ def test_overview_reports_market_accounts_and_schedule(dashboard):
     assert payload["market"]["snapshot_id"].startswith("snap-")
     assert payload["market"]["published_end"] == DAYS[-1].isoformat()
     accounts = {item["account_id"]: item for item in payload["accounts"]}
-    assert accounts["paper-1"]["exists"] and accounts["paper-1"]["head_date"] == DAYS[-2].isoformat()
+    assert accounts["paper-1"]["exists"] and accounts["paper-1"]["head_date"] == DAYS[-1].isoformat()
     assert payload["schedule"]["exists"] is False
     assert payload["last_report"]["status"] == "ok"
 
@@ -198,7 +198,7 @@ def test_agent_decision_submission_validates_and_lists(dashboard):
 
     accounts = client.get("/api/agent/accounts").json()
     assert [item["account_id"] for item in accounts] == ["paper-agent"]
-    assert accounts[0]["head_date"] == DAYS[-2].isoformat()
+    assert accounts[0]["head_date"] == DAYS[-1].isoformat()
 
     future = "2026-07-17"
     ok = client.post("/api/agent/decisions/paper-agent", json={
