@@ -99,10 +99,19 @@ that are too narrow; on the latest completed session, MiniQMT/xtquant and Eastmo
 limits must both match every active bounded instrument. This second check also covers overly wide
 bounds and keeps the SSE unreformed `S`-share 5% rule separate from ST risk-warning rules.
 
-The accepted 2010--2026 history is the immutable migration baseline. Routine publication uses only
-already validated observations for the exact next dates:
+The accepted 2010--2026 history is the immutable migration baseline. Routine publication first turns
+one ready field-level reconciliation into an exact simulation partition. This stage derives trading
+rules, verifies full open-session coverage, binds the upstream observations and requires two direct
+provider limit values on the latest bounded session:
 
 ```powershell
+uv run fundlab data validate-simulation-increment `
+  --candidate-observation-id obs-... `
+  --calendar-observation-id obs-... `
+  --universe-as-of 2026-07-31 `
+  --start-date 2026-07-27 --end-date 2026-07-31 `
+  --description "validated EOD partition through 2026-07-31"
+
 uv run fundlab data extend-simulation `
   --predecessor-snapshot-id snap-... `
   --calendar-observation-id obs-... `
@@ -113,10 +122,12 @@ uv run fundlab data extend-simulation `
 
 Internally one snapshot pins four content-addressed component classes: immutable market facts,
 effective-dated trading rules, field-level adjudication evidence, and a disposable simulation view.
-The command accepts only a contiguous increment, validated calendar and disjoint validated partitions.
+The extension command accepts only a contiguous increment, validated calendar and disjoint partitions
+produced by the committed validator.
 It reuses unchanged component identities, rejects undeclared correction scope, validates a shadow
 snapshot, and changes the current pointer with compare-and-swap only if the predecessor is still current.
-It never silently falls back to a full-history rebuild.
+Generic `build-snapshot`, `reconcile --publish`, and ordinary `publish()` cannot create or publish a
+simulation snapshot. The path never silently falls back to a full-history rebuild.
 
 The completed revision-2 real-data delivery is currently published through the Issue #8 component
 manifest as `snap-2a502eb188874c6ac7bbfb7f`. It preserves the accepted extension through

@@ -222,14 +222,27 @@ uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
 uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
   --source tickflow --source xtquant --shard-count 4 --assemble-only --publish
 
-# The only routine canonical publication path accepts already validated, disjoint
-# partitions for contiguous new dates and refuses a stale predecessor.
+# Convert a ready field-level reconciliation into an exact EOD partition. This
+# derives the rules, checks dense session coverage and binds two-provider direct
+# limit evidence. The command emits the observation ID consumed below.
+uv run fundlab data validate-simulation-increment `
+  --candidate-observation-id obs-... `
+  --calendar-observation-id obs-... `
+  --universe-as-of 2026-07-17 `
+  --start-date 2026-07-14 --end-date 2026-07-17 `
+  --description "validated manual EOD partition"
+
+# The only routine canonical publication path accepts validator-produced,
+# disjoint partitions for contiguous new dates and refuses a stale predecessor.
 uv run fundlab data extend-simulation `
   --predecessor-snapshot-id snap-... `
   --calendar-observation-id obs-... `
   --increment-observation-id obs-... `
   --universe-as-of 2026-07-17 --target-date 2026-07-17 `
   --description "manual EOD 2026-07-17" --publish
+
+# Simulation cannot be published by build-snapshot, reconcile --publish, or the
+# ordinary warehouse publish API. Those paths fail closed instead of bypassing CAS.
 
 # Read-only audit; report goes under ignored data/reports/data_v2/canonical/
 uv run fundlab data audit-legacy

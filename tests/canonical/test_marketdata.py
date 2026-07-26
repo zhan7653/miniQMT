@@ -54,6 +54,7 @@ def plan(observation_id, *, require_complete=True):
         tuple(SourceSlice(observation_id, table, "fixture is the explicit canonical source") for table in MarketTable),
         "complete deterministic fixture",
         require_complete,
+        readiness=ReadinessProfile.RESEARCH_PRICE,
         universe_scope=fixture_universe_scope(),
     )
 
@@ -71,7 +72,9 @@ def test_observation_snapshot_and_point_in_time_portal_are_immutable(tmp_path):
         "daily_bars": 8, "instruments": 1,
     }
     warehouse.publish(snapshot.snapshot_id)
-    portal = CanonicalMarketData.open(tmp_path / "market")
+    portal = CanonicalMarketData.open(
+        tmp_path / "market", required_readiness=ReadinessProfile.RESEARCH_PRICE,
+    )
     assert portal.snapshot_id == snapshot.snapshot_id
     assert portal.trading_days(DAYS[0], DAYS[-1]) == DAYS
     bars = portal.bars(
@@ -119,17 +122,26 @@ def test_cross_source_overlap_requires_explicit_precedence(tmp_path):
     ]
     selections.append(SourceSlice(revised.observation_id, MarketTable.DAILY_BARS, "correction source"))
     with pytest.raises(SourceConflictError, match="Explicit precedence"):
-        warehouse.build_snapshot(SnapshotPlan(tuple(selections), "ambiguous correction"))
+        warehouse.build_snapshot(SnapshotPlan(
+            tuple(selections),
+            "ambiguous correction",
+            readiness=ReadinessProfile.RESEARCH_PRICE,
+        ))
 
     selections[-1] = SourceSlice(
         revised.observation_id, MarketTable.DAILY_BARS, "reviewed correction", priority=1,
     )
     snapshot = warehouse.build_snapshot(SnapshotPlan(
-        tuple(selections), "explicit correction", universe_scope=fixture_universe_scope(),
+        tuple(selections),
+        "explicit correction",
+        readiness=ReadinessProfile.RESEARCH_PRICE,
+        universe_scope=fixture_universe_scope(),
     ))
     assert snapshot.quality.ready
     warehouse.publish(snapshot.snapshot_id)
-    portal = CanonicalMarketData.open(tmp_path / "market")
+    portal = CanonicalMarketData.open(
+        tmp_path / "market", required_readiness=ReadinessProfile.RESEARCH_PRICE,
+    )
     bars = portal.bars(["600000.SH"], DAYS[0], DAYS[0], price_mode=PriceMode.RAW, as_of=DAYS[0])
     assert bars.iloc[0]["close"] == 11.0
     assert bars.iloc[0]["source_provider"] == "revision"

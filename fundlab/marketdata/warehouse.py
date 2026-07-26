@@ -285,6 +285,11 @@ class MarketDataWarehouse:
         return pd.read_parquet(self.observation_path(observation_id) / item.path)
 
     def build_snapshot(self, plan: SnapshotPlan) -> SnapshotManifest:
+        if plan.readiness is ReadinessProfile.SIMULATION:
+            raise SnapshotNotReadyError(
+                "Non-componentized simulation snapshot construction is retired; "
+                "validate an EOD partition and use the componentized incremental publisher"
+            )
         self.initialize()
         tables: dict[MarketTable, pd.DataFrame] = {}
         coverage_errors: list[str] = []
@@ -738,6 +743,11 @@ class MarketDataWarehouse:
 
     def publish(self, snapshot_id: str) -> None:
         manifest = self._publishable_snapshot(snapshot_id)
+        if manifest.plan.readiness is ReadinessProfile.SIMULATION:
+            raise SnapshotNotReadyError(
+                "Simulation publication requires predecessor compare-and-swap; "
+                "use publish_if_current"
+            )
         with _exclusive_pointer_lock(self.root / ".current.lock"):
             self._replace_current_pointer(manifest)
 
@@ -770,6 +780,14 @@ class MarketDataWarehouse:
         if not manifest.quality.ready:
             raise SnapshotNotReadyError(
                 f"Snapshot is not ready for publication: {snapshot_id}"
+            )
+        if (
+            manifest.plan.readiness is ReadinessProfile.SIMULATION
+            and not manifest.component_selections
+        ):
+            raise SnapshotNotReadyError(
+                "Non-componentized simulation publication is retired; "
+                "use publish_if_current with a componentized successor"
             )
         return manifest
 

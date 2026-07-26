@@ -8,9 +8,46 @@ from pathlib import Path
 import pytest
 import yaml
 
-from fundlab.cli import main
+from fundlab.cli import build_parser, main
 from fundlab.settings import load_foundation_settings
 from tests.canonical.fixtures import DAYS, ready_market
+
+
+def test_cli_exposes_only_the_componentized_simulation_publication_flow():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "data", "build-snapshot",
+            "--observation-id", "candidate",
+            "--description", "must not parse",
+            "--readiness", "simulation",
+            "--publish",
+        ])
+
+    validated = parser.parse_args([
+        "data", "validate-simulation-increment",
+        "--candidate-observation-id", "candidate",
+        "--calendar-observation-id", "calendar",
+        "--universe-as-of", "2026-07-24",
+        "--start-date", "2026-07-24",
+        "--end-date", "2026-07-24",
+        "--description", "validated increment",
+    ])
+    assert validated.data_command == "validate-simulation-increment"
+
+    extend = parser.parse_args([
+        "data", "extend-simulation",
+        "--predecessor-snapshot-id", "predecessor",
+        "--calendar-observation-id", "calendar",
+        "--increment-observation-id", "validated-partition",
+        "--universe-as-of", "2026-07-24",
+        "--target-date", "2026-07-24",
+        "--description", "atomic increment",
+        "--publish",
+    ])
+    assert extend.data_command == "extend-simulation"
+    assert extend.publish is True
 
 
 def test_committed_simulation_fee_schedule_has_dated_public_boundaries():

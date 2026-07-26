@@ -19,18 +19,26 @@ from fundlab.marketdata import (
     SnapshotPlan,
     SourceSlice,
     UniverseScope,
+    SimulationIncrementValidator,
+    SimulationSnapshotBuilder,
 )
 from fundlab.marketdata.components import ComponentKind, ComponentScope, ComponentStore
 from fundlab.marketdata.incremental import (
     IncrementalCanonicalPublisher,
     _materialize_simulation_view,
 )
-from tests.canonical.fixtures import DAYS, fixture_universe_scope, market_frames, observation
+from tests.canonical.fixtures import (
+    DAYS,
+    commit_test_snapshot,
+    fixture_universe_scope,
+    market_frames,
+    observation,
+)
 
 
 def _snapshot(warehouse: MarketDataWarehouse):
     observed = warehouse.record_observation(observation())
-    return warehouse.build_snapshot(SnapshotPlan(
+    return commit_test_snapshot(warehouse, SnapshotPlan(
         tuple(SourceSlice(
             observed.observation_id,
             table,
@@ -100,6 +108,171 @@ def test_partitioned_snapshot_rejects_retired_full_simulation_path(tmp_path):
         ))
 
 
+def test_all_non_componentized_simulation_publication_paths_fail_closed(tmp_path):
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    observed = warehouse.record_observation(observation())
+    plan = SnapshotPlan(
+        tuple(SourceSlice(
+            observed.observation_id, table, "retired simulation fixture",
+        ) for table in MarketTable),
+        "retired simulation fixture",
+        readiness=ReadinessProfile.SIMULATION,
+        universe_scope=fixture_universe_scope(),
+    )
+
+    with pytest.raises(SnapshotNotReadyError, match="construction is retired"):
+        warehouse.build_snapshot(plan)
+
+    legacy = commit_test_snapshot(warehouse, plan)
+    with pytest.raises(SnapshotNotReadyError, match="publication is retired"):
+        warehouse.publish(legacy.snapshot_id)
+
+    componentized = IncrementalCanonicalPublisher(warehouse).bootstrap(
+        legacy.snapshot_id,
+    )
+    with pytest.raises(SnapshotNotReadyError, match="compare-and-swap"):
+        warehouse.publish(componentized.snapshot_id)
+
+
+def test_eod_validator_produces_partition_consumed_by_atomic_increment(tmp_path):
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    source = warehouse.record_observation(observation())
+    previous_scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[-2], DAYS[0], DAYS[-2],
+        survivorship_bias=True,
+        instrument_ids=("600000.SH",),
+    )
+    predecessor = IncrementalCanonicalPublisher(warehouse).bootstrap(
+        commit_test_snapshot(warehouse, SnapshotPlan(
+            tuple(SourceSlice(
+                source.observation_id,
+                table,
+                "accepted predecessor fixture",
+                start_date=None if table is MarketTable.INSTRUMENTS else DAYS[0],
+                end_date=None if table is MarketTable.INSTRUMENTS else DAYS[-2],
+            ) for table in MarketTable),
+            "accepted predecessor fixture",
+            readiness=ReadinessProfile.SIMULATION,
+            universe_scope=previous_scope,
+        )).snapshot_id,
+    )
+    warehouse._replace_current_pointer(predecessor)
+
+    frames = market_frames()
+    last_raw = frames[MarketTable.DAILY_BARS].loc[
+        frames[MarketTable.DAILY_BARS]["session_date"].eq(DAYS[-1].isoformat())
+        & frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+    ].reset_index(drop=True)
+    upstream_ids = []
+    for second, provider in enumerate(("baostock", "xtquant"), start=1):
+        upstream = warehouse.record_observation(ObservationPayload(
+            provider,
+            datetime(2026, 7, 18, 1, 0, second, tzinfo=timezone.utc),
+            ProviderRequest(
+                ProviderCapability.DAILY_BARS_RAW,
+                DAYS[-1], DAYS[-1], ("600000.SH",),
+            ),
+            {MarketTable.DAILY_BARS: last_raw},
+            (CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                DAYS[-1], DAYS[-1], ("600000.SH",),
+            ),),
+        ))
+        upstream_ids.append(upstream.observation_id)
+
+    candidate = warehouse.record_observation(ObservationPayload(
+        "canonical-reconciler-a-share-daily-simulation-v4",
+        datetime(2026, 7, 18, 1, 1, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            DAYS[-1], DAYS[-1], ("600000.SH",),
+            {"input_observation_ids": tuple(upstream_ids)},
+        ),
+        {
+            MarketTable.INSTRUMENTS: frames[MarketTable.INSTRUMENTS],
+            MarketTable.DAILY_BARS: last_raw,
+            MarketTable.CORPORATE_ACTIONS: frames[MarketTable.CORPORATE_ACTIONS],
+            MarketTable.ADJUSTMENT_FACTORS: frames[MarketTable.ADJUSTMENT_FACTORS],
+        },
+        tuple(CoverageClaim(
+            table,
+            True,
+            None if table is MarketTable.INSTRUMENTS else DAYS[-1],
+            None if table is MarketTable.INSTRUMENTS else DAYS[-1],
+            ("600000.SH",),
+        ) for table in (
+            MarketTable.INSTRUMENTS,
+            MarketTable.DAILY_BARS,
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        )),
+        {
+            "kind": "field_level_reconciliation",
+            "reconciliation_ready": True,
+            "report": {
+                "blockers": (),
+                "unresolved_conflicts": (),
+                "input_observation_ids": tuple(upstream_ids),
+            },
+        },
+    ))
+    increment_scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[-1], DAYS[-1], DAYS[-1],
+        survivorship_bias=True,
+        instrument_ids=("600000.SH",),
+    )
+    validated = SimulationIncrementValidator(
+        warehouse, tmp_path / "reports",
+    ).validate_and_record(
+        candidate_observation_id=candidate.observation_id,
+        calendar_observation_id=source.observation_id,
+        universe_scope=increment_scope,
+        description="validated one-day EOD fixture",
+    )
+    validated_manifest = warehouse.load_observation(validated.observation_id)
+    partition_quality = validated_manifest.source_metadata["partition_quality"]
+    assert partition_quality["validated"] is True
+    assert (
+        partition_quality["validator_version"]
+        == SIMULATION_PARTITION_VALIDATOR_VERSION
+    )
+    assert partition_quality["price_limit_audit"][
+        "minimum_direct_limit_observations_latest_session"
+    ] == 2
+
+    target_scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[-1], DAYS[0], DAYS[-1],
+        survivorship_bias=True,
+        instrument_ids=("600000.SH",),
+    )
+    result = SimulationSnapshotBuilder(
+        warehouse, tmp_path / "reports",
+    ).extend(
+        predecessor_snapshot_id=predecessor.snapshot_id,
+        calendar_observation_id=source.observation_id,
+        increment_observation_ids=(validated.observation_id,),
+        universe_scope=target_scope,
+        description="atomic validated EOD fixture",
+        publish=True,
+    )
+
+    assert result.ready and result.published
+    assert warehouse.current_snapshot_id() == result.snapshot_id
+    row = warehouse.query_snapshot_table(
+        result.snapshot_id,
+        MarketTable.DAILY_BARS,
+        instrument_ids=("600000.SH",),
+        start_date=DAYS[-1],
+        end_date=DAYS[-1],
+        price_mode="raw",
+    ).iloc[0]
+    assert row["close"] == 13.0
+
+
 def test_real_increment_audit_measures_every_prior_daily_open(tmp_path, monkeypatch):
     warehouse = MarketDataWarehouse(tmp_path / "market")
     source = warehouse.record_observation(observation())
@@ -109,7 +282,7 @@ def test_real_increment_audit_measures_every_prior_daily_open(tmp_path, monkeypa
         survivorship_bias=True,
         instrument_ids=("600000.SH",),
     )
-    predecessor = warehouse.build_snapshot(SnapshotPlan(
+    predecessor = commit_test_snapshot(warehouse, SnapshotPlan(
         tuple(SourceSlice(
             source.observation_id,
             table,

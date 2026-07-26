@@ -12,10 +12,18 @@ from fundlab.marketdata import (
     ProviderCapability,
     ProviderRequest,
     MarketDataWarehouse,
+    ReadinessProfile,
     SnapshotPlan,
     SourceSlice,
+    StoredFile,
     UniverseScope,
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+)
+from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
+from fundlab.marketdata.schema import (
+    TABLE_DATE_COLUMNS,
+    TABLE_INSTRUMENT_COLUMNS,
+    validate_snapshot_tables,
 )
 
 
@@ -142,15 +150,68 @@ def observation(
     )
 
 
+def commit_test_snapshot(
+    warehouse: MarketDataWarehouse,
+    plan: SnapshotPlan,
+):
+    """Create an immutable legacy fixture without reopening a production API."""
+
+    tables: dict[MarketTable, pd.DataFrame] = {}
+    files: list[StoredFile] = []
+    seen: set[tuple[str, MarketTable]] = set()
+    for table in MarketTable:
+        selections = [item for item in plan.selections if item.table is table]
+        if not selections:
+            continue
+        pieces = []
+        for selection in selections:
+            frame = warehouse.read_observation_table(selection.observation_id, table)
+            instrument_column = TABLE_INSTRUMENT_COLUMNS[table]
+            if selection.instrument_ids and instrument_column:
+                frame = frame.loc[
+                    frame[instrument_column].astype(str).isin(selection.instrument_ids)
+                ]
+            date_column = TABLE_DATE_COLUMNS[table]
+            if selection.start_date is not None and date_column:
+                frame = frame.loc[
+                    frame[date_column].astype(str).between(
+                        selection.start_date.isoformat(), selection.end_date.isoformat(),
+                    )
+                ]
+            frame = frame.copy()
+            frame["source_observation_id"] = selection.observation_id
+            pieces.append(frame)
+            key = (selection.observation_id, table)
+            if key not in seen:
+                manifest = warehouse.load_observation(selection.observation_id)
+                stored = next(item for item in manifest.files if item.table is table)
+                files.append(StoredFile(
+                    table,
+                    f"{selection.observation_id}/{stored.path}",
+                    stored.sha256,
+                    stored.row_count,
+                ))
+                seen.add(key)
+        tables[table] = pd.concat(pieces, ignore_index=True)
+    quality = validate_snapshot_tables(
+        tables,
+        profile=ReadinessProfile(plan.readiness),
+        universe_scope=plan.universe_scope,
+    )
+    assert quality.ready, quality.errors
+    return warehouse._commit_snapshot(plan, quality, tuple(files))
+
+
 def ready_market(path, *, close_values: tuple[float, ...] | None = None):
     warehouse = MarketDataWarehouse(path)
     manifest = warehouse.record_observation(observation(close_values=close_values))
-    snapshot = warehouse.build_snapshot(SnapshotPlan(
+    legacy = commit_test_snapshot(warehouse, SnapshotPlan(
         tuple(SourceSlice(
             manifest.observation_id, table, "deterministic test fixture",
         ) for table in MarketTable),
         "deterministic test fixture",
         universe_scope=fixture_universe_scope(),
     ))
-    warehouse.publish(snapshot.snapshot_id)
+    snapshot = IncrementalCanonicalPublisher(warehouse).bootstrap(legacy.snapshot_id)
+    warehouse._replace_current_pointer(snapshot)
     return CanonicalMarketData.open(path)

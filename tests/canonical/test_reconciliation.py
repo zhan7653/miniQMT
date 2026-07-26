@@ -268,10 +268,15 @@ def test_adjusted_history_is_derived_only_from_factors_visible_as_of(tmp_path):
     snapshot = warehouse.build_snapshot(SnapshotPlan(
         tuple(SourceSlice(observed.observation_id, item.table, "trusted fixture") for item in observed.files),
         "point-in-time ratio fixture",
+        readiness=ReadinessProfile.RESEARCH_PRICE,
         universe_scope=fixture_universe_scope(),
     ))
     assert snapshot.quality.ready
-    market = CanonicalMarketData(warehouse, snapshot.snapshot_id)
+    market = CanonicalMarketData(
+        warehouse,
+        snapshot.snapshot_id,
+        required_readiness=ReadinessProfile.RESEARCH_PRICE,
+    )
 
     before = market.adjusted_history(
         ("600000.SH",), DAYS[0], DAYS[1], as_of=DAYS[1],

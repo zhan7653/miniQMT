@@ -26,6 +26,7 @@ from fundlab.marketdata import (
     SnapshotPlan,
     SimulationSnapshotBuilder,
     SimulationEvidenceCollector,
+    SimulationIncrementValidator,
     SimulationStatusCollector,
     StatusCollectionSpec,
     SourceSlice,
@@ -111,6 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence.add_argument("--batch-size", type=int, default=100)
     evidence.add_argument("--refresh", action="store_true")
+    validate_increment = data_commands.add_parser(
+        "validate-simulation-increment",
+        help="Assemble and validate one reconciled EOD partition",
+    )
+    validate_increment.add_argument("--candidate-observation-id", required=True)
+    validate_increment.add_argument("--calendar-observation-id", required=True)
+    validate_increment.add_argument("--universe-as-of", type=date.fromisoformat, required=True)
+    validate_increment.add_argument("--start-date", type=date.fromisoformat, required=True)
+    validate_increment.add_argument("--end-date", type=date.fromisoformat, required=True)
+    validate_increment.add_argument("--description", required=True)
     eod = data_commands.add_parser(
         "extend-simulation",
         help="Validate a contiguous manual EOD increment and optionally publish atomically",
@@ -186,11 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--publish", action="store_true")
     snapshot.add_argument(
         "--readiness",
-        choices=tuple(
-            item.value for item in ReadinessProfile
-            if item is not ReadinessProfile.LEGACY_UNKNOWN
-        ),
-        default=ReadinessProfile.SIMULATION.value,
+        choices=(ReadinessProfile.RESEARCH_PRICE.value,),
+        default=ReadinessProfile.RESEARCH_PRICE.value,
     )
 
     account = commands.add_parser("account", help="Manage isolated persistent simulation accounts")
@@ -349,6 +357,29 @@ def _data(args, settings: FoundationSettings) -> int:
         ))
         print(canonical_json({"status": result.status, **to_primitive(result)}))
         return 0 if result.status == "complete" else 2
+    if args.data_command == "validate-simulation-increment":
+        candidate = warehouse.load_observation(args.candidate_observation_id)
+        instruments = warehouse.read_observation_table(
+            candidate.observation_id, MarketTable.INSTRUMENTS,
+        )
+        scope = UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            args.universe_as_of,
+            args.start_date,
+            args.end_date,
+            survivorship_bias=True,
+            instrument_ids=tuple(sorted(map(str, instruments["instrument_id"]))),
+        )
+        result = SimulationIncrementValidator(
+            warehouse, settings.paths.report_root,
+        ).validate_and_record(
+            candidate_observation_id=candidate.observation_id,
+            calendar_observation_id=args.calendar_observation_id,
+            universe_scope=scope,
+            description=args.description,
+        )
+        print(canonical_json({"status": "complete", **to_primitive(result)}))
+        return 0
     if args.data_command == "extend-simulation":
         predecessor = warehouse.load_snapshot(args.predecessor_snapshot_id)
         previous_scope = predecessor.plan.universe_scope
@@ -454,6 +485,30 @@ def _data(args, settings: FoundationSettings) -> int:
             readiness=readiness,
             description=args.description,
         )
+        if readiness is ReadinessProfile.SIMULATION:
+            if args.publish:
+                raise ValueError(
+                    "Simulation reconciliation cannot publish directly; validate the "
+                    "EOD partition and use extend-simulation"
+                )
+            reconciliation_payload = {
+                "decision_source": "https://github.com/zhan7653/miniQMT/issues/7",
+                "canonical_observation_id": observed.observation_id,
+                "snapshot_id": None,
+                "readiness": readiness,
+                "reconciliation": report,
+                "published": False,
+            }
+            report_path = settings.paths.report_root / (
+                f"reconciliation-{observed.observation_id}-candidate.json"
+            )
+            _write_immutable_report(report_path, reconciliation_payload)
+            print(canonical_json({
+                "status": "ok" if report.ready else "incomplete",
+                **reconciliation_payload,
+                "report": report_path,
+            }))
+            return 0 if report.ready else 2
         plan = SnapshotPlan(
             tuple(_scoped_source_slice(
                 observed,

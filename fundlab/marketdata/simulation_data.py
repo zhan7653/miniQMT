@@ -21,14 +21,23 @@ from fundlab.marketdata.contracts import (
     ProviderCapability,
     ProviderRequest,
     ReadinessProfile,
+    SIMULATION_PARTITION_VALIDATOR_VERSION,
     SnapshotManifest,
     SnapshotNotReadyError,
     UniverseScope,
 )
 from fundlab.marketdata.providers import ProviderRegistry
-from fundlab.marketdata.schema import empty_table
+from fundlab.marketdata.reconciliation import default_reconciliation_policy
+from fundlab.marketdata.schema import empty_table, validate_snapshot_tables
 from fundlab.marketdata.sources import default_provider_registry
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
+from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+from fundlab.marketdata.trade_rules import (
+    apply_corroborated_historical_limit_exceptions,
+    audit_provider_price_limits,
+    materialize_daily_trade_rules,
+    materialize_order_quantity_rules,
+)
 from fundlab.marketdata.warehouse import MarketDataWarehouse
 
 
@@ -46,6 +55,14 @@ class SimulationBuildResult:
     published: bool
     report: Path
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SimulationIncrementValidationResult:
+    observation_id: str
+    candidate_observation_id: str
+    report: Path
+    source_observation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1130,6 +1147,392 @@ def reconcile_simulation_status(
         "_st_semantics",
         "_suspension_semantics",
     ]).reset_index(drop=True)
+
+
+class SimulationIncrementValidator:
+    """Assemble and validate one exact EOD partition before publication.
+
+    The input must already be a field-level reconciliation observation.  This
+    stage owns the simulation-only semantics that a generic reconciler cannot:
+    exchange-derived quantity/rule materialization, exact open-session coverage,
+    provider price-limit corroboration, and the immutable partition-quality
+    marker consumed by the incremental publisher.
+    """
+
+    def __init__(self, warehouse: MarketDataWarehouse, report_root: str | Path) -> None:
+        self.warehouse = warehouse
+        self.report_root = Path(report_root).resolve()
+
+    def validate_and_record(
+        self,
+        *,
+        candidate_observation_id: str,
+        calendar_observation_id: str,
+        universe_scope: UniverseScope,
+        description: str,
+    ) -> SimulationIncrementValidationResult:
+        candidate = self.warehouse.load_observation(candidate_observation_id)
+        if (
+            candidate.source_metadata.get("kind") != "field_level_reconciliation"
+            or not candidate.source_metadata.get("reconciliation_ready")
+        ):
+            raise SnapshotNotReadyError(
+                "Simulation increment candidate must be a ready field-level reconciliation"
+            )
+        required_tables = {
+            MarketTable.INSTRUMENTS,
+            MarketTable.DAILY_BARS,
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        }
+        available_tables = {item.table for item in candidate.files}
+        missing = sorted(item.value for item in required_tables - available_tables)
+        if missing:
+            raise SnapshotNotReadyError(
+                "Simulation increment candidate is missing tables: " + ", ".join(missing)
+            )
+
+        tables = {
+            table: self.warehouse.read_observation_table(candidate_observation_id, table)
+            for table in required_tables
+        }
+        for frame in tables.values():
+            frame["source_observation_id"] = candidate_observation_id
+        instruments = materialize_order_quantity_rules(tables[MarketTable.INSTRUMENTS])
+        instrument_ids = tuple(sorted(map(str, instruments["instrument_id"])))
+        if instrument_ids != universe_scope.instrument_ids:
+            raise SnapshotNotReadyError(
+                "Simulation increment candidate does not match its pinned instrument scope"
+            )
+        exchanges = set(map(str, instruments["exchange"]))
+
+        calendar_manifest = self.warehouse.load_observation(calendar_observation_id)
+        if not any(item.table is MarketTable.CALENDAR for item in calendar_manifest.files):
+            raise SnapshotNotReadyError("Simulation increment calendar observation has no calendar")
+        calendar = self.warehouse.read_observation_table(
+            calendar_observation_id, MarketTable.CALENDAR,
+        )
+        calendar = calendar.loc[
+            calendar["exchange"].astype(str).isin(exchanges)
+            & calendar["session_date"].astype(str).between(
+                universe_scope.history_start.isoformat(),
+                universe_scope.history_end.isoformat(),
+            )
+        ].reset_index(drop=True)
+        calendar["source_observation_id"] = calendar_observation_id
+        target_open = calendar.loc[
+            calendar["session_date"].astype(str).eq(
+                universe_scope.history_end.isoformat()
+            )
+            & calendar["is_open"].fillna(False).astype(bool)
+        ]
+        if target_open.empty:
+            raise SnapshotNotReadyError(
+                "Simulation increment must end on a completed open exchange session"
+            )
+
+        bars = tables[MarketTable.DAILY_BARS].loc[
+            tables[MarketTable.DAILY_BARS]["instrument_id"].astype(str).isin(instrument_ids)
+            & tables[MarketTable.DAILY_BARS]["session_date"].astype(str).between(
+                universe_scope.history_start.isoformat(),
+                universe_scope.history_end.isoformat(),
+            )
+            & tables[MarketTable.DAILY_BARS]["price_mode"].astype(str).eq("raw")
+        ].reset_index(drop=True)
+        if len(bars) != len(tables[MarketTable.DAILY_BARS]):
+            raise SnapshotNotReadyError(
+                "Routine simulation increment contains rows outside its exact raw date scope"
+            )
+        etf_rules = None
+        if instruments["asset_type"].astype(str).eq("etf").any():
+            etf_rules = EtfRuleEvidenceBuilder(self.report_root).build(
+                instruments,
+                universe_as_of=universe_scope.as_of_date,
+                universe_observation_id=candidate_observation_id,
+            ).rules
+        bars = materialize_daily_trade_rules(
+            bars, instruments, calendar, etf_rules=etf_rules,
+        )
+
+        provider_bars, upstream_manifests = self._provider_audit_bars(
+            candidate,
+            instrument_ids=instrument_ids,
+            start_date=universe_scope.history_start,
+            end_date=universe_scope.history_end,
+        )
+        bars, exception_audit = apply_corroborated_historical_limit_exceptions(
+            bars,
+            provider_bars,
+            protected_dates=(universe_scope.history_end,),
+        )
+        latest_historical_exception = bars.loc[
+            bars["session_date"].astype(str).eq(universe_scope.history_end.isoformat())
+            & bars["trade_rule_id"].astype(str).eq(
+                "cn-historical-exchange-exception-corroborated-v1"
+            )
+        ]
+        if not latest_historical_exception.empty:
+            raise SnapshotNotReadyError(
+                "Latest EOD rules cannot use a historical price-limit exception"
+            )
+        price_limit_audit = audit_provider_price_limits(
+            bars,
+            provider_bars,
+            required_direct_limit_date=universe_scope.history_end,
+        )
+
+        scoped_tables = {
+            MarketTable.INSTRUMENTS: instruments,
+            MarketTable.CALENDAR: calendar,
+            MarketTable.DAILY_BARS: bars,
+            MarketTable.CORPORATE_ACTIONS: self._exact_event_scope(
+                tables[MarketTable.CORPORATE_ACTIONS],
+                "ex_date",
+                universe_scope,
+            ),
+            MarketTable.ADJUSTMENT_FACTORS: self._exact_event_scope(
+                tables[MarketTable.ADJUSTMENT_FACTORS],
+                "effective_date",
+                universe_scope,
+            ),
+        }
+        quality = validate_snapshot_tables(
+            scoped_tables,
+            profile=ReadinessProfile.SIMULATION,
+            universe_scope=universe_scope,
+        )
+        if not quality.ready:
+            raise SnapshotNotReadyError(
+                "Simulation increment validation failed: " + "; ".join(quality.errors)
+            )
+
+        source_observation_ids = tuple(sorted({
+            candidate.observation_id,
+            calendar_manifest.observation_id,
+            *(item.observation_id for item in upstream_manifests),
+        }))
+        partition_quality = {
+            "validated": True,
+            "validator_version": SIMULATION_PARTITION_VALIDATOR_VERSION,
+            "readiness": ReadinessProfile.SIMULATION.value,
+            "calendar_observation_id": calendar_observation_id,
+            "start_date": universe_scope.history_start,
+            "end_date": universe_scope.history_end,
+            "universe_as_of": universe_scope.as_of_date,
+            "universe_definition": universe_scope.definition,
+            "instrument_ids": instrument_ids,
+            "row_counts": quality.row_counts,
+            "candidate_observation_id": candidate_observation_id,
+            "source_observation_ids": source_observation_ids,
+            "price_limit_audit": price_limit_audit,
+            "historical_limit_exception_audit": exception_audit,
+        }
+        observed_at = max(
+            candidate.observed_at,
+            calendar_manifest.observed_at,
+            *(item.observed_at for item in upstream_manifests),
+        )
+        claims = tuple(
+            CoverageClaim(
+                table,
+                True,
+                None if table is MarketTable.INSTRUMENTS else universe_scope.history_start,
+                None if table is MarketTable.INSTRUMENTS else universe_scope.history_end,
+                instrument_ids,
+                f"Validated by {SIMULATION_PARTITION_VALIDATOR_VERSION}",
+            )
+            for table in (
+                MarketTable.INSTRUMENTS,
+                MarketTable.DAILY_BARS,
+                MarketTable.CORPORATE_ACTIONS,
+                MarketTable.ADJUSTMENT_FACTORS,
+            )
+        )
+        payload = ObservationPayload(
+            f"canonical-{SIMULATION_PARTITION_VALIDATOR_VERSION}",
+            observed_at,
+            ProviderRequest(
+                ProviderCapability.CANONICAL_RECONCILIATION,
+                universe_scope.history_start,
+                universe_scope.history_end,
+                instrument_ids,
+                {
+                    "description": description,
+                    "candidate_observation_id": candidate_observation_id,
+                    "calendar_observation_id": calendar_observation_id,
+                    "validator_version": SIMULATION_PARTITION_VALIDATOR_VERSION,
+                    "source_observation_ids": source_observation_ids,
+                },
+            ),
+            {
+                table: scoped_tables[table]
+                for table in (
+                    MarketTable.INSTRUMENTS,
+                    MarketTable.DAILY_BARS,
+                    MarketTable.CORPORATE_ACTIONS,
+                    MarketTable.ADJUSTMENT_FACTORS,
+                )
+            },
+            claims,
+            {
+                "kind": "field_level_reconciliation",
+                "reconciliation_ready": True,
+                "description": description,
+                "partition_quality": partition_quality,
+                "report": {
+                    "blockers": (),
+                    "unresolved_conflicts": (),
+                    "candidate_observation_id": candidate_observation_id,
+                    "source_observation_ids": source_observation_ids,
+                    "price_limit_audit": to_primitive(price_limit_audit),
+                    "historical_limit_exception_audit": to_primitive(exception_audit),
+                },
+            },
+        )
+        validated = self.warehouse.record_observation(payload)
+        report_payload = {
+            "decision_source": "https://github.com/zhan7653/miniQMT/issues/8",
+            "decision_revision": 1,
+            "kind": "simulation_increment_validation",
+            "candidate_observation_id": candidate_observation_id,
+            "validated_observation_id": validated.observation_id,
+            "calendar_observation_id": calendar_observation_id,
+            "universe_scope": universe_scope,
+            "partition_quality": partition_quality,
+        }
+        self.report_root.mkdir(parents=True, exist_ok=True)
+        report_hash = stable_digest(report_payload)[:16]
+        report = self.report_root / (
+            f"simulation-increment-{validated.observation_id}-{report_hash}.json"
+        )
+        primitive = to_primitive(report_payload)
+        if report.exists():
+            if json.loads(report.read_text(encoding="utf-8")) != primitive:
+                raise ValueError(f"Immutable increment validation report collision: {report}")
+        else:
+            report.write_text(canonical_json(report_payload), encoding="utf-8", newline="\n")
+        return SimulationIncrementValidationResult(
+            validated.observation_id,
+            candidate_observation_id,
+            report,
+            source_observation_ids,
+        )
+
+    @staticmethod
+    def _exact_event_scope(
+        frame: pd.DataFrame,
+        date_column: str,
+        scope: UniverseScope,
+    ) -> pd.DataFrame:
+        inside = (
+            frame["instrument_id"].astype(str).isin(scope.instrument_ids)
+            & frame[date_column].astype(str).between(
+                scope.history_start.isoformat(), scope.history_end.isoformat(),
+            )
+        )
+        if not inside.all():
+            raise SnapshotNotReadyError(
+                "Routine simulation increment contains an event outside its exact scope"
+            )
+        return frame.reset_index(drop=True)
+
+    def _provider_audit_bars(
+        self,
+        candidate: ObservationManifest,
+        *,
+        instrument_ids: tuple[str, ...],
+        start_date: date,
+        end_date: date,
+    ) -> tuple[Mapping[str, pd.DataFrame], tuple[ObservationManifest, ...]]:
+        policy = default_reconciliation_policy(ReadinessProfile.SIMULATION)
+        queue = list(_declared_input_observation_ids(candidate))
+        visited: set[str] = set()
+        upstream: dict[str, ObservationManifest] = {}
+        grouped: dict[str, list[pd.DataFrame]] = {}
+        while queue:
+            observation_id = queue.pop()
+            if observation_id in visited or observation_id == candidate.observation_id:
+                continue
+            visited.add(observation_id)
+            manifest = self.warehouse.load_observation(observation_id)
+            nested = _declared_input_observation_ids(manifest)
+            queue.extend(item for item in nested if item not in visited)
+            if (
+                manifest.provider.startswith("canonical-")
+                or manifest.request.capability not in {
+                    ProviderCapability.DAILY_BARS_RAW,
+                    ProviderCapability.DAILY_STATUS,
+                }
+                or not any(item.table is MarketTable.DAILY_BARS for item in manifest.files)
+            ):
+                continue
+            frame = self.warehouse.read_observation_table(
+                observation_id, MarketTable.DAILY_BARS,
+            )
+            frame = frame.loc[
+                frame["instrument_id"].astype(str).isin(instrument_ids)
+                & frame["session_date"].astype(str).between(
+                    start_date.isoformat(), end_date.isoformat(),
+                )
+                & frame["price_mode"].astype(str).eq("raw")
+            ].copy()
+            if frame.empty:
+                continue
+            frame["_audit_observation_id"] = observation_id
+            grouped.setdefault(policy.backend(manifest.provider), []).append(frame)
+            upstream[observation_id] = manifest
+        provider_bars: dict[str, pd.DataFrame] = {}
+        keys = ["instrument_id", "session_date", "price_mode"]
+        for backend, pieces in sorted(grouped.items()):
+            combined = pd.concat(pieces, ignore_index=True).sort_values(
+                [*keys, "observed_at"], kind="stable",
+            )
+            provider_bars[backend] = combined.drop_duplicates(keys, keep="last")
+        if len(provider_bars) < 2:
+            raise SnapshotNotReadyError(
+                "Simulation increment needs two independent daily provider backends"
+            )
+        return provider_bars, tuple(
+            upstream[item] for item in sorted(upstream)
+        )
+
+
+def _declared_input_observation_ids(
+    manifest: ObservationManifest,
+) -> tuple[str, ...]:
+    values: list[Any] = [
+        manifest.request.parameters.get("input_observation_ids"),
+        manifest.request.parameters.get("source_observation_ids"),
+        manifest.source_metadata.get("source_observation_ids"),
+    ]
+    report = manifest.source_metadata.get("report")
+    if isinstance(report, Mapping):
+        values.extend((
+            report.get("input_observation_ids"),
+            report.get("source_observation_ids"),
+        ))
+    quality = manifest.source_metadata.get("partition_quality")
+    if isinstance(quality, Mapping):
+        values.append(quality.get("source_observation_ids"))
+    found: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            if value.startswith("obs-"):
+                found.add(value)
+            return
+        if isinstance(value, Mapping):
+            for item in value.values():
+                collect(item)
+            return
+        if isinstance(value, (tuple, list, set, frozenset)):
+            for item in value:
+                collect(item)
+
+    for value in values:
+        collect(value)
+    found.discard(manifest.observation_id)
+    return tuple(sorted(found))
 
 
 class SimulationSnapshotBuilder:
