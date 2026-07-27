@@ -1,13 +1,7 @@
 paths:
-  # Runtime remains under the repository-approved ignored v2 directory during safe cutover;
-  # public code and commands use canonical names and do not expose a v1/v2 API split.
   market_data: ../data/warehouse/v2/canonical
   trading_database: ../data/warehouse/v2/trading.sqlite3
   report_root: ../data/reports/data_v2/canonical
-  legacy_market_data: ../data/warehouse/v2
-  legacy_reports: ../data/reports/data_v2
-  protected_legacy_database: ../data/warehouse/sqlite/fundlab.db
-  protected_legacy_bars: ../data/warehouse/parquet/fund_daily_bar
 
 daily:
   # A session counts as completed only after this local time; before it the

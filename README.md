@@ -215,19 +215,6 @@ The previous schema-5 publication `snap-9a0c35efaf0ac6a9c9e6d82e` remains immuta
 Before cutover, 142 bounded public-query slices validated the complete historical and increment rows
 through the pinned view dependency/version path.
 
-## Safe legacy audit
-
-The importer reads the existing collector and protected v1 warehouse without modifying them:
-
-```powershell
-uv run fundlab data audit-legacy
-```
-
-The current real-data audit verifies every report-bound partition checksum and row count. It does not
-publish a canonical snapshot because coverage gates failed and the legacy data lacks ordinary stocks,
-corporate actions, price-limit rules, and instrument settlement rules. An incomplete source observation
-can be created only with an explicit flag; it still cannot be published as canonical data.
-
 ## Simulation
 
 Create an isolated account after a ready canonical snapshot exists:
@@ -244,5 +231,6 @@ a real broker account. Live or broker-parity work must bind a separately verifie
 
 See [docs/foundation.md](docs/foundation.md) for contracts, timing, realism boundaries, migration state,
 and operating commands. Runtime consumers use only `fundlab.marketdata`, `fundlab.trading`,
-`fundlab.strategies`, and the `fundlab.pipeline` orchestrator; legacy warehouse files remain read-only
-evidence and are not a second runtime path.
+`fundlab.strategies`, and the `fundlab.pipeline` orchestrator. The pre-v2 legacy warehouses and their
+audit/import channel were retired in July 2026 after the revision-2 canonical delivery superseded them;
+one-time build and validation reports are archived in `data/archive/build-reports-2026-07.zip`.

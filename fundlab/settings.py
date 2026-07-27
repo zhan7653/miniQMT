@@ -16,10 +16,6 @@ class FoundationPaths:
     market_data: Path
     trading_database: Path
     report_root: Path
-    legacy_market_data: Path
-    legacy_reports: Path
-    protected_legacy_database: Path
-    protected_legacy_bars: Path
 
 
 @dataclass(frozen=True)
@@ -74,8 +70,7 @@ def load_foundation_settings(path: str | Path = "config/fundlab.yaml") -> Founda
     raw_paths = _mapping(payload, "paths")
     paths = FoundationPaths(
         *(_resolve(base, raw_paths, key) for key in (
-            "market_data", "trading_database", "report_root", "legacy_market_data",
-            "legacy_reports", "protected_legacy_database", "protected_legacy_bars",
+            "market_data", "trading_database", "report_root",
         ))
     )
     raw_execution = _mapping(payload, "execution")

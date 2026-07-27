@@ -6,8 +6,8 @@
 
 ## Data and environment safety
 
-- Treat `data/warehouse/sqlite/fundlab.db` and `data/warehouse/parquet/fund_daily_bar/**` as read-only legacy artifacts unless the user explicitly authorizes a legacy-data mutation. They are no longer tracked by git but remain protected evidence on disk.
-- Put Data Platform v2 runtime artifacts under ignored `data/warehouse/v2/` and reports under `data/reports/data_v2/`; daily ops reports go under ignored `data/reports/daily/`.
+- The pre-v2 legacy warehouses (`data/warehouse/sqlite`, `data/warehouse/parquet`) and the `audit-legacy`/`import-legacy` channel were retired with user authorization on 2026-07-27; do not recreate them. One-time build/validation reports live in `data/archive/build-reports-2026-07.zip`.
+- Put Data Platform v2 runtime artifacts under ignored `data/warehouse/v2/` and canonical reports under `data/reports/data_v2/canonical/`; daily ops reports go under ignored `data/reports/daily/`.
 - `xtquant` is externally installed and is not locked in `uv.lock`. Use `uv sync --dev --frozen --inexact` when syncing so the environment does not remove it.
 - Routine canonical publication must use the componentized incremental path, driven by `uv run fundlab daily run` (`fundlab/pipeline/daily.py`). Do not restore or call a full-history simulation builder for a routine update, and do not hand-relay observation IDs through ad-hoc scripts — extend the pipeline instead.
 - A historical correction requires an exact instrument/date/field dependency scope. If the affected scope cannot be proven, fail closed instead of rebuilding all history.

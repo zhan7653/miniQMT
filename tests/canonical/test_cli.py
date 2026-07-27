@@ -90,10 +90,6 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
             "market_data": str(market_root),
             "trading_database": str(tmp_path / "trading.sqlite3"),
             "report_root": str(tmp_path / "reports"),
-            "legacy_market_data": str(tmp_path / "legacy"),
-            "legacy_reports": str(tmp_path / "legacy-reports"),
-            "protected_legacy_database": str(tmp_path / "legacy.db"),
-            "protected_legacy_bars": str(tmp_path / "legacy-bars"),
         },
         "execution": {
             "policy_id": "test", "version": "1", "maximum_participation": "0.05",
@@ -115,7 +111,7 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
     assert {item["provider"] for item in sources} == {
         "baostock", "cninfo-public", "eastmoney-efinance", "exchange-public",
         "eastmoney-fund-public", "sina-calendar", "sina-etf", "tickflow",
-        "tencent-public", "xtquant",
+        "xtquant",
     }
 
     assert main([

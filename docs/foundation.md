@@ -185,9 +185,12 @@ that the legacy collector is not canonical-ready:
 - corporate actions, price-limit rules, and settlement rules are absent;
 - old duplicate source identities exist outside the report-bound partition set and are excluded.
 
-The protected warehouse therefore remains read-only. No legacy data was copied, no current snapshot
-was published, and no old source path was deleted. The importer can preserve the report-bound rows as
-an explicitly incomplete observation, but doing so requires `--allow-incomplete-source`.
+The protected warehouse therefore remained read-only. No legacy data was copied and no current snapshot
+was published from it.
+
+Retirement note (2026-07-27): after the revision-2 canonical delivery fully superseded the legacy
+collector, the protected v1 warehouses and the `audit-legacy`/`import-legacy` channel were deleted with
+explicit user authorization. This section is preserved as the historical record of that audit.
 
 ## Daily pipeline
 
@@ -265,12 +268,6 @@ uv run fundlab data extend-simulation `
 # Simulation cannot be published by build-snapshot, reconcile --publish, or the
 # ordinary warehouse publish API. Those paths fail closed instead of bypassing CAS.
 
-# Read-only audit; report goes under ignored data/reports/data_v2/canonical/
-uv run fundlab data audit-legacy
-
-# Explicit preservation only; still not publishable
-uv run fundlab data import-legacy --allow-incomplete-source
-
 # Rebuild a scoped snapshot from an already reconciled canonical observation.
 uv run fundlab data build-snapshot --observation-id obs-... --readiness research_price `
   --description "reviewed reconciled selection" --publish
@@ -326,12 +323,12 @@ recorded audit difference was historical calendar provenance: the new path corre
 predecessor lineage instead of rewriting 12,084 unrelated rows to the latest observation.
 
 Beijing and delisted-history completeness are intentionally outside revision 2, not hidden gaps in
-this snapshot. The protected legacy database and Parquet tree remain read-only until the separate
-cutover rule below is satisfied; no revision-2 validation mutated them.
+this snapshot. No revision-2 validation mutated the then-protected legacy database or Parquet tree.
 
 ## Cutover rule
 
 The cutover gates passed for the runtime: canonical hashes/counts/date ranges verify, the canonical API
 can read the published snapshot, and the shared-kernel tests pass. Old code, APIs, CLIs, tests, paper
-accounts, and ledgers were removed; Git history is their archive. Protected legacy market-data files
-remain read-only evidence and are not a runtime path.
+accounts, and ledgers were removed; Git history is their archive. The protected legacy market-data
+files were retained as read-only evidence until 2026-07-27, then deleted with explicit user
+authorization once the revision-2 delivery fully superseded them (see the retirement note above).

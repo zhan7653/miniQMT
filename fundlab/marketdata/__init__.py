@@ -40,7 +40,6 @@ from fundlab.marketdata.portal import (
     PointInTimeMarketView,
 )
 from fundlab.marketdata.warehouse import MarketDataWarehouse
-from fundlab.marketdata.legacy import LegacyAuditReport, LegacyV2Importer, ProtectedArtifact
 from fundlab.marketdata.ingestion import MarketIngestionService
 from fundlab.marketdata.adjustments import derive_ratio_adjusted_bars
 from fundlab.marketdata.corporate_actions import (
@@ -100,7 +99,6 @@ from fundlab.marketdata.sources import (
     SinaEtfProvider,
     SinaCalendarProvider,
     TickFlowProvider,
-    TencentAdjustmentFactorProvider,
     XtQuantProvider,
     default_provider_registry,
     source_statuses,
@@ -131,8 +129,6 @@ __all__ = [
     "MarketDataProvider",
     "MarketIngestionService",
     "MarketDataWarehouse",
-    "LegacyAuditReport",
-    "LegacyV2Importer",
     "DailyBar",
     "Instrument",
     "MarketSession",
@@ -146,7 +142,6 @@ __all__ = [
     "ProviderCapability",
     "ProviderRegistry",
     "ProviderRequest",
-    "ProtectedArtifact",
     "ProviderSelectionError",
     "QualityReport",
     "ReadinessProfile",
@@ -175,7 +170,6 @@ __all__ = [
     "SinaEtfProvider",
     "SinaCalendarProvider",
     "TickFlowProvider",
-    "TencentAdjustmentFactorProvider",
     "XtQuantProvider",
     "default_provider_registry",
     "default_reconciliation_policy",

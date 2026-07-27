@@ -9,11 +9,7 @@ __pycache__/
 /tmp/
 
 logs/
-data/raw/*
-!data/raw/manual/
-!data/raw/manual/universe_seed.csv
-data/warehouse/
-data/reports/
+data/
 
 *.db
 *.sqlite

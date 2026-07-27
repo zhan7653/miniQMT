@@ -16,7 +16,6 @@ from fundlab.marketdata import (
     SinaEtfProvider,
     SinaCalendarProvider,
     TickFlowProvider,
-    TencentAdjustmentFactorProvider,
     XtQuantProvider,
 )
 from fundlab.marketdata.sources.cninfo import CninfoPublicClient, _cninfo_token
@@ -601,44 +600,6 @@ def test_baostock_complete_factor_claim_includes_instrument_with_no_events():
 
     assert observed.coverage[0].complete
     assert observed.coverage[0].instrument_ids == requested
-
-
-def test_tencent_factor_audit_derives_candidate_ratio_from_raw_and_qfq_ohlc():
-    class Transport:
-        def get_json(self, url, *, parameters, headers, timeout):
-            adjusted = parameters["param"].endswith(",qfq")
-            key = "qfqday" if adjusted else "day"
-            rows = (
-                [
-                    ["2024-01-02", "5", "5", "5", "5", "100"],
-                    ["2024-01-03", "5", "5", "5", "5", "100"],
-                ]
-                if adjusted else
-                [
-                    ["2024-01-02", "10", "10", "10", "10", "100"],
-                    ["2024-01-03", "5", "5", "5", "5", "100"],
-                ]
-            )
-            return {"code": 0, "data": {"sh600000": {key: rows}}}
-
-    payload = TencentAdjustmentFactorProvider(transport=Transport()).observe(
-        ProviderRequest(
-            ProviderCapability.ADJUSTMENT_FACTORS,
-            date(2024, 1, 1),
-            date(2024, 1, 5),
-            ("600000.SH",),
-            {
-                "candidate_multipliers": {"600000.SH": {"2024-01-03": 0.5}},
-                "max_workers": 1,
-                "retries": 1,
-            },
-        )
-    )
-
-    assert payload.coverage[0].complete
-    factor = payload.tables[MarketTable.ADJUSTMENT_FACTORS].iloc[0]
-    assert factor["effective_date"] == "2024-01-03"
-    assert factor["price_multiplier"] == pytest.approx(0.5)
 
 
 def test_cninfo_actions_preserve_announcement_and_effect_lifecycle_with_per_share_units():

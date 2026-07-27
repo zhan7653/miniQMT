@@ -15,7 +15,6 @@ from fundlab.marketdata import (
     EvidenceCollectionSpec,
     HistoryBuildSpec,
     HistoryDatabaseBuilder,
-    LegacyV2Importer,
     MarketIngestionService,
     MarketDataWarehouse,
     MarketTable,
@@ -61,10 +60,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     data = commands.add_parser("data", help="Manage source observations and canonical snapshots")
     data_commands = data.add_subparsers(dest="data_command", required=True)
-    audit = data_commands.add_parser("audit-legacy", help="Read-only audit of protected legacy data")
-    audit.add_argument("--require-canonical-ready", action="store_true")
-    imported = data_commands.add_parser("import-legacy", help="One-time legacy observation import")
-    imported.add_argument("--allow-incomplete-source", action="store_true")
     snapshot = data_commands.add_parser("build-snapshot", help="Build a snapshot from one explicit observation")
     snapshot.add_argument("--observation-id", required=True)
     snapshot.add_argument("--description", required=True)
@@ -261,25 +256,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _data(args, settings: FoundationSettings) -> int:
-    importer = LegacyV2Importer(
-        legacy_root=settings.paths.legacy_market_data,
-        legacy_report_root=settings.paths.legacy_reports,
-        protected_v1_db=settings.paths.protected_legacy_database,
-        protected_v1_parquet_root=settings.paths.protected_legacy_bars,
-    )
-    if args.data_command == "audit-legacy":
-        audit = importer.audit()
-        path = settings.paths.report_root / f"legacy-audit-{audit.audit_hash[:16]}.json"
-        audit.write(path)
-        print(canonical_json({
-            "status": "ok",
-            "report": path,
-            "audit_hash": audit.audit_hash,
-            "source_import_ready": audit.source_import_ready,
-            "canonical_ready": audit.canonical_ready,
-            "blockers": audit.blockers,
-        }))
-        return 2 if args.require_canonical_ready and not audit.canonical_ready else 0
     warehouse = MarketDataWarehouse(settings.paths.market_data)
     if args.data_command == "sources":
         print(canonical_json({"status": "ok", "sources": source_statuses()}))
@@ -433,18 +409,6 @@ def _data(args, settings: FoundationSettings) -> int:
             publish=args.publish,
         )
         print(canonical_json({"status": "complete", **to_primitive(result)}))
-        return 0
-    if args.data_command == "import-legacy":
-        audit = importer.audit()
-        audit_path = settings.paths.report_root / f"legacy-audit-{audit.audit_hash[:16]}.json"
-        audit.write(audit_path)
-        manifest = importer.import_source_observation(
-            warehouse, audit=audit, allow_incomplete_source=args.allow_incomplete_source,
-        )
-        print(canonical_json({
-            "status": "ok", "observation_id": manifest.observation_id,
-            "audit_report": audit_path, "coverage": manifest.coverage,
-        }))
         return 0
     if args.data_command == "build-snapshot":
         observed = warehouse.load_observation(args.observation_id)
