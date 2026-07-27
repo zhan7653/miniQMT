@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from fundlab.agent.llm import (
     DividendValueAdviser,
@@ -154,6 +155,7 @@ class AgentDecisionService:
             / account.account_id
             / f"{decision_date.isoformat()}.json"
         )
+        existing = None
         if existing_path.exists():
             try:
                 existing = load_agent_decision(
@@ -181,7 +183,13 @@ class AgentDecisionService:
         result["as_of"] = as_of.isoformat()
         result["reason"] = decision.reason
         self._attach_review_result(result, decision)
+        review_completed = bool(decision.audit.get("review_completed"))
         if dry_run:
+            if decision.hold and existing is not None:
+                if review_completed:
+                    result["would_supersede_existing_decision"] = True
+                else:
+                    result["existing_decision_retained"] = True
             if not decision.hold:
                 result["target_weights"] = {
                     instrument_id: str(weight)
@@ -189,7 +197,23 @@ class AgentDecisionService:
                 }
             return result
 
-        review_completed = bool(decision.audit.get("review_completed"))
+        if decision.hold and existing is not None:
+            if not review_completed:
+                result.update({
+                    "existing_decision_retained": True,
+                    "existing_content_hash": existing.content_hash,
+                    "skipped": str(decision.audit.get("skipped") or "policy_hold"),
+                })
+                return result
+            superseded = self._supersede_existing_decision(
+                account_id=account.account_id,
+                decision_date=decision_date,
+                expected_content_hash=existing.content_hash,
+            )
+            result.update({
+                "superseded_file": superseded,
+                "superseded_content_hash": existing.content_hash,
+            })
         if review_completed:
             memory.append(self._review_memory_entry(
                 account_id=account.account_id,
@@ -269,6 +293,60 @@ class AgentDecisionService:
                     "error": str(exc),
                 })
         return outcomes
+
+    def _supersede_existing_decision(
+        self,
+        *,
+        account_id: str,
+        decision_date: date,
+        expected_content_hash: str,
+    ) -> str:
+        """Atomically move a validated future decision out of the executable path."""
+        try:
+            current = load_agent_decision(
+                self.settings.daily.agent_decision_root,
+                account_id,
+                decision_date,
+            )
+        except AgentDecisionError as exc:
+            raise AgentServiceError(
+                "Existing decision changed or became invalid before it could be superseded"
+            ) from exc
+        if current is None or current.content_hash != expected_content_hash:
+            raise AgentServiceError(
+                "Existing decision changed before it could be superseded; refusing to move it"
+            )
+        source = Path(current.source_path)
+        archive_root = (
+            Path(self.settings.daily.agent_decision_root)
+            / ".superseded"
+            / account_id
+        )
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive = archive_root / (
+            f"{decision_date.isoformat()}-{expected_content_hash[:16]}-{uuid4().hex}.json"
+        )
+        try:
+            source.replace(archive)
+        except OSError as exc:
+            raise AgentServiceError(
+                f"Could not supersede existing decision for {decision_date.isoformat()}"
+            ) from exc
+        try:
+            replacement = load_agent_decision(
+                self.settings.daily.agent_decision_root,
+                account_id,
+                decision_date,
+            )
+        except AgentDecisionError as exc:
+            raise AgentServiceError(
+                "A concurrent invalid decision appeared after superseding the old decision"
+            ) from exc
+        if replacement is not None:
+            raise AgentServiceError(
+                "A concurrent decision appeared after superseding the old decision"
+            )
+        return str(archive)
 
     def _configured_account(self, account_id: str):
         account = next(

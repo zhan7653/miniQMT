@@ -208,8 +208,12 @@ def _parse_response(payload: Mapping[str, object], *, top_n: int) -> AdviserResu
     status = payload.get("status")
     if status != "completed" or payload.get("error") is not None:
         raise ResponsesAPIError(f"Responses request did not complete successfully (status={status!r})")
-    response_id = str(payload.get("id", "")).strip()
-    model = str(payload.get("model", "")).strip()
+    response_id_raw = payload.get("id")
+    model_raw = payload.get("model")
+    if not isinstance(response_id_raw, str) or not isinstance(model_raw, str):
+        raise ResponsesAPIError("Responses result id and model must be strings")
+    response_id = response_id_raw.strip()
+    model = model_raw.strip()
     if not response_id or not model:
         raise ResponsesAPIError("Responses result is missing id or model")
     output = payload.get("output")
@@ -257,16 +261,22 @@ def _parse_review(payload: Mapping[str, object], *, top_n: int) -> DividendRevie
         raise ResponsesAPIError(
             f"Structured review fields differ from the contract: {sorted(map(str, payload))}"
         )
-    action = str(payload["action"])
-    summary = str(payload["summary"]).strip()
+    action_raw = payload["action"]
+    summary_raw = payload["summary"]
     selected_raw = payload["selected_instruments"]
     rationales_raw = payload["selection_rationale"]
     opportunities_raw = payload["opportunities"]
+    if not isinstance(action_raw, str) or not isinstance(summary_raw, str):
+        raise ResponsesAPIError("Structured review action and summary must be strings")
+    action = action_raw
+    summary = summary_raw.strip()
     if action not in {"hold", "rebalance"} or not summary or len(summary) > 4_000:
-        raise ResponsesAPIError("Structured review has an invalid action or empty summary")
+        raise ResponsesAPIError("Structured review has an invalid action or summary")
     if not isinstance(selected_raw, list) or len(selected_raw) != top_n:
         raise ResponsesAPIError(f"Structured review must select exactly {top_n} instruments")
-    selected = tuple(str(item).strip() for item in selected_raw)
+    if any(not isinstance(item, str) for item in selected_raw):
+        raise ResponsesAPIError("Structured review selected instruments must be strings")
+    selected = tuple(item.strip() for item in selected_raw)
     if (
         any(not item or len(item) > 64 for item in selected)
         or len(set(selected)) != len(selected)
@@ -278,8 +288,12 @@ def _parse_review(payload: Mapping[str, object], *, top_n: int) -> DividendRevie
     for item in rationales_raw:
         if not isinstance(item, dict) or set(item) != {"instrument_id", "rationale"}:
             raise ResponsesAPIError("Structured review contains an invalid selection rationale")
-        instrument_id = str(item["instrument_id"]).strip()
-        rationale = str(item["rationale"]).strip()
+        instrument_id_raw = item["instrument_id"]
+        rationale_raw = item["rationale"]
+        if not isinstance(instrument_id_raw, str) or not isinstance(rationale_raw, str):
+            raise ResponsesAPIError("Selection rationale fields must be strings")
+        instrument_id = instrument_id_raw.strip()
+        rationale = rationale_raw.strip()
         if (
             not instrument_id
             or len(instrument_id) > 64
@@ -297,10 +311,17 @@ def _parse_review(payload: Mapping[str, object], *, top_n: int) -> DividendRevie
     for item in opportunities_raw:
         if not isinstance(item, dict) or set(item) != {"instrument_id", "headline", "rationale"}:
             raise ResponsesAPIError("Structured review contains an invalid opportunity")
+        instrument_id_raw = item["instrument_id"]
+        headline_raw = item["headline"]
+        rationale_raw = item["rationale"]
+        if not all(isinstance(value, str) for value in (
+            instrument_id_raw, headline_raw, rationale_raw,
+        )):
+            raise ResponsesAPIError("Opportunity fields must be strings")
         opportunity = ReviewOpportunity(
-            instrument_id=str(item["instrument_id"]).strip(),
-            headline=str(item["headline"]).strip(),
-            rationale=str(item["rationale"]).strip(),
+            instrument_id=instrument_id_raw.strip(),
+            headline=headline_raw.strip(),
+            rationale=rationale_raw.strip(),
         )
         if (
             not opportunity.instrument_id

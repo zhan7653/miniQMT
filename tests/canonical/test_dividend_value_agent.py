@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import urllib.error
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 import fundlab.agent.policy as policy_module
@@ -35,7 +37,7 @@ from fundlab.settings import (
     DailyAccountSettings,
     load_foundation_settings,
 )
-from fundlab.strategies import load_agent_decision
+from fundlab.strategies import load_agent_decision, write_agent_decision
 from fundlab.trading import PortfolioState, PositionLot
 from tests.canonical.fixtures import DAYS, FUTURE_DAYS, ready_market
 from tests.canonical.test_daily_pipeline import build_settings
@@ -224,6 +226,62 @@ def test_hard_rule_violation_forces_rebalance_even_when_adviser_holds(tmp_path, 
     assert any(item.kind == "risk" for item in decision.highlights)
 
 
+def test_liquidity_gate_requires_all_20_session_amounts_and_counts_suspensions():
+    from fundlab.agent.dividend import build_dividend_candidates
+
+    as_of = date(2026, 7, 24)
+    sessions = tuple(as_of - timedelta(days=19 - index) for index in range(20))
+    symbols = ("600000.SH", "600001.SH", "600002.SH")
+    bars = []
+    for symbol in symbols:
+        for index, session in enumerate(sessions):
+            if symbol == "600001.SH" and index == 0:
+                continue
+            suspended = symbol == "600002.SH" and index == 0
+            bars.append({
+                "instrument_id": symbol,
+                "session_date": session.isoformat(),
+                "close": 10.0,
+                "suspended": suspended,
+                "is_st": False,
+                "amount": 0.0 if suspended else 21_000_000.0,
+            })
+    actions = [{
+        "instrument_id": symbol,
+        "action_type": "cash_dividend",
+        "cash_per_share": 1.0,
+        "ex_date": date(year, 6, 1).isoformat(),
+        "known_date": date(year, 5, 1).isoformat(),
+    } for symbol in symbols for year in range(2022, 2027)]
+
+    class StubMarket:
+        @staticmethod
+        def instruments(**kwargs):
+            return tuple(SimpleNamespace(instrument_id=item, name=item) for item in symbols)
+
+        @staticmethod
+        def trading_days(start, end):
+            return sessions
+
+        @staticmethod
+        def bars(*args, **kwargs):
+            return pd.DataFrame(bars)
+
+        @staticmethod
+        def corporate_actions(*args, **kwargs):
+            return pd.DataFrame(actions)
+
+    found = build_dividend_candidates(
+        StubMarket(),
+        as_of=as_of,
+        min_dividend_years=5,
+        min_avg_amount=20_000_000.0,
+    )
+
+    assert [item.instrument_id for item in found] == ["600000.SH"]
+    assert found[0].amount_observed_sessions == 20
+
+
 def test_recorded_week_and_config_skip_the_model_and_duplicate_email(tmp_path):
     adviser = FakeAdviser()
     dividend_policy = policy(tmp_path, adviser, force_review=False)
@@ -381,7 +439,22 @@ def test_responses_adapter_rechecks_schema_limits_locally(monkeypatch):
         open_fn=lambda request, *, timeout: FakeHTTPResponse(payload),
     )
 
-    with pytest.raises(ResponsesAPIError, match="invalid action or empty summary"):
+    with pytest.raises(ResponsesAPIError, match="invalid action or summary"):
+        adviser.review({"facts": []}, top_n=2)
+
+
+def test_responses_adapter_rejects_non_string_fields_after_relay_schema_claim(monkeypatch):
+    monkeypatch.setenv("FUNDLAB_LLM_API_KEY", "test-key")
+    payload = response_payload()
+    structured = json.loads(payload["output"][0]["content"][0]["text"])
+    structured["selection_rationale"][0]["rationale"] = 42
+    payload["output"][0]["content"][0]["text"] = json.dumps(structured)
+    adviser = ResponsesDividendValueAdviser(
+        AgentLLMSettings(base_url="https://relay.example/v1"),
+        open_fn=lambda request, *, timeout: FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(ResponsesAPIError, match="fields must be strings"):
         adviser.review({"facts": []}, top_n=2)
 
 
@@ -472,6 +545,50 @@ def test_forced_weekly_hold_records_memory_and_can_email_without_decision(
     ) is None
     entries = AgentMemory(tmp_path / "memory", "paper-dividend").entries()
     assert [item["event"] for item in entries] == ["review", "email"]
+
+
+def test_overwrite_hold_supersedes_old_future_decision_and_dry_run_does_not(
+    tmp_path, monkeypatch,
+):
+    ready_market(tmp_path / "market")
+    measured = candidates()
+    monkeypatch.setattr(policy_module, "build_dividend_candidates", lambda *args, **kwargs: measured)
+    settings, adviser = dividend_service_settings(tmp_path, action="hold")
+    prior = write_agent_decision(
+        settings.daily.agent_decision_root,
+        account_id="paper-dividend",
+        decision_date=FUTURE_DAYS[0],
+        target_weights={"600000.SH": "0.5"},
+        reason="prior future rebalance",
+        agent_id="prior-agent",
+    )
+    service = AgentDecisionService(settings, adviser_factory=lambda _: adviser)
+
+    cadence_skip = service.decide("paper-dividend", overwrite=True)
+    assert cadence_skip["existing_decision_retained"] is True
+    assert cadence_skip["skipped"] == "policy_hold"
+    assert adviser.calls == 0
+    assert load_agent_decision(
+        settings.daily.agent_decision_root, "paper-dividend", FUTURE_DAYS[0],
+    ).content_hash == prior.content_hash
+
+    preview = service.decide(
+        "paper-dividend", overwrite=True, dry_run=True, force_review=True,
+    )
+    assert preview["would_supersede_existing_decision"] is True
+    assert load_agent_decision(
+        settings.daily.agent_decision_root, "paper-dividend", FUTURE_DAYS[0],
+    ).content_hash == prior.content_hash
+
+    result = service.decide(
+        "paper-dividend", overwrite=True, force_review=True,
+    )
+    assert result["held"] is True
+    assert result["superseded_content_hash"] == prior.content_hash
+    assert Path(result["superseded_file"]).is_file()
+    assert load_agent_decision(
+        settings.daily.agent_decision_root, "paper-dividend", FUTURE_DAYS[0],
+    ) is None
 
 
 def test_committed_dividend_agent_config_is_gray_and_uses_confirmed_budget():

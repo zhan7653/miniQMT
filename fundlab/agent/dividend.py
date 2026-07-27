@@ -26,6 +26,7 @@ class DividendCandidate:
     avg_amount: float
     annual_dividends: tuple[tuple[int, float], ...]
     payout_variability: float
+    amount_observed_sessions: int = 20
 
     def evidence(self) -> dict[str, object]:
         """Bounded, JSON-ready facts supplied to the adviser and audit log."""
@@ -37,6 +38,7 @@ class DividendCandidate:
             "ttm_yield": round(self.ttm_yield, 8),
             "consecutive_dividend_years": self.dividend_years,
             "average_daily_amount_20_sessions": round(self.avg_amount, 2),
+            "average_daily_amount_observed_sessions": self.amount_observed_sessions,
             "annual_dividends_per_share": [
                 {"year": year, "amount": round(amount, 6)}
                 for year, amount in self.annual_dividends
@@ -77,6 +79,11 @@ def build_dividend_candidates(
     if not sessions or sessions[-1] != as_of:
         raise ValueError(f"{as_of.isoformat()} is not an open session in the snapshot calendar")
     window = sessions[-amount_window_sessions:]
+    if len(window) != amount_window_sessions:
+        raise ValueError(
+            f"Need {amount_window_sessions} open sessions through {as_of.isoformat()} "
+            "to compute the liquidity gate"
+        )
     bars = market.bars(
         symbols,
         window[0],
@@ -93,9 +100,24 @@ def build_dividend_candidates(
     closes = pd.to_numeric(latest["close"], errors="coerce")
     suspended = latest["suspended"].fillna(False).astype(bool)
     st_flags = latest["is_st"].fillna(False).astype(bool)
-    traded = bars[~bars["suspended"].fillna(False).astype(bool)].copy()
-    traded["amount"] = pd.to_numeric(traded["amount"], errors="coerce")
-    amounts = traded.dropna(subset=["amount"]).groupby("instrument_id")["amount"].mean()
+    liquidity = bars[["instrument_id", "session_date", "amount"]].copy()
+    liquidity["session_date"] = liquidity["session_date"].astype(str)
+    liquidity = liquidity[liquidity["session_date"].isin(
+        {item.isoformat() for item in window}
+    )]
+    liquidity["amount"] = pd.to_numeric(liquidity["amount"], errors="coerce")
+    measured = liquidity.groupby("instrument_id", sort=False).agg(
+        row_count=("session_date", "size"),
+        session_count=("session_date", "nunique"),
+        amount_count=("amount", "count"),
+        total_amount=("amount", "sum"),
+    )
+    complete = measured[
+        (measured["row_count"] == amount_window_sessions)
+        & (measured["session_count"] == amount_window_sessions)
+        & (measured["amount_count"] == amount_window_sessions)
+    ]
+    amounts = complete["total_amount"] / amount_window_sessions
 
     history_start = date(as_of.year - _HISTORY_YEARS, 1, 1)
     actions = market.corporate_actions(symbols, history_start, as_of, as_of=as_of)
@@ -162,5 +184,6 @@ def build_dividend_candidates(
             avg_amount=avg_amount,
             annual_dividends=tuple(sorted(streak_values[:6])),
             payout_variability=variability,
+            amount_observed_sessions=amount_window_sessions,
         ))
     return tuple(sorted(found, key=lambda item: (-item.ttm_yield, item.instrument_id)))
