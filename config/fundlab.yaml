@@ -28,12 +28,40 @@ daily:
       name: "Paper Agent (file decisions)"
       initial_cash: "1000000"
       strategy: agent-file
+    - account_id: paper-dividend
+      name: "Paper Dividend Value Agent"
+      initial_cash: "1000000"
+      strategy: agent-file
 
 agent:
-  # Deterministic baseline policy for each agent-file account. The daily
-  # scheduled task attempts `fundlab agent decide --all` before the daily run
-  # and again after a successful publication; a policy failure writes no file,
-  # which the contract treats as hold.
+  # OpenAI-compatible Responses endpoint. The API key is read only from the
+  # named environment variable; no secret belongs in this file.
+  llm:
+    base_url: https://way.696998.xyz/v1
+    model: gpt-5.6-sol
+    api_key_env: FUNDLAB_LLM_API_KEY
+    reasoning_effort: medium
+    max_output_tokens: 32768
+    timeout_seconds: 300
+    max_retries: 2
+    store: false
+  library:
+    root: ../data/agent/library
+    # Only explicitly listed .md/.txt files are sent to the trusted relay.
+    documents: []
+    max_document_chars: 40000
+    max_total_chars: 120000
+  memory:
+    root: ../data/agent/memory
+    recent_entries: 20
+    max_entry_chars: 20000
+    max_total_chars: 120000
+  notify:
+    # Set a recipient to enable best-effort SMTP opportunity/risk mail.
+    email_to:
+
+  # The daily task attempts scheduled policies before and after publication.
+  # A policy failure writes no decision file, which the kernel treats as hold.
   policies:
     paper-agent:
       type: momentum-rotation
@@ -47,6 +75,20 @@ agent:
       risk_off:
         510300.SH: "0.1"
         511010.SH: "0.9"
+    paper-dividend:
+      type: dividend-value
+      # Gray release: manual `--force-review --dry-run` first. Flip to true
+      # only after one real Responses call and its decision validation pass.
+      scheduled: false
+      charter: agents/dividend-value.yaml
+      top_n: 10
+      min_yield: "0.04"
+      min_dividend_years: 5
+      min_avg_amount: "20000000"
+      alert_min_yield: "0.06"
+      cash_reserve: "0.05"
+      candidate_pool_size: 50
+      rebalance_cooldown_days: 28
 
 execution:
   policy_id: cn-daily-conservative

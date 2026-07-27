@@ -169,6 +169,7 @@ def create_app(
                 account_id,
                 overwrite=bool(payload.get("overwrite")),
                 dry_run=bool(payload.get("dry_run")),
+                force_review=bool(payload.get("force_review")),
             )
         except DashboardError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

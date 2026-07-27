@@ -92,8 +92,9 @@ API 路由（全部 JSON）：
 | GET `/api/runs` / `/api/runs/{file}` | 每日报告列表（最多 60 条，按生成时间倒序）/ 单份报告原文 |
 | POST `/api/daily/run`、GET `/api/daily/run/status` | 手动触发一次每日运行 / 轮询状态与日志尾部 |
 | GET/PUT/DELETE `/api/schedule` | 查询 / 创建或改时间与启停 / 删除 `FundLab Daily` 计划任务 |
-| GET `/api/agent/accounts` | 列出 `agent-file` 策略账户（当前即 paper-agent） |
+| GET `/api/agent/accounts` | 列出 `agent-file` 策略账户（`paper-agent`、`paper-dividend`） |
 | GET/POST `/api/agent/decisions/{id}` | 决策历史（含无效文件的错误原因）/ 投递新决策 |
+| POST `/api/agent/decide/{id}` | 运行该账户配置的 Agent；支持 `dry_run`、`overwrite`、`force_review` |
 
 前端五个页签与上表一一对应；页签切换按需拉取，窗口重新聚焦（`visibilitychange`）自动刷新当前页签，自动刷新不折叠用户展开的运行详情、不重置净值图上用户拖出的缩放区间（仅切换账户时重置）。净值图为双轴折线（总权益 + 净值），超过 60 个点出现缩放滑条，颜色全部取自 CSS 变量。涨跌数字用 `signed()` 渲染：红涨绿跌（A 股习惯）、正数带 `+`、按展示精度归一化后约等于零的尾差保持中性色。
 

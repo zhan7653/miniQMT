@@ -923,11 +923,13 @@ async function runAgentDecide(dryRun) {
       body: JSON.stringify({
         dry_run: dryRun,
         overwrite: $("#agent-overwrite").checked,
+        force_review: $("#agent-force-review").checked,
       }),
     });
     const weights = Object.entries(result.target_weights || {})
       .map(([k, v]) => `${k} ${parseFloat((Number(v) * 100).toFixed(1))}%`).join(" · ");
     const alreadyPresent = result.skipped === "already_present";
+    const reviewedHold = result.held && result.review && result.review.review_completed;
     resultBox.classList.remove("hidden");
     resultBox.replaceChildren(
       el("div", { class: "row" }, [
@@ -940,16 +942,28 @@ async function runAgentDecide(dryRun) {
           ? el("span", { class: "badge ok", text: "已投递" })
           : alreadyPresent
             ? el("span", { class: "badge ok", text: "已存在" })
-            : el("span", { class: "badge muted", text: "未落盘(预演)" }),
+            : reviewedHold
+              ? el("span", { class: "badge muted", text: "评估后持有" })
+              : el("span", { class: "badge muted", text: "未落盘(预演)" }),
       ]),
       el("div", {
-        text: alreadyPresent ? "已有有效决策，未改写文件。" : `目标权重:${weights}`,
+        text: alreadyPresent
+          ? "已有有效决策，未改写文件。"
+          : weights ? `目标权重:${weights}` : "本次没有组合变更。",
       }),
       el("div", { class: "hint", text: result.reason || "" }),
+      el("div", {
+        class: "hint",
+        text: result.email
+          ? `邮件:${result.email.sent ? "已发送" : result.email.detail}`
+          : "",
+      }),
     );
     const outcome = result.written
       ? `已投递:${result.decision_date}.json`
-      : alreadyPresent ? "同日有效决策已存在，幂等跳过" : "预演完成,未写入文件";
+      : alreadyPresent
+        ? "同日有效决策已存在，幂等跳过"
+        : reviewedHold ? "周度评估完成，本次不调仓" : "预演完成,未写入文件";
     setMessage(message, "ok", outcome, { autoclear: result.written || alreadyPresent });
     if (result.written) await loadDecisions();
   } catch (error) {

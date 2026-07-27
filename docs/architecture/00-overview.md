@@ -14,9 +14,9 @@ FundLab 是一套**单用户、纯本地**的量化基础设施,当前目标刻�
 3. **持久的每日模拟账户**——模拟盘按真实交易日历逐日推进,状态永不重建;
 4. **可审计的反馈账本**——每次运行产出确定性的收益/回撤/成交/费用反馈。
 
-**不在范围内**:实盘交易与券商对接(2026-07-27 明确决定不做)、Agent 的学习行为。
-2026-07-27 起,`paper-agent` 账户由 [fundlab/agent](05-agent.md) 的确定性基线策略在每日计划任务中自动决策——
-Agent 的"插座"和第一个"插头"都有了,LLM 决策与学习仍是后续阶段。
+**不在范围内**:实盘交易与券商对接(2026-07-27 明确决定不做)、Agent 自主修改章程/参数的学习行为。
+`paper-agent` 继续运行确定性动量基线；`paper-dividend` 提供首个严格结构化的 LLM 红利价值 Agent，
+初始关闭计划调用，完成真实中转预演后再灰度启用。新闻输入与自主学习仍是后续阶段。
 
 ## 两条持久边界
 
@@ -81,7 +81,7 @@ miniQMT/
 │   ├── marketdata/           行情数据平台(观测/对账/快照/增量发布)→ 文档 01
 │   ├── trading/              交易内核、账户仓库、费用、反馈        → 文档 02
 │   ├── strategies/           IntentSource 协议 + 静态/文件决策实现  → 文档 02
-│   ├── agent/                决策 Agent(点时特征→策略→决策文件)   → 文档 05
+│   ├── agent/                决策 Agent(点时筛选→严格评估→决策文件) → 文档 05
 │   ├── pipeline/             每日管线编排                          → 文档 03
 │   └── web/                  FastAPI 控制台 + 无框架前端            → 文档 04
 ├── config/fundlab.yaml       全部运行配置(路径/执行/风控/费用/每日)
@@ -95,7 +95,10 @@ miniQMT/
     ├── warehouse/v2/         现役仓库:canonical 快照 + trading.sqlite3(6.4G)
     ├── reports/daily/        每日运行报告(运维报告,退出码依据)
     ├── reports/data_v2/canonical/  数据平台报告根目录
-    ├── agent/decisions/      外部 Agent 的 JSON 决策文件投递点
+    ├── agent/                决策、资料库与追加式记忆(运行期忽略)
+    │   ├── decisions/        外部 Agent 的 JSON 决策文件投递点
+    │   ├── library/          人工白名单资料(.md/.txt)
+    │   └── memory/           每账户 JSONL 评估/邮件记忆
     ├── archive/              一次性构建/验证报告压缩存档(2026-07 归档)
     └── (logs/                 每日运行日志,launcher 写入)
 ```
@@ -124,7 +127,7 @@ sequenceDiagram
 
 ```powershell
 uv sync --dev --frozen --inexact      # xtquant 在 uv.lock 之外,必须 --inexact
-uv run fundlab agent decide --all     # Agent 为下一交易日落决策文件(计划任务自动做)
+uv run fundlab agent decide --all     # 仅运行 scheduled=true 的 Agent 策略
 uv run fundlab daily run              # 一条命令:校验日历→扩展快照→推进账户(幂等)
 uv run fundlab daily status           # 快照头、账户头寸日、配置概览
 uv run fundlab web                    # localhost:8610 控制台
@@ -139,7 +142,7 @@ uv run pytest tests/canonical         # 全量测试
 | 项 | 值 |
 | --- | --- |
 | 已发布快照 | `snap-2a502eb188874c6ac7bbfb7f`(6,809 标的,14.9M 日线,数据至 2026-07-24) |
-| 模拟账户 | `paper-1`(静态 ETF 权重)、`paper-agent`(文件决策),头寸日 2026-07-24 |
+| 模拟账户 | `paper-1`、`paper-agent` 头寸日 2026-07-24；`paper-dividend` 已配置，下一轮 daily 创建并以现金起步 |
 | 数据源 | 9 个:tickflow、xtquant、baostock、eastmoney-efinance、eastmoney-fund-public、exchange-public、sina-calendar、sina-etf、cninfo-public |
 | 每日配置 | 双源 `[tickflow, xtquant]`,仲裁 `baostock`,收盘截止 19:00,日历前瞻 60 天 |
 | 测试 | `tests/canonical` 全量用例通过 |

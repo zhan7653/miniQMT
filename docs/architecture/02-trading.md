@@ -84,7 +84,7 @@ sequenceDiagram
 ## 对外接口
 
 - **CLI**(`fundlab/cli.py`):`fundlab account create/show` 管理账户;`fundlab simulate --account-id ... --weight INSTRUMENT=WEIGHT (--date | --start-date/--end-date)` 用 `StaticAllocationSource` 驱动共享内核,结束后打印 `build_simulation_feedback` 结果;`--allow-untrusted-fees` 才允许未验证费用表(仍会标记 incomplete)。
-- **每日管线**(`fundlab/pipeline/daily.py`):`_advance_accounts` 为配置的每个模拟账户构建 `SimulationService`,从账户头逐日 `run_daily` 推进到快照数据头(`published_end`);`_intent_source` 按账户策略选择 `StaticAllocationSource`(paper-1)或 `FileIntentSource`(paper-agent),后者从 `settings.daily.agent_decision_root` 读取决策文件。单账户异常不放大为管线崩溃,而是记为 `blocked` 并写入日报。
+- **每日管线**(`fundlab/pipeline/daily.py`):`_advance_accounts` 为配置的每个模拟账户构建 `SimulationService`,从账户头逐日 `run_daily` 推进到快照数据头(`published_end`);`_intent_source` 按账户策略选择 `StaticAllocationSource`(`paper-1`)或 `FileIntentSource`(`paper-agent`、`paper-dividend`),后者从 `settings.daily.agent_decision_root` 的账户子目录读取决策文件。单账户异常不放大为管线崩溃,而是记为 `blocked` 并写入日报。
 - **Web 控制台**(`fundlab/web/service.py`):只读消费 `TradingRepository` 与 `build_simulation_feedback` 展示账户头与运行反馈。
 - **外部 Agent**:不 import 任何代码,只在 `<decision_root>/<account_id>/<YYYY-MM-DD>.json` 落一个 JSON 文件即可参与当日决策。字段:`account_id`、`decision_date`(必须与路径一致)、`target_weights`(非空、非负、字符串数值)、`reason`(必填)、`agent_id`(可选,默认 `agent-file`)。语义:**无文件 = 持有**(一等结果,不是错误);**文件存在但无效 = 抛 `AgentDecisionError` 使运行失败**(沉默与损坏在证据里必须可区分);决策内容哈希被绑入 `FileIntentSource.config_hash`,进而进入 `RunBinding`——重放同一天换了决策内容会得到不同绑定,不可能悄悄执行另一份决策。
 

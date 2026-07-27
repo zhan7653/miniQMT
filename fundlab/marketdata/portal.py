@@ -125,14 +125,21 @@ class CanonicalMarketData:
                 f"Snapshot {snapshot_id} is only {self.manifest.plan.readiness.value}-ready"
             )
         self.snapshot_id = self.manifest.snapshot_id
-        self._instruments = warehouse.read_snapshot_table(snapshot_id, MarketTable.INSTRUMENTS)
+        # ``load_snapshot`` above is this handle's trust boundary. Reuse the
+        # verified manifest for later queries instead of re-hashing the whole
+        # warehouse on every Agent feature request.
+        self._instruments = warehouse.query_loaded_snapshot_table(
+            self.manifest, MarketTable.INSTRUMENTS,
+        )
         selected = {item.table for item in self.manifest.plan.selections}
         self._calendar = (
-            warehouse.read_snapshot_table(snapshot_id, MarketTable.CALENDAR)
+            warehouse.query_loaded_snapshot_table(self.manifest, MarketTable.CALENDAR)
             if MarketTable.CALENDAR in selected else pd.DataFrame()
         )
         self._actions = (
-            warehouse.read_snapshot_table(snapshot_id, MarketTable.CORPORATE_ACTIONS)
+            warehouse.query_loaded_snapshot_table(
+                self.manifest, MarketTable.CORPORATE_ACTIONS,
+            )
             if MarketTable.CORPORATE_ACTIONS in selected else pd.DataFrame()
         )
         self._instrument_records = {
@@ -223,8 +230,8 @@ class CanonicalMarketData:
             return pd.DataFrame()
         if price_mode is PriceMode.ADJUSTED:
             return self.adjusted_history(symbols, start_date, end_date, as_of=as_of)
-        return self.warehouse.query_snapshot_table(
-            self.snapshot_id,
+        return self.warehouse.query_loaded_snapshot_table(
+            self.manifest,
             MarketTable.DAILY_BARS,
             instrument_ids=symbols,
             start_date=start_date,
@@ -249,8 +256,8 @@ class CanonicalMarketData:
         symbols = tuple(sorted(set(instrument_ids)))
         if not symbols:
             return pd.DataFrame()
-        raw = self.warehouse.query_snapshot_table(
-            self.snapshot_id,
+        raw = self.warehouse.query_loaded_snapshot_table(
+            self.manifest,
             MarketTable.DAILY_BARS,
             instrument_ids=symbols,
             start_date=start_date,
@@ -262,14 +269,49 @@ class CanonicalMarketData:
             raise SnapshotNotReadyError(
                 f"Snapshot {self.snapshot_id} has no adjustment-factor coverage"
             )
-        factors = self.warehouse.query_snapshot_table(
-            self.snapshot_id,
+        factors = self.warehouse.query_loaded_snapshot_table(
+            self.manifest,
             MarketTable.ADJUSTMENT_FACTORS,
             instrument_ids=symbols,
             start_date=start_date,
             end_date=as_of,
         )
         return derive_ratio_adjusted_bars(raw, factors, as_of=as_of)
+
+    def corporate_actions(
+        self,
+        instrument_ids: Iterable[str],
+        start_date: date,
+        end_date: date,
+        *,
+        as_of: date,
+    ) -> pd.DataFrame:
+        """Return action history visible at the explicit point-in-time boundary.
+
+        Selection is by ``ex_date``. A row whose implementation announcement
+        (``known_date``) was later than ``as_of`` remains invisible even when
+        the current immutable snapshot already contains it.
+        """
+        if start_date > end_date:
+            raise ValueError("start_date must not exceed end_date")
+        if end_date > as_of:
+            raise ValueError("Market-data query exceeds its point-in-time as_of boundary")
+        symbols = tuple(sorted(set(instrument_ids)))
+        if not symbols:
+            return pd.DataFrame()
+        frame = self.warehouse.query_loaded_snapshot_table(
+            self.manifest,
+            MarketTable.CORPORATE_ACTIONS,
+            instrument_ids=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if frame.empty:
+            return frame
+        visible = frame["known_date"].astype(str) <= as_of.isoformat()
+        return frame[visible].sort_values(
+            ["ex_date", "instrument_id"], kind="stable",
+        ).reset_index(drop=True)
 
     def session(self, session_date: date) -> MarketSession:
         symbols = tuple(self._instrument_records)

@@ -89,7 +89,7 @@ flowchart TD
 `config/fundlab.yaml` 五段,一一映射到冻结 dataclass:
 
 - `paths` → `FoundationPaths`:`market_data`(`data/warehouse/v2/canonical`)、`trading_database`(`data/warehouse/v2/trading.sqlite3`)、`report_root`(`data/reports/data_v2/canonical`);
-- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, xtquant]`、`adjudicator: baostock`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 `paper-1`(510300.SH 0.6 / 511010.SH 0.4)与 `paper-agent`;
+- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, xtquant]`、`adjudicator: baostock`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 `paper-1`、`paper-agent` 与灰度中的 `paper-dividend`;
 - `execution` → `ExecutionPolicy`:参与率上限、滑点/冲击 bps、涨跌停阻断、部分成交;
 - `risk` → `RiskPolicy`:单仓权重上限、最低现金权重、允许资产类型;
 - `fees` → `FeeSchedule`:带生效区间与证据说明的分段费率规则,`trusted_for_simulation: true` 是模拟内核放行的显式声明(它是版本化的模拟假设,不是真实券商账户的声明)。
@@ -103,7 +103,8 @@ flowchart TD
   - `data/warehouse/v2/trading.sqlite3` — 账户与哈希链账本;
   - `data/reports/daily/` — 每轮 `daily-<日期>-<摘要10位>.json/.md` 双格式报告;
   - `data/reports/data_v2/canonical/` — 构建/对账/模拟等组件级不可变报告;
-  - `data/agent/decisions/` — `paper-agent` 的文件决策投递目录(按需创建);
+  - `data/agent/decisions/` — Agent 文件决策投递目录(按账户、按需创建);
+  - `data/agent/library/` / `memory/` — LLM Agent 的白名单资料与追加式本地记忆;
   - `data/archive/build-reports-2026-07.zip` — 历史构建报告归档;
   - `logs/daily/` — 计划任务运行日志(首次运行时创建)。
 

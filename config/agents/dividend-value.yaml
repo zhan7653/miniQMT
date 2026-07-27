@@ -1,0 +1,29 @@
+# 红利价值 Agent 的长期章程（“道”）。具体筛选阈值与调用参数属于“术”，
+# 位于 config/fundlab.yaml；术不得突破这里的硬边界。修改本文件必须递增
+# version，内容哈希会进入每次 LLM 评估与决策的审计证据。
+
+charter:
+  id: dividend-value
+  version: "1"
+  established: "2026-07-27"
+
+  philosophy: |
+    以持续现金分红为核心的价值型红利策略。
+    一、股息率是估值锚：同一家公司，股价越低股息率越高；买入高股息率
+       等于在相对低位买入，股息率回落则重新评估，不预测短期价格。
+    二、只与可靠的公司同行：分红应来自持续经营。连年分红、分红金额稳定
+       是当前数据能够验证的质量信号；一次性高分红和突击分红不作为依据。
+    三、避免风险优先于追逐收益：风险警示股、无流动性的股票、缺乏足够
+       分红历史的股票，无论表面股息率多高都不进入候选。
+    四、分散但不稀释：持有一篮子股票，限制单一持仓，并保留现金缓冲。
+    五、低换手：每周研究，但组合变更受冷却期约束；机会可以只提示不交易。
+
+  hard_rules:
+    asset_types: [stock]
+    exclude_st: true
+    min_dividend_years: 3
+    min_yield_floor: "0.02"
+    max_single_weight: "0.15"
+    min_cash_weight: "0.05"
+    max_positions: 20
+    min_positions: 5

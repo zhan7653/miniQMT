@@ -203,6 +203,12 @@ def test_schedule_lifecycle(dashboard):
 def test_agent_decide_endpoint_runs_the_configured_policy(dashboard):
     client, _, settings = dashboard
 
+    wrong_policy = client.post(
+        "/api/agent/decide/paper-agent", json={"force_review": True},
+    )
+    assert wrong_policy.status_code == 422
+    assert "force-review" in wrong_policy.json()["detail"]
+
     preview = client.post("/api/agent/decide/paper-agent", json={"dry_run": True})
     assert preview.status_code == 200, preview.text
     payload = preview.json()

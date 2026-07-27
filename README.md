@@ -98,17 +98,26 @@ file (wrong account, wrong date, negative weight, missing reason) fails the acco
 of degrading to a hold, and the decision content is bound into the run's strategy config hash so a
 replay cannot silently execute a different decision.
 
-A local deterministic producer for that contract ships in `fundlab.agent`: point-in-time features
-from the published snapshot drive a config-declared policy (`agent:` in `config/fundlab.yaml`,
-momentum rotation as the baseline). The scheduled task tries it before the daily cycle, then again
-after a successful publication to prepare the following session:
+A local producer for that contract ships in `fundlab.agent`. It contains the deterministic
+`momentum-rotation` baseline and the charter-bound, LLM-backed `dividend-value` paper Agent. The
+dividend Agent screens the canonical stock universe deterministically, sends only the bounded
+candidate/library/memory context to an OpenAI-compatible **Responses** endpoint, accepts a strict
+JSON Schema result, then re-validates every selected instrument and portfolio limit before the
+shared decision writer can publish anything. The scheduled task tries enabled policies before the
+daily cycle and again after a successful publication:
 
 ```powershell
 uv run fundlab agent decide --all        # or --account-id paper-agent [--dry-run]
+uv run fundlab agent decide --account-id paper-dividend --force-review --dry-run
 ```
 
-A policy that cannot decide writes nothing, which the contract treats as a hold. Live trading is
-explicitly out of scope. See `docs/architecture/05-agent.md` for the module contract.
+`paper-dividend` starts with `scheduled: false`; perform one real forced dry-run before enabling it.
+Its relay key comes only from `FUNDLAB_LLM_API_KEY`. Optional SMTP mail uses
+`FUNDLAB_SMTP_HOST`, `FUNDLAB_SMTP_PORT`, `FUNDLAB_SMTP_USER`, and
+`FUNDLAB_SMTP_PASSWORD`; no credential belongs in YAML. A weekly review may email a new validated
+opportunity without changing the portfolio. A policy or strict-response failure writes no decision
+and sends no mail, which the kernel treats as hold. News intake and autonomous strategy learning
+remain deferred; live trading is explicitly out of scope. See `docs/architecture/05-agent.md`.
 
 ## Trusted data canary
 

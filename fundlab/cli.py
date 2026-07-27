@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--promote-historical", action="store_true")
 
     agent = commands.add_parser(
-        "agent", help="Deterministic decision agent: features -> policy -> decision file",
+        "agent", help="Local decision agents: bounded research -> policy -> decision file",
     )
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     decide = agent_commands.add_parser(
@@ -244,6 +244,11 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--target-date", type=date.fromisoformat)
     decide.add_argument("--overwrite", action="store_true")
     decide.add_argument("--dry-run", action="store_true")
+    decide.add_argument(
+        "--force-review",
+        action="store_true",
+        help="Run a review-cadence policy now (single account only)",
+    )
     return parser
 
 
@@ -280,6 +285,8 @@ def _agent(args, settings: FoundationSettings) -> int:
     if args.all:
         if args.target_date is not None:
             raise ValueError("--target-date needs a single --account-id")
+        if args.force_review:
+            raise ValueError("--force-review needs a single --account-id")
         outcomes = service.decide_all(overwrite=args.overwrite, dry_run=args.dry_run)
     else:
         outcomes = [service.decide(
@@ -287,6 +294,7 @@ def _agent(args, settings: FoundationSettings) -> int:
             target_date=args.target_date,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            force_review=args.force_review,
         )]
     failed = [item for item in outcomes if item.get("error")]
     print(canonical_json({

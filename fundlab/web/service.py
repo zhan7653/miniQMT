@@ -476,7 +476,12 @@ class DashboardService:
         }
 
     def run_agent_decision(
-        self, account_id: str, *, overwrite: bool = False, dry_run: bool = False,
+        self,
+        account_id: str,
+        *,
+        overwrite: bool = False,
+        dry_run: bool = False,
+        force_review: bool = False,
     ) -> dict[str, Any]:
         """Run the configured deterministic policy for one agent-file account.
 
@@ -487,7 +492,10 @@ class DashboardService:
 
         try:
             return AgentDecisionService(self.settings).decide(
-                account_id, overwrite=overwrite, dry_run=dry_run,
+                account_id,
+                overwrite=overwrite,
+                dry_run=dry_run,
+                force_review=force_review,
             )
         except (AgentServiceError, AgentPolicyError, AgentDecisionError) as exc:
             raise DashboardError(str(exc)) from exc

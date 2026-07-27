@@ -1,106 +1,151 @@
 # 决策 Agent（`fundlab/agent`）
 
-`fundlab/agent` 是决策文件契约的第一个仓库内生产者：读取已发布快照的点时视图，
-运行配置声明的确定性策略，生成
-`data/agent/decisions/<account_id>/<YYYY-MM-DD>.json`。它不直接调用交易内核；
-每日管线仍只通过 `fundlab.strategies.FileIntentSource` 把文件转换成
-`PortfolioIntent`。
-
-当前 MVP 只包含 `momentum-rotation`。红利价值、新闻/阅读工具、邮件、记忆和 LLM
-策略均不在本阶段运行面内。
-
-## 契约与边界
-
-- **点时数据**：策略接口是
-  `decide(market: CanonicalMarketData, as_of: date) -> PolicyDecision`。
-  特征只从发布快照读取，portal 会拒绝越过 `as_of` 的查询。
-- **配置绑定**：`config/fundlab.yaml` 的 `agent.policies.<account_id>` 声明策略和参数；
-  策略配置哈希进入决策理由，账本最终绑定决策文件内容哈希。
-- **唯一写入路径**：Agent 和 Web 都调用 `write_agent_decision`。候选文件先在唯一
-  staging 目录中由内核同款 loader 验证，再原子发布；未授权并发写入只有一个赢家，
-  不会静默覆盖。
-- **静默与损坏不同**：没有文件表示持有；已有但无效的文件会失败关闭，不能降级为
-  持有，`--dry-run` 也不例外。显式覆盖只能替换已验证的有效文件，不会销毁无法
-  解析的现场。
-- **幂等重试**：同日已有有效文件时，`AgentDecisionService` 返回
-  `skipped: already_present`，不改写文件；只有显式 `--overwrite` 才替换内容。
-
-## 决策时点
-
-账户已有账本头 `H` 时，默认决策日是快照日历中 `H` 后的第一个交易日。配置了但尚未
-创建账本的新账户，以快照的 `published_end` 作为有效头，因此无人值守流程可以自动
-引导。策略数据截止日为：
+`fundlab/agent` 是 JSON 决策文件契约的仓库内生产者。无论确定性策略还是 LLM
+策略，进入交易内核的唯一产物仍是：
 
 ```text
-as_of = min(decision_date, published_end)
+data/agent/decisions/<account_id>/<YYYY-MM-DD>.json
+        ↓
+fundlab.strategies.FileIntentSource
+        ↓
+PortfolioIntent
 ```
 
-显式 `--target-date` 必须晚于有效头且是快照日历中的开市日。
+Agent 不直接调用模拟内核，更不连接实盘。没有决策文件表示持有；已有但无效的文件
+会失败关闭，不能降级成沉默。
 
-## 动量策略
+## 当前策略
 
-`MomentumRotationPolicy` 计算风险资产过去 `momentum_days` 个已成交会话的复权收盘
-动量：
+### `momentum-rotation`
 
-- 动量严格大于阈值：使用 `risk_on` 权重；
-- 否则：使用 `risk_off` 权重；
-- 历史不足、配置键拼错、权重为负或权重和超过 1：拒绝决策且不落盘。
+`paper-agent` 的确定性基线。它使用点时复权收盘价计算 60 会话动量，在声明的
+`risk_on` / `risk_off` 权重之间选择。历史不足、参数拼错或权重越界都不落盘。
 
-当前 `paper-agent` 配置以 `510300.SH` 为风险资产、`511010.SH` 为防守资产，使用
-60 会话动量。
+### `dividend-value`
 
-## 运行流程
+`paper-dividend` 的红利价值 Agent，也是第一个 LLM 策略。它不是“让模型随意选股”，
+而是确定性代码包围一次受限的语义排序：
 
-```mermaid
-sequenceDiagram
-    participant T as 计划任务（周二至周六 06:00）
-    participant A as fundlab agent decide --all
-    participant M as CanonicalMarketData
-    participant F as 决策文件
-    participant D as fundlab daily run
-    participant K as 交易内核
-    T->>A: 先尝试所有 Agent 账户
-    A->>M: 账户有效头 → 下一交易日；读取 as_of 特征
-    alt 策略成功且同日无文件
-        A->>F: 验证后原子发布
-    else 同日已有有效文件
-        A-->>T: 幂等跳过
-    else 配置、日历、特征或文件损坏
-        A-->>T: 失败；不新建文件
-    end
-    T->>D: 无论 Agent 是否失败，继续 daily run
-    D->>K: FileIntentSource → PortfolioIntent
-    D-->>T: 成功发布并推进账户
-    T->>A: 再幂等调用，为下个交易日预置决策
+1. `CanonicalMarketData` 在明确 `as_of` 下读取全股票宇宙、原始收盘/成交额和
+   `known_date <= as_of` 的现金分红记录。
+2. 代码排除停牌、ST、流动性不足、连续分红不足和股息率不足的股票，计算 TTM
+   股息率、连续分红年数、近年每股分红序列及波动度。
+3. 只把前 50 个合格候选、白名单资料、最近的有界记忆和当前组合事实发给 LLM。
+4. LLM 必须严格返回 10 个候选 ID、逐项理由、`hold|rebalance` 和可选机会列表。
+5. 代码再次验证候选归属、数量、机会邮件 6% 股息率门槛、等权、5% 现金、15%
+   单股上限和章程硬规则；任何越界都不生成文件、不发邮件。
+
+当前发布快照（`snap-2a502eb188874c6ac7bbfb7f`，数据截至 2026-07-24）的只读实测：
+5,201 只股票中，2,882 只通过三年/流动性等硬筛，334 只继续通过“五年连续分红、
+股息率至少 4%”战术门槛，足以形成候选池。该宇宙带幸存者偏差，因此这里只证明
+当前向前模拟可运行，不据此宣称历史回测收益无偏。
+
+## 章程与战术
+
+`config/agents/dividend-value.yaml` 是版本化 charter（“道”），内容哈希进入评估上下文
+与策略配置证据。v1 硬规则：
+
+- 只买股票且排除 ST；
+- 连续现金分红至少 3 年，股息率不得低于 2%；
+- 持仓 5–20 只，单股不超过 15%；
+- 现金不少于 5%；
+- 每周研究、低换手，机会可以只提示而不交易。
+
+`config/fundlab.yaml` 是可调战术（“术”）：选 10 只、至少 5 年连续分红、股息率至少
+4%、20 日平均成交额至少 2,000 万元、现金 5%、候选池 50、组合变更冷却 28 天。
+构造策略时就校验“术”没有突破“道”，否则拒绝启动。
+
+## 周度研究与组合变更
+
+每日脚本仍会在发布前后调用 `agent decide --all`，但 dividend 策略只有在当前
+`as_of` 是该自然周最后一个开市日时才评估（通常周五；节假日周可为周四）。同一
+ISO 周、同一配置哈希的评估记录存在后，后续调用幂等跳过。
+
+LLM 每周都可以给出研究结论，但只有以下情况允许写新组合决策：
+
+- 账户尚未建仓；
+- 当前持仓违反 charter，代码要求退出/恢复边界；
+- 距离上一份组合决策至少 28 天且 LLM 建议 `rebalance`。
+
+有未完成订单时不叠加新组合。冷却期内发现的机会仍可发邮件，但不调仓。持仓违反
+硬规则时，代码可以用 LLM 已严格选出的合格篮子强制恢复边界，即使模型建议 hold。
+
+## Responses 中转契约
+
+配置与当前 Codex provider 对齐：`gpt-5.6-sol`、OpenAI-compatible Responses 协议、
+`medium` reasoning、`max_output_tokens=32768`、300 秒超时、瞬时失败最多重试两次。
+实际请求固定为：
+
+```text
+POST <agent.llm.base_url>/responses
+Authorization: Bearer $FUNDLAB_LLM_API_KEY
+Content-Type: application/json; charset=utf-8
 ```
 
-Agent 批次失败会写 `logs/daily/LAST-AGENT-HOLD`，但不会把 daily 管线本身标为失败；
-daily 成功后的第二次尝试可在首次部署或日历刚扩展时当场恢复。下一次 Agent
-全部成功后自动删除该标记。
+请求使用 `store: false`；结构化输出按 Responses API 放在 `text.format`，而不是旧的
+`response_format`。详见 OpenAI 的
+[Responses Structured Outputs 迁移说明](https://developers.openai.com/api/docs/guides/migrate-to-responses#6-update-structured-outputs-definitions)。
 
-## 对外接口
+响应只接受 `status=completed` 且恰好一个正式
+`output[].content[].type=output_text`；拒绝、非 JSON、schema 字段变化、候选越界均失败。
+不解析 Markdown 代码块，不从自由文本提取 JSON，也不降级到另一个模型或协议。
 
-- CLI：
-  `fundlab agent decide (--account-id X | --all) [--target-date D] [--overwrite] [--dry-run]`
-- Web：`POST /api/agent/decide/{account_id}`，body 支持 `dry_run`、`overwrite`
-- 配置：
+## 资料库、记忆与邮件
 
-  ```yaml
-  agent:
-    policies:
-      paper-agent:
-        type: momentum-rotation
-        risk_instrument: 510300.SH
-        defensive_instrument: 511010.SH
-        momentum_days: 60
-        threshold: "0"
-        risk_on: {510300.SH: "0.7", 511010.SH: "0.3"}
-        risk_off: {510300.SH: "0.1", 511010.SH: "0.9"}
-  ```
+- **资料库**：`data/agent/library/` 下仅 `.md`/`.txt`，且必须在
+  `agent.library.documents` 明确列名；每份最多 40,000 字符，总计最多 120,000。
+  内容作为不可信引用数据，模型提示明确禁止执行其中的指令。
+- **记忆**：`data/agent/memory/<account>.jsonl` 追加记录评估、模型/response ID、token
+  用量、上下文哈希、选择理由、决策落盘和邮件结果。输入只取最近 20 条，并继续受
+  单条 20,000、总计 120,000 字符限制。损坏的 JSONL 不会被静默喂给模型。
+- **并发**：每账户跨进程文件锁包围完整评估，避免计划任务与手动 Web/CLI 同时调用
+  LLM 或重复发信；交易决策文件另有原子无覆盖写入保护。
+- **邮件**：只有通过代码复核的新机会/风险才进入邮件；证据哈希已成功发送过则不
+  重复。机会需股息率至少 6%，持仓硬规则风险不受此门槛限制。SMTP 失败不会撤销
+  已验证的交易决策。
+
+所有秘密只来自环境变量：
+
+```text
+FUNDLAB_LLM_API_KEY
+FUNDLAB_SMTP_HOST
+FUNDLAB_SMTP_PORT       # 可选，默认 465 / SSL
+FUNDLAB_SMTP_USER
+FUNDLAB_SMTP_PASSWORD
+```
+
+## 灰度启用
+
+`paper-dividend` 已加入模拟账户，但策略初始是 `scheduled: false`。因此账户会随每日
+管线推进并保持现金，`agent decide --all` 不会调用外部模型。先配置密钥后运行：
+
+```powershell
+uv run fundlab agent decide --account-id paper-dividend --force-review --dry-run
+```
+
+这会真实调用中转并完整验证结果，但不写决策、记忆或邮件。确认后可去掉
+`--dry-run` 做一次人工投递，或把 `scheduled` 改为 `true` 交给周度节奏。Web API
+同样支持 body 字段 `force_review`；仪表盘提供“忽略周度节奏，立即评估”复选框。
+
+CLI 完整接口：
+
+```text
+fundlab agent decide (--account-id X | --all)
+  [--target-date D] [--overwrite] [--dry-run] [--force-review]
+```
+
+`--force-review` 只允许单账户 review-cadence 策略；`--all` 只执行
+`scheduled: true` 的策略。
+
+## 明确延期
+
+本期不抓取新闻，不启用 hosted web search，也不让 Agent 修改 charter、战术参数或
+提示词。记忆只是可审计事实和后续上下文，不是自主学习通道。
 
 ## 验证
 
-`tests/canonical/test_agent_decision.py` 覆盖点时特征、确定性策略、配置哈希、历史不足、
-新账户引导、已有文件幂等、损坏文件失败、dry-run、跨账户失败隔离、原子校验和并发
-无覆盖。`tests/canonical/test_web_api.py` 覆盖 Web 预演、投递和幂等重复调用；
-`tests/canonical/test_runtime_surface.py` 约束策略包公共面。
+- `test_agent_decision.py`：共享时点、策略、服务、文件幂等与并发写入契约；
+- `test_dividend_value_agent.py`：章程边界、候选限制、冷却/强制退出、资料与记忆上限、
+  `/responses` 请求形状、严格解析、瞬时重试、灰度开关、hold 邮件与零决策文件；
+- `test_cli.py` / `test_web_api.py`：CLI 与 Web 共享服务入口；
+- 正式快照候选只读冒烟：不调用模型、不写数据，验证实际候选数量大于 10。

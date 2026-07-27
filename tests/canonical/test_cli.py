@@ -22,6 +22,13 @@ def test_cli_exposes_only_the_componentized_simulation_publication_flow():
     assert web.host == "127.0.0.1"
     assert web.port == 8610
 
+    forced_review = parser.parse_args([
+        "agent", "decide", "--account-id", "paper-dividend",
+        "--force-review", "--dry-run",
+    ])
+    assert forced_review.force_review is True
+    assert forced_review.dry_run is True
+
     with pytest.raises(SystemExit):
         parser.parse_args([
             "data", "build-snapshot",
