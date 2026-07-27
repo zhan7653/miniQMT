@@ -9,20 +9,25 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">FundLab <span>模拟盘控制台</span></div>
-  <div class="topbar-status" id="topbar-status">加载中…</div>
-  <button class="btn ghost" id="refresh-btn" title="刷新全部数据">刷新</button>
+  <div class="topbar-inner">
+    <div class="brand">FundLab <span>模拟盘控制台</span></div>
+    <div class="topbar-status" id="topbar-status">加载中…</div>
+    <button class="btn ghost" id="refresh-btn" title="刷新全部数据">刷新</button>
+  </div>
 </header>
 
 <nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="overview">总览</button>
-  <button class="tab" data-tab="accounts">账户</button>
-  <button class="tab" data-tab="runs">运行记录</button>
-  <button class="tab" data-tab="schedule">计划任务</button>
-  <button class="tab" data-tab="agent">Agent 决策</button>
+  <div class="tabs-inner">
+    <button class="tab active" data-tab="overview" aria-current="true">总览</button>
+    <button class="tab" data-tab="accounts">账户</button>
+    <button class="tab" data-tab="runs">运行记录</button>
+    <button class="tab" data-tab="schedule">计划任务</button>
+    <button class="tab" data-tab="agent">Agent 决策</button>
+  </div>
 </nav>
 
 <main>
+  <div id="global-error" class="error-banner hidden"></div>
   <section class="panel active" id="panel-overview">
     <div class="cards" id="overview-cards"></div>
     <h2>账户概览</h2>
@@ -33,9 +38,10 @@
 
   <section class="panel" id="panel-accounts">
     <div class="row">
-      <label>选择账户</label>
+      <label for="account-select">选择账户</label>
       <select id="account-select"></select>
     </div>
+    <div id="account-empty" class="empty hidden">config/fundlab.yaml 中尚未配置任何账户</div>
     <div id="account-detail">
       <div class="cards" id="account-metrics"></div>
       <h2>净值曲线</h2>
@@ -65,14 +71,14 @@
     <div class="boxed">
       <h2>设置每日自动运行</h2>
       <div class="row">
-        <label>运行时间（周一至周五）</label>
+        <label for="schedule-time">运行时间（周一至周五）</label>
         <input type="time" id="schedule-time" value="20:00">
         <button class="btn" id="schedule-save">保存计划任务</button>
         <button class="btn ghost" id="schedule-toggle"></button>
         <button class="btn danger" id="schedule-delete">删除任务</button>
       </div>
       <p class="hint">计划任务由 Windows 任务计划程序执行，本页面关闭后依然生效。要求运行时段
-        MiniQMT 客户端在线。</p>
+        MiniQMT 客户端在线。<span id="cutoff-hint"></span></p>
       <div id="schedule-message" class="message"></div>
     </div>
     <div class="boxed">
@@ -89,16 +95,16 @@
 
   <section class="panel" id="panel-agent">
     <div class="row">
-      <label>Agent 账户</label>
+      <label for="agent-account-select">Agent 账户</label>
       <select id="agent-account-select"></select>
     </div>
     <div class="grid-2col">
-      <div class="boxed">
+      <div class="boxed" id="decision-form">
         <h2>投递新决策</h2>
-        <div class="row"><label>决策日期</label><input type="date" id="decision-date"></div>
+        <div class="row"><label for="decision-date">决策日期</label><input type="date" id="decision-date"></div>
         <div id="weight-rows"></div>
         <button class="btn ghost small" id="add-weight">+ 添加标的</button>
-        <div class="row"><label>决策理由</label></div>
+        <div class="row"><label for="decision-reason">决策理由</label></div>
         <textarea id="decision-reason" rows="3" placeholder="为什么要这个配置（必填，写入审计账本）"></textarea>
         <div class="row">
           <label><input type="checkbox" id="decision-overwrite"> 覆盖同日已有决策</label>
