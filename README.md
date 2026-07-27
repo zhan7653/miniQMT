@@ -229,6 +229,10 @@ The checked-in fee schedule is a versioned simulation assumption: public taxes p
 commission with a CNY 5 minimum. It is trusted for reproducible simulation but does not claim to match
 a real broker account. Live or broker-parity work must bind a separately verified account schedule.
 
+Architecture documentation (Chinese) lives under [docs/architecture/](docs/architecture/00-overview.md):
+an overview plus per-module deep dives for marketdata, trading/strategies, the daily pipeline/CLI/ops,
+and the web console.
+
 See [docs/foundation.md](docs/foundation.md) for contracts, timing, realism boundaries, migration state,
 and operating commands. Runtime consumers use only `fundlab.marketdata`, `fundlab.trading`,
 `fundlab.strategies`, and the `fundlab.pipeline` orchestrator. The pre-v2 legacy warehouses and their
