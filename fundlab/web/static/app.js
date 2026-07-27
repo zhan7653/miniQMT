@@ -840,11 +840,13 @@ async function loadAgentTab() {
   if (current && accounts.some((item) => item.account_id === current)) select.value = current;
   if (!accounts.length) {
     $("#decision-form").classList.add("hidden");
+    $("#auto-decision").classList.add("hidden");
     $("#decisions-table").replaceChildren(
       el("div", { class: "empty", text: "config/fundlab.yaml 中没有 agent-file 策略的账户" }));
     return;
   }
   $("#decision-form").classList.remove("hidden");
+  $("#auto-decision").classList.remove("hidden");
   const head = accounts.find((item) => item.account_id === select.value);
   const defaultDate = nextDay(head && head.head_date);
   if (!$("#decision-date").value) $("#decision-date").value = defaultDate;
@@ -906,6 +908,60 @@ $("#add-weight").addEventListener("click", (event) => {
 });
 
 $("#agent-account-select").addEventListener("change", () => loadDecisions().then(clearError).catch(showError));
+
+async function runAgentDecide(dryRun) {
+  const message = $("#agent-decide-message");
+  const resultBox = $("#agent-decide-result");
+  const accountId = $("#agent-account-select").value;
+  if (!accountId) return;
+  $("#agent-preview").disabled = true;
+  $("#agent-decide").disabled = true;
+  setMessage(message, "", dryRun ? "预演中…" : "决策中…");
+  try {
+    const result = await api(`/api/agent/decide/${encodeURIComponent(accountId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        dry_run: dryRun,
+        overwrite: $("#agent-overwrite").checked,
+      }),
+    });
+    const weights = Object.entries(result.target_weights || {})
+      .map(([k, v]) => `${k} ${parseFloat((Number(v) * 100).toFixed(1))}%`).join(" · ");
+    const alreadyPresent = result.skipped === "already_present";
+    resultBox.classList.remove("hidden");
+    resultBox.replaceChildren(
+      el("div", { class: "row" }, [
+        el("strong", { text: `决策日 ${result.decision_date}` }),
+        el("span", {
+          class: "badge",
+          text: result.existing_agent_id || (result.policy ? result.policy.agent_id : "—"),
+        }),
+        result.written
+          ? el("span", { class: "badge ok", text: "已投递" })
+          : alreadyPresent
+            ? el("span", { class: "badge ok", text: "已存在" })
+            : el("span", { class: "badge muted", text: "未落盘(预演)" }),
+      ]),
+      el("div", {
+        text: alreadyPresent ? "已有有效决策，未改写文件。" : `目标权重:${weights}`,
+      }),
+      el("div", { class: "hint", text: result.reason || "" }),
+    );
+    const outcome = result.written
+      ? `已投递:${result.decision_date}.json`
+      : alreadyPresent ? "同日有效决策已存在，幂等跳过" : "预演完成,未写入文件";
+    setMessage(message, "ok", outcome, { autoclear: result.written || alreadyPresent });
+    if (result.written) await loadDecisions();
+  } catch (error) {
+    setMessage(message, "bad", `失败:${error.message}`);
+  } finally {
+    $("#agent-preview").disabled = false;
+    $("#agent-decide").disabled = false;
+  }
+}
+
+$("#agent-preview").addEventListener("click", () => runAgentDecide(true));
+$("#agent-decide").addEventListener("click", () => runAgentDecide(false));
 
 $("#decision-submit").addEventListener("click", async () => {
   const message = $("#decision-message");

@@ -230,6 +230,20 @@ def build_parser() -> argparse.ArgumentParser:
     clock.add_argument("--start-date", type=date.fromisoformat)
     simulate.add_argument("--end-date", type=date.fromisoformat)
     simulate.add_argument("--promote-historical", action="store_true")
+
+    agent = commands.add_parser(
+        "agent", help="Deterministic decision agent: features -> policy -> decision file",
+    )
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    decide = agent_commands.add_parser(
+        "decide", help="Compute the next decision for agent-file accounts and drop the file",
+    )
+    decide_scope = decide.add_mutually_exclusive_group(required=True)
+    decide_scope.add_argument("--account-id")
+    decide_scope.add_argument("--all", action="store_true")
+    decide.add_argument("--target-date", type=date.fromisoformat)
+    decide.add_argument("--overwrite", action="store_true")
+    decide.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -247,12 +261,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _daily(args, settings)
         if args.command == "web":
             return _web(args, settings)
+        if args.command == "agent":
+            return _agent(args, settings)
         raise AssertionError(args.command)
     except Exception as exc:
         print(canonical_json({
             "status": "error", "error_type": type(exc).__name__, "error": str(exc),
         }), file=sys.stderr)
         return 2
+
+
+def _agent(args, settings: FoundationSettings) -> int:
+    from fundlab.agent import AgentDecisionService
+
+    service = AgentDecisionService(settings)
+    if args.agent_command != "decide":
+        raise AssertionError(args.agent_command)
+    if args.all:
+        if args.target_date is not None:
+            raise ValueError("--target-date needs a single --account-id")
+        outcomes = service.decide_all(overwrite=args.overwrite, dry_run=args.dry_run)
+    else:
+        outcomes = [service.decide(
+            args.account_id,
+            target_date=args.target_date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )]
+    failed = [item for item in outcomes if item.get("error")]
+    print(canonical_json({
+        "status": "ok" if not failed else "error",
+        "decisions": outcomes,
+    }))
+    return 0 if not failed else 2
 
 
 def _data(args, settings: FoundationSettings) -> int:

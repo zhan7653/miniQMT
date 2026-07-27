@@ -2,7 +2,8 @@
 
 > 本组文档描述仓库在 2026-07-27 清理后的现状。分模块细节见:
 > [01-行情数据平台](01-marketdata.md) · [02-交易内核与策略](02-trading.md) ·
-> [03-每日管线、CLI 与运维](03-pipeline-ops.md) · [04-Web 控制台](04-web.md)
+> [03-每日管线、CLI 与运维](03-pipeline-ops.md) · [04-Web 控制台](04-web.md) ·
+> [05-决策 Agent](05-agent.md)
 
 ## 这个系统是什么
 
@@ -13,7 +14,9 @@ FundLab 是一套**单用户、纯本地**的量化基础设施,当前目标刻�
 3. **持久的每日模拟账户**——模拟盘按真实交易日历逐日推进,状态永不重建;
 4. **可审计的反馈账本**——每次运行产出确定性的收益/回撤/成交/费用反馈。
 
-**不在范围内**:Agent 的学习行为、实盘交易、券商对接。系统是"未来交易 Agent 的地基",不是 Agent 本身。
+**不在范围内**:实盘交易与券商对接(2026-07-27 明确决定不做)、Agent 的学习行为。
+2026-07-27 起,`paper-agent` 账户由 [fundlab/agent](05-agent.md) 的确定性基线策略在每日计划任务中自动决策——
+Agent 的"插座"和第一个"插头"都有了,LLM 决策与学习仍是后续阶段。
 
 ## 两条持久边界
 
@@ -78,6 +81,7 @@ miniQMT/
 │   ├── marketdata/           行情数据平台(观测/对账/快照/增量发布)→ 文档 01
 │   ├── trading/              交易内核、账户仓库、费用、反馈        → 文档 02
 │   ├── strategies/           IntentSource 协议 + 静态/文件决策实现  → 文档 02
+│   ├── agent/                决策 Agent(点时特征→策略→决策文件)   → 文档 05
 │   ├── pipeline/             每日管线编排                          → 文档 03
 │   └── web/                  FastAPI 控制台 + 无框架前端            → 文档 04
 ├── config/fundlab.yaml       全部运行配置(路径/执行/风控/费用/每日)
@@ -120,10 +124,11 @@ sequenceDiagram
 
 ```powershell
 uv sync --dev --frozen --inexact      # xtquant 在 uv.lock 之外,必须 --inexact
+uv run fundlab agent decide --all     # Agent 为下一交易日落决策文件(计划任务自动做)
 uv run fundlab daily run              # 一条命令:校验日历→扩展快照→推进账户(幂等)
 uv run fundlab daily status           # 快照头、账户头寸日、配置概览
 uv run fundlab web                    # localhost:8600 控制台
-pwsh -File scripts/register-daily-task.ps1   # 注册工作日 20:00 计划任务
+pwsh -File scripts/register-daily-task.ps1   # 注册周二至周六 06:00 计划任务(先决策后运行)
 uv run pytest tests/canonical         # 全量测试
 ```
 
@@ -137,7 +142,7 @@ uv run pytest tests/canonical         # 全量测试
 | 模拟账户 | `paper-1`(静态 ETF 权重)、`paper-agent`(文件决策),头寸日 2026-07-24 |
 | 数据源 | 9 个:tickflow、xtquant、baostock、eastmoney-efinance、eastmoney-fund-public、exchange-public、sina-calendar、sina-etf、cninfo-public |
 | 每日配置 | 双源 `[tickflow, xtquant]`,仲裁 `baostock`,收盘截止 19:00,日历前瞻 60 天 |
-| 测试 | tests/canonical 178 个用例全部通过 |
+| 测试 | `tests/canonical` 全量用例通过 |
 
 **2026-07-27 清理记录**:v1 遗留仓库(sqlite/parquet)及其 audit/import 通道、tencent 因子源、一次性构建/验证报告(已压缩至 `data/archive/build-reports-2026-07.zip`)、旧工具痕迹(.codex 等)已全部移除;Web 控制台完成一轮视觉与交互改版。详见 git 历史与 [foundation.md](../foundation.md) 的退役备注。
 

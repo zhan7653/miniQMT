@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, time
 from decimal import Decimal
 
@@ -7,11 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fundlab.pipeline import DailyPipeline
-from fundlab.settings import DailyAccountSettings
+from fundlab.settings import AgentPolicySettings, AgentSettings, DailyAccountSettings
 from fundlab.web.app import create_app
 from fundlab.web.runner import DailyRunLauncher
 from fundlab.web.schedule import ScheduledTaskState, TaskSchedulerError
-from tests.canonical.fixtures import DAYS, ready_market
+from tests.canonical.fixtures import DAYS, FUTURE_DAYS, ready_market
 from tests.canonical.test_daily_pipeline import (
     build_settings,
     evening_of,
@@ -36,7 +37,7 @@ class FakeScheduler:
         self._guard()
         self.state = ScheduledTaskState(
             exists=True, enabled=True, state="Ready", time=time_str,
-            days=("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"),
+            days=("Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"),
         )
         return self.state
 
@@ -103,6 +104,16 @@ def dashboard(tmp_path):
         ),
         DailyAccountSettings("paper-agent", "Agent", Decimal("100000"), "agent-file"),
     ))
+    settings = replace(settings, agent=AgentSettings(policies={
+        "paper-agent": AgentPolicySettings("paper-agent", "momentum-rotation", {
+            "risk_instrument": "600000.SH",
+            "defensive_instrument": "600000.SH",
+            "momentum_days": 2,
+            "threshold": "0",
+            "risk_on": {"600000.SH": "0.6"},
+            "risk_off": {"600000.SH": "0.1"},
+        }),
+    }))
     pipeline = DailyPipeline(
         settings,
         registry=registry_with_calendars(),
@@ -189,6 +200,37 @@ def test_schedule_lifecycle(dashboard):
     assert client.put("/api/schedule", json={"time": "20:00"}).status_code == 502
 
 
+def test_agent_decide_endpoint_runs_the_configured_policy(dashboard):
+    client, _, settings = dashboard
+
+    preview = client.post("/api/agent/decide/paper-agent", json={"dry_run": True})
+    assert preview.status_code == 200, preview.text
+    payload = preview.json()
+    assert payload["written"] is False
+    assert payload["decision_date"] == FUTURE_DAYS[0].isoformat()
+    assert payload["as_of"] == DAYS[-1].isoformat()
+    decision_path = (
+        settings.daily.agent_decision_root / "paper-agent"
+        / f"{FUTURE_DAYS[0].isoformat()}.json"
+    )
+    assert not decision_path.exists()
+
+    written = client.post("/api/agent/decide/paper-agent", json={})
+    assert written.status_code == 200, written.text
+    assert written.json()["written"] is True
+    assert decision_path.is_file()
+    listed = client.get("/api/agent/decisions/paper-agent").json()
+    assert listed[0]["decision_date"] == FUTURE_DAYS[0].isoformat() and listed[0]["valid"]
+
+    duplicate = client.post("/api/agent/decide/paper-agent", json={})
+    assert duplicate.status_code == 200
+    assert duplicate.json()["written"] is False
+    assert duplicate.json()["skipped"] == "already_present"
+
+    not_agent = client.post("/api/agent/decide/paper-1", json={})
+    assert not_agent.status_code == 422
+
+
 def test_agent_decision_submission_validates_and_lists(dashboard):
     client, _, settings = dashboard
 
@@ -251,6 +293,17 @@ def test_agent_decision_submission_validates_and_lists(dashboard):
     }).status_code == 422
 
     assert client.get("/api/agent/decisions/paper-1").status_code == 404
+
+    decision_path.write_text("{}", encoding="utf-8")
+    corrupt_overwrite = client.post("/api/agent/decisions/paper-agent", json={
+        "decision_date": future,
+        "target_weights": {"600000.SH": "0.5"},
+        "reason": "must not erase corrupt evidence",
+        "overwrite": True,
+    })
+    assert corrupt_overwrite.status_code == 422
+    assert "损坏" in corrupt_overwrite.json()["detail"]
+    assert decision_path.read_text(encoding="utf-8") == "{}"
 
 
 def test_manual_run_subprocess_succeeds_offline(dashboard, tmp_path):

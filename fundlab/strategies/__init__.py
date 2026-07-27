@@ -10,6 +10,7 @@ from fundlab.strategies.agent_file import (
     AgentDecisionError,
     FileIntentSource,
     load_agent_decision,
+    write_agent_decision,
 )
 from fundlab.strategies.static import StaticAllocationSource
 
@@ -19,4 +20,5 @@ __all__ = [
     "FileIntentSource",
     "StaticAllocationSource",
     "load_agent_decision",
+    "write_agent_decision",
 ]

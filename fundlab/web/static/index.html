@@ -71,8 +71,8 @@
     <div class="boxed">
       <h2>设置每日自动运行</h2>
       <div class="row">
-        <label for="schedule-time">运行时间（周一至周五）</label>
-        <input type="time" id="schedule-time" value="20:00">
+        <label for="schedule-time">运行时间（周二至周六）</label>
+        <input type="time" id="schedule-time" value="06:00">
         <button class="btn" id="schedule-save">保存计划任务</button>
         <button class="btn ghost" id="schedule-toggle"></button>
         <button class="btn danger" id="schedule-delete">删除任务</button>
@@ -97,6 +97,18 @@
     <div class="row">
       <label for="agent-account-select">Agent 账户</label>
       <select id="agent-account-select"></select>
+    </div>
+    <div class="boxed" id="auto-decision">
+      <h2>策略自动决策</h2>
+      <p class="hint">运行 config/fundlab.yaml 里为该账户配置的确定性策略(与每日计划任务
+        执行的 <code>fundlab agent decide</code> 相同),生成下一交易日的决策文件。</p>
+      <div class="row">
+        <button class="btn ghost" id="agent-preview">预演(不落盘)</button>
+        <button class="btn" id="agent-decide">生成并投递</button>
+        <label><input type="checkbox" id="agent-overwrite"> 覆盖同日已有决策</label>
+      </div>
+      <div id="agent-decide-result" class="boxed hidden"></div>
+      <div id="agent-decide-message" class="message"></div>
     </div>
     <div class="grid-2col">
       <div class="boxed" id="decision-form">

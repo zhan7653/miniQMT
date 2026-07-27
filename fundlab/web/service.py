@@ -9,7 +9,6 @@ go through the exact validation the account run will apply later.
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -19,7 +18,7 @@ from typing import Any, Mapping
 
 from fundlab.marketdata import MarketDataWarehouse
 from fundlab.settings import DailyAccountSettings, FoundationSettings
-from fundlab.strategies import AgentDecisionError, load_agent_decision
+from fundlab.strategies import AgentDecisionError, load_agent_decision, write_agent_decision
 from fundlab.trading import TradingRepository, build_simulation_feedback
 from fundlab.trading.repository import RunRecord
 
@@ -444,36 +443,51 @@ class DashboardService:
         except KeyError:
             pass
 
-        root = Path(self.settings.daily.agent_decision_root) / account_id
-        path = root / f"{parsed_date.isoformat()}.json"
-        if path.exists() and not overwrite:
-            raise DashboardError(f"该日期已有决策文件，勾选覆盖后重试: {path.name}")
-        payload = {
-            "account_id": account_id,
-            "decision_date": parsed_date.isoformat(),
-            "target_weights": weights,
-            "reason": str(reason).strip(),
-            "agent_id": str(agent_id).strip() or "dashboard",
-        }
-        root.mkdir(parents=True, exist_ok=True)
-        # Write-then-rename so a concurrently starting daily run can never read
-        # a half-written decision file.
-        staging = path.with_suffix(".json.tmp")
-        staging.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n",
+        path = (
+            Path(self.settings.daily.agent_decision_root)
+            / account_id / f"{parsed_date.isoformat()}.json"
         )
-        os.replace(staging, path)
+        if path.exists():
+            try:
+                load_agent_decision(
+                    self.settings.daily.agent_decision_root, account_id, parsed_date,
+                )
+            except AgentDecisionError as exc:
+                raise DashboardError(f"已有决策文件损坏，请先检查处理: {exc}") from exc
+            if not overwrite:
+                raise DashboardError(f"该日期已有决策文件，勾选覆盖后重试: {path.name}")
         try:
-            decision = load_agent_decision(
-                self.settings.daily.agent_decision_root, account_id, parsed_date,
+            decision = write_agent_decision(
+                self.settings.daily.agent_decision_root,
+                account_id=account_id,
+                decision_date=parsed_date,
+                target_weights=weights,
+                reason=reason,
+                agent_id=str(agent_id).strip() or "dashboard",
+                overwrite=overwrite,
             )
         except AgentDecisionError as exc:
-            path.unlink(missing_ok=True)
             raise DashboardError(f"决策文件校验失败: {exc}") from exc
-        assert decision is not None
         return {
             "account_id": account_id,
             "decision_date": parsed_date.isoformat(),
             "file": path.name,
             "content_hash": decision.content_hash,
         }
+
+    def run_agent_decision(
+        self, account_id: str, *, overwrite: bool = False, dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Run the configured deterministic policy for one agent-file account.
+
+        Same mechanism the scheduled task uses (`fundlab agent decide`); the
+        dashboard only offers a button for it.
+        """
+        from fundlab.agent import AgentDecisionService, AgentPolicyError, AgentServiceError
+
+        try:
+            return AgentDecisionService(self.settings).decide(
+                account_id, overwrite=overwrite, dry_run=dry_run,
+            )
+        except (AgentServiceError, AgentPolicyError, AgentDecisionError) as exc:
+            raise DashboardError(str(exc)) from exc

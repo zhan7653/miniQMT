@@ -29,6 +29,7 @@ def test_strategies_package_exposes_only_intent_sources():
         "FileIntentSource",
         "StaticAllocationSource",
         "load_agent_decision",
+        "write_agent_decision",
     }
     from fundlab.trading import IntentSource
 

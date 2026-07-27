@@ -44,7 +44,8 @@ gate blocked the run — the reason is in the console JSON and in the ops report
 `data/reports/daily/`. Re-running after a block resumes from the durable observation warehouse;
 nothing partial is ever published.
 
-Schedule it on weekdays at 20:00 with catch-up and retries:
+Schedule it Tuesday-Saturday at 06:00, after the previous trading day's upstream data has settled,
+with catch-up and retries:
 
 ```powershell
 pwsh -File scripts/register-daily-task.ps1
@@ -96,6 +97,18 @@ No file means hold current positions — silence is a first-class outcome. A pre
 file (wrong account, wrong date, negative weight, missing reason) fails the account's run instead
 of degrading to a hold, and the decision content is bound into the run's strategy config hash so a
 replay cannot silently execute a different decision.
+
+A local deterministic producer for that contract ships in `fundlab.agent`: point-in-time features
+from the published snapshot drive a config-declared policy (`agent:` in `config/fundlab.yaml`,
+momentum rotation as the baseline). The scheduled task tries it before the daily cycle, then again
+after a successful publication to prepare the following session:
+
+```powershell
+uv run fundlab agent decide --all        # or --account-id paper-agent [--dry-run]
+```
+
+A policy that cannot decide writes nothing, which the contract treats as a hold. Live trading is
+explicitly out of scope. See `docs/architecture/05-agent.md` for the module contract.
 
 ## Trusted data canary
 

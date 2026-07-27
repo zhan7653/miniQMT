@@ -29,11 +29,11 @@
 
 ## 关键流程
 
-### 每晚 20:00 的一轮 daily run
+### 次日早晨 06:00 的一轮 daily run
 
 ```mermaid
 flowchart TD
-    T["Windows 计划任务 FundLab Daily<br/>工作日 20:00 (+错过补跑, 失败 30 分钟×3 重试)"] --> R["run-daily.ps1<br/>uv run fundlab daily run → logs/daily/run-*.log"]
+    T["Windows 计划任务 FundLab Daily<br/>周二至周六 06:00 (+错过补跑, 失败 30 分钟×3 重试)"] --> R["run-daily.ps1<br/>agent decide → daily run → agent decide → 日志"]
     R --> L{"文件锁<br/>daily-run.lock"}
     L -- 已被占用 --> B0["lock: blocked → 退出码 2"]
     L --> CAL["resolve/calendar:<br/>baostock + sina-calendar 双源日历<br/>开市日集合逐条完全一致, 否则阻断"]
@@ -56,7 +56,7 @@ flowchart TD
 ### 幂等性与被阻断后的恢复
 
 - 全程幂等:源观测捕获走 `capture_resumable`(同范围已完整则复用);已验证的日历观测按输入观测 ID 精确匹配复用(`_matching_validated_calendar`);目标日不超过已发布数据头时直接 `up_to_date`;账户按 run 链头推进,重复运行不会重放会话。
-- 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。最常见的阻断原因是 MiniQMT 客户端(xtquant 数据源)不在线——这是每晚运行的**前置条件**。`run-daily.ps1` 失败时会在 `logs/daily/LAST-RUN-BLOCKED` 落一个标记文件(内容为时间戳),下次成功自动删除;人工排查从 `data/reports/daily/` 里对应 `daily-*.md` 的阶段明细入手。
+- 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。最常见的阻断原因是 MiniQMT 客户端(xtquant 数据源)不在线——这是每次计划运行的**前置条件**。`run-daily.ps1` 失败时会在 `logs/daily/LAST-RUN-BLOCKED` 落一个标记文件(内容为时间戳),下次成功自动删除;人工排查从 `data/reports/daily/` 里对应 `daily-*.md` 的阶段明细入手。
 
 ## 对外接口
 
@@ -96,8 +96,8 @@ flowchart TD
 
 ### 运维脚本与数据目录
 
-- `scripts/register-daily-task.ps1`:注册计划任务 "FundLab Daily"——工作日 20:00(`-Time` 可改),`StartWhenAvailable` 错过补跑,失败 30 分钟间隔重试 3 次(幂等所以安全),4 小时执行上限,`IgnoreNew` 拒绝并发实例;卸载用 `Unregister-ScheduledTask -TaskName "FundLab Daily" -Confirm:$false`。
-- `scripts/run-daily.ps1`:切到仓库根,执行 `uv run fundlab daily run`,全部输出追加到 `logs/daily/run-<时间戳>.log`,按退出码维护 `LAST-RUN-BLOCKED` 标记,并原样透传退出码给计划任务(触发其重试逻辑)。
+- `scripts/register-daily-task.ps1`:注册计划任务 "FundLab Daily"——周二至周六 06:00(`-Time` 可改),在上游数据稳定后处理前一交易日;`StartWhenAvailable` 错过补跑,失败 30 分钟间隔重试 3 次(幂等所以安全),4 小时执行上限,`IgnoreNew` 拒绝并发实例;卸载用 `Unregister-ScheduledTask -TaskName "FundLab Daily" -Confirm:$false`。
+- `scripts/run-daily.ps1`:切到仓库根,在 daily 前尝试 `uv run fundlab agent decide --all`,daily 成功发布后再幂等补一次(用新账本头和新日历为下个交易日预置决策);任一最终决策失败仅记 `LAST-AGENT-HOLD` 标记,契约上等于持有,详见[05-决策 Agent](05-agent.md)。全部输出追加到 `logs/daily/run-<时间戳>.log`;管线失败时维护 `LAST-RUN-BLOCKED` 标记,退出码原样透传给计划任务(触发其重试逻辑)。
 - 数据目录布局:
   - `data/warehouse/v2/canonical/{observations,components,snapshots,builds,current.json}` — 观测仓库、组件、快照与当前发布指针;
   - `data/warehouse/v2/trading.sqlite3` — 账户与哈希链账本;

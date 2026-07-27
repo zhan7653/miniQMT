@@ -53,12 +53,34 @@ class DailySettings:
 
 
 @dataclass(frozen=True)
+class AgentPolicySettings:
+    """One account's declared decision policy: a kind plus opaque params.
+
+    Parsing stays dumb on purpose — policy construction and validation live in
+    ``fundlab.agent.policy.build_policy`` so a config typo fails there, loudly,
+    instead of being half-interpreted here.
+    """
+
+    account_id: str
+    kind: str
+    params: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class AgentSettings:
+    """Per-account deterministic policies for ``agent-file`` accounts."""
+
+    policies: Mapping[str, AgentPolicySettings] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class FoundationSettings:
     paths: FoundationPaths
     execution_policy: ExecutionPolicy
     risk_policy: RiskPolicy
     fee_schedule: FeeSchedule
     daily: DailySettings
+    agent: AgentSettings = field(default_factory=AgentSettings)
 
 
 def load_foundation_settings(path: str | Path = "config/fundlab.yaml") -> FoundationSettings:
@@ -102,7 +124,27 @@ def load_foundation_settings(path: str | Path = "config/fundlab.yaml") -> Founda
         str(raw_fees.get("verification_note", "")),
     )
     daily = _daily_settings(payload.get("daily"), base)
-    return FoundationSettings(paths, execution, risk, fee_schedule, daily)
+    agent = _agent_settings(payload.get("agent"))
+    return FoundationSettings(paths, execution, risk, fee_schedule, daily, agent)
+
+
+def _agent_settings(raw: Any) -> AgentSettings:
+    raw = raw if isinstance(raw, dict) else {}
+    policies_raw = raw.get("policies")
+    policies: dict[str, AgentPolicySettings] = {}
+    if policies_raw is not None:
+        if not isinstance(policies_raw, dict):
+            raise ValueError("agent.policies must be a mapping of account_id -> policy")
+        for account_id, item in policies_raw.items():
+            if not isinstance(item, dict) or "type" not in item:
+                raise ValueError(f"agent.policies.{account_id} needs a mapping with a `type`")
+            params = {key: value for key, value in item.items() if key != "type"}
+            policies[str(account_id)] = AgentPolicySettings(
+                account_id=str(account_id),
+                kind=str(item["type"]),
+                params=params,
+            )
+    return AgentSettings(policies=policies)
 
 
 def _daily_settings(raw: Any, base: Path) -> DailySettings:

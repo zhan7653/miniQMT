@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -104,6 +107,78 @@ def load_agent_decision(
         agent_id=str(payload.get("agent_id", "agent-file")).strip() or "agent-file",
         source_path=str(path),
     )
+
+
+def write_agent_decision(
+    decision_root: str | Path,
+    *,
+    account_id: str,
+    decision_date: date,
+    target_weights: Mapping[str, object],
+    reason: str,
+    agent_id: str,
+    overwrite: bool = False,
+) -> AgentDecision:
+    """Atomically drop one decision file and prove the kernel can consume it.
+
+    This is the single write path for the decision-file contract (the dashboard
+    and the local agent both go through it).  Validation happens **before**
+    publication: the payload is staged under a private staging root, re-loaded
+    through ``load_agent_decision`` — the exact loader the account run uses —
+    and only then atomically published into the real path. A failed validation
+    therefore never destroys an existing valid decision and never leaves an
+    invalid file visible to a concurrently starting daily run, not even for an
+    instant.
+    """
+    base = Path(decision_root)
+    path = base / account_id / f"{decision_date.isoformat()}.json"
+    if path.exists():
+        # Even explicit replacement may not erase evidence we cannot parse.
+        # The operator must inspect and repair/remove a corrupt file first.
+        load_agent_decision(base, account_id, decision_date)
+        if not overwrite:
+            raise AgentDecisionError(f"Decision file already exists (need overwrite): {path}")
+    payload = {
+        "account_id": account_id,
+        "decision_date": decision_date.isoformat(),
+        "target_weights": {str(k): str(v) for k, v in target_weights.items()},
+        "reason": str(reason).strip(),
+        "agent_id": str(agent_id).strip() or "agent-file",
+    }
+    staging_parent = base / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix="decision-", dir=staging_parent))
+    staged = staging_root / account_id / path.name
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        staged.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n",
+        )
+        # Prove the kernel would accept it while it is still invisible.
+        load_agent_decision(staging_root, account_id, decision_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite:
+            os.replace(staged, path)
+        else:
+            try:
+                # A same-volume hard link publishes the fully validated inode
+                # atomically and, unlike replace(), can never clobber a winner
+                # that appeared after the optimistic path.exists() check.
+                os.link(staged, path)
+            except FileExistsError as exc:
+                raise AgentDecisionError(
+                    f"Decision file already exists (need overwrite): {path}"
+                ) from exc
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            staging_parent.rmdir()
+        except OSError:
+            pass
+    decision = load_agent_decision(base, account_id, decision_date)
+    if decision is None:  # pragma: no cover - only a concurrent delete could cause this
+        raise AgentDecisionError(f"Decision file vanished after write: {path}")
+    return decision
 
 
 @dataclass(frozen=True)

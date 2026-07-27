@@ -29,6 +29,25 @@ daily:
       initial_cash: "1000000"
       strategy: agent-file
 
+agent:
+  # Deterministic baseline policy for each agent-file account. The daily
+  # scheduled task attempts `fundlab agent decide --all` before the daily run
+  # and again after a successful publication; a policy failure writes no file,
+  # which the contract treats as hold.
+  policies:
+    paper-agent:
+      type: momentum-rotation
+      risk_instrument: 510300.SH
+      defensive_instrument: 511010.SH
+      momentum_days: 60
+      threshold: "0"
+      risk_on:
+        510300.SH: "0.7"
+        511010.SH: "0.3"
+      risk_off:
+        510300.SH: "0.1"
+        511010.SH: "0.9"
+
 execution:
   policy_id: cn-daily-conservative
   version: "2026-07-18"

@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+import fundlab.cli as cli_module
+from fundlab.agent import build_policy
 from fundlab.cli import build_parser, main
 from fundlab.settings import load_foundation_settings
 from tests.canonical.fixtures import DAYS, ready_market
@@ -55,6 +57,12 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
         Path(__file__).resolve().parents[2] / "config" / "fundlab.yaml"
     )
     schedule = settings.fee_schedule
+    agent = settings.agent.policies["paper-agent"]
+    policy = build_policy(agent.kind, agent.params)
+
+    assert policy.policy_id == "momentum-rotation"
+    assert policy.risk_instrument == "510300.SH"
+    assert policy.defensive_instrument == "511010.SH"
 
     before_2022 = schedule.calculate(
         day=date(2022, 4, 28), asset_type="stock", exchange="SH",
@@ -135,3 +143,24 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
     assert main(simulate_args) == 0
     repeated = json.loads(capsys.readouterr().out)
     assert repeated["reused"] is True and repeated["report"] == payload["report"]
+
+
+def test_agent_cli_runs_the_configured_policy_in_dry_run(
+    tmp_path, capsys, monkeypatch,
+):
+    from tests.canonical.test_agent_decision import agent_settings
+
+    ready_market(tmp_path / "market", close_values=(10.0, 11.0, 12.0, 13.0))
+    settings = agent_settings(tmp_path)
+    monkeypatch.setattr(cli_module, "load_foundation_settings", lambda _: settings)
+
+    code = main([
+        "--config", "ignored.yaml", "agent", "decide",
+        "--account-id", "paper-agent", "--dry-run",
+    ])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["decisions"][0]["written"] is False
+    assert payload["decisions"][0]["target_weights"] == {"600000.SH": "0.6"}

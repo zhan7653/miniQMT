@@ -162,6 +162,17 @@ def create_app(
         except DashboardError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/api/agent/decide/{account_id}")
+    def run_agent_decision(account_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        try:
+            return service.run_agent_decision(
+                account_id,
+                overwrite=bool(payload.get("overwrite")),
+                dry_run=bool(payload.get("dry_run")),
+            )
+        except DashboardError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     # ------------------------------------------------------------- static
 
     app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
