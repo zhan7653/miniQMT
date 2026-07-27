@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     web = commands.add_parser("web", help="Serve the local dashboard (accounts, runs, schedule, agent decisions)")
     web.add_argument("--host", default="127.0.0.1")
-    web.add_argument("--port", type=int, default=8600)
+    web.add_argument("--port", type=int, default=8610)
     web.add_argument("--no-browser", action="store_true")
 
     daily = commands.add_parser("daily", help="Automated daily cycle: extend the snapshot, advance paper accounts")

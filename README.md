@@ -66,7 +66,7 @@ real T+1 prices.
 uv run fundlab web
 ```
 
-Starts a localhost dashboard (default `http://127.0.0.1:8600`, change with `--port`) with five
+Starts a localhost dashboard (default `http://127.0.0.1:8610`, change with `--port`) with five
 views: overview, per-account equity curve / positions / orders / ledger events, daily run reports
 with stage-level detail, Windows scheduled-task management plus a manual "run now" trigger with
 live log tail, and agent decision submission with the same validation the account run applies.

@@ -2,7 +2,7 @@
 
 ## 职责与边界
 
-`fundlab/web` 是单用户本地量化基础设施的浏览器控制台，由 `fundlab web` 命令启动（默认 `127.0.0.1:8600`，启动后自动打开浏览器）。它默认只绑定 localhost、**没有任何鉴权**——这是 `app.py` 模块 docstring 里明文声明的边界：控制台是单人本机工具，不为暴露到网络设计。
+`fundlab/web` 是单用户本地量化基础设施的浏览器控制台，由 `fundlab web` 命令启动（默认 `127.0.0.1:8610`，启动后自动打开浏览器）。它默认只绑定 localhost、**没有任何鉴权**——这是 `app.py` 模块 docstring 里明文声明的边界：控制台是单人本机工具，不为暴露到网络设计。
 
 核心设计边界是"**只管理 CLI 已拥有的东西**"。控制台不引入任何新的数据通道或写入路径，可变操作被严格限定为三类，且每一类都复用已有机制：
 
@@ -81,7 +81,7 @@ flowchart LR
 
 ## 对外接口
 
-启动：`fundlab web [--host 127.0.0.1] [--port 8600] [--no-browser]`（pyproject 注册的 CLI；`cli.py` 的 `_web` 用 uvicorn 起服务并延时打开浏览器）。程序化使用：`from fundlab.web import create_app`，传入 `FoundationSettings`，测试可注入假的 `scheduler`/`launcher`。
+启动：`fundlab web [--host 127.0.0.1] [--port 8610] [--no-browser]`（pyproject 注册的 CLI；`cli.py` 的 `_web` 用 uvicorn 起服务并延时打开浏览器）。程序化使用：`from fundlab.web import create_app`，传入 `FoundationSettings`，测试可注入假的 `scheduler`/`launcher`。
 
 API 路由（全部 JSON）：
 

@@ -82,7 +82,7 @@ flowchart TD
 - `simulate` — 以静态组合意图直接驱动共享交易内核(`--date` 单日 / `--start-date --end-date` 历史区间,`--promote-historical` 可晋升历史链);费率表未标记 `trusted_for_simulation` 时拒绝运行,除非 `--allow-untrusted-fees`;
 - `daily run` — 上述整轮循环(`--target-date/--skip-data/--skip-accounts`);
 - `daily status` — 打印快照头、各账户 head、决策目录与截止时间等配置;
-- `web` — 启动本地控制台(默认 `127.0.0.1:8600`,自动开浏览器,`--no-browser` 关闭)。Web 端触发的 daily run 与计划任务共享同一把文件锁。
+- `web` — 启动本地控制台(默认 `127.0.0.1:8610`,自动开浏览器,`--no-browser` 关闭)。Web 端触发的 daily run 与计划任务共享同一把文件锁。
 
 ### 配置结构(`FoundationSettings`)
 

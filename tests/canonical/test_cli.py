@@ -18,6 +18,10 @@ from tests.canonical.fixtures import DAYS, ready_market
 def test_cli_exposes_only_the_componentized_simulation_publication_flow():
     parser = build_parser()
 
+    web = parser.parse_args(["web", "--no-browser"])
+    assert web.host == "127.0.0.1"
+    assert web.port == 8610
+
     with pytest.raises(SystemExit):
         parser.parse_args([
             "data", "build-snapshot",
