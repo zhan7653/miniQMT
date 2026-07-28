@@ -113,6 +113,66 @@ def test_exchange_provider_pins_exact_current_sh_sz_stock_etf_membership():
     }
 
 
+def test_exchange_provider_excludes_announced_future_etfs_from_as_of_membership():
+    class Client(_ExchangeClient):
+        def fund_etf_list_sse(self):
+            return pd.concat((
+                super().fund_etf_list_sse(),
+                pd.DataFrame([{
+                    "fundCode": "588530",
+                    "secNameFull": "科创创业人工智能ETF中银证券",
+                    "fundAbbr": "AIBOCI",
+                    "listingDate": "20260715",
+                    "subClass": "31",
+                }]),
+            ), ignore_index=True)
+
+        def fund_etf_scale_szse(self):
+            return pd.concat((
+                super().fund_etf_scale_szse(),
+                pd.DataFrame([{
+                    "基金代码": "159999",
+                    "基金简称": "明日ETF",
+                    "上市日期": "2026-07-15",
+                    "基金类别": "ETF",
+                    "投资类别": "跨市场",
+                }]),
+            ), ignore_index=True)
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    instruments = observed.tables[MarketTable.INSTRUMENTS]
+    assert "588530.SH" not in set(instruments["instrument_id"])
+    assert "159999.SZ" not in set(instruments["instrument_id"])
+    assert observed.source_metadata["endpoint_counts"][
+        "sse-current-full-etf-list"
+    ] == 2
+    assert observed.source_metadata["endpoint_response_counts"][
+        "sse-current-full-etf-list"
+    ] == 3
+    assert observed.source_metadata["as_of_excluded_future_instrument_ids"] == {
+        "sse-current-full-etf-list": ("588530.SH",),
+        "szse-current-etf-list": ("159999.SZ",),
+    }
+
+
+def test_exchange_provider_rejects_invalid_official_etf_listing_dates():
+    class Client(_ExchangeClient):
+        def fund_etf_list_sse(self):
+            frame = super().fund_etf_list_sse()
+            frame.loc[frame["fundCode"].eq("510300"), "listingDate"] = "unknown"
+            return frame
+
+    with pytest.raises(Exception, match="invalid listing dates"):
+        ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={"as_of_date": "2026-07-14"},
+        ))
+
+
 def test_exchange_provider_rejects_membership_without_required_szse_classification():
     class Client(_ExchangeClient):
         def fund_etf_scale_szse(self):

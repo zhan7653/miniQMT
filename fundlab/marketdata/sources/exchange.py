@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from importlib import import_module, util
 import json
@@ -60,6 +60,8 @@ class ExchangePublicUniverseProvider:
         rows: list[dict[str, Any]] = []
         hashes: dict[str, str] = {}
         endpoint_counts: dict[str, int] = {}
+        endpoint_response_counts: dict[str, int] = {}
+        future_exclusions: dict[str, tuple[str, ...]] = {}
         if "stock" in assets and "SH" in exchanges:
             for endpoint, board, symbol in (
                 ("sse-main-stock-list", "main", "主板A股"),
@@ -67,6 +69,7 @@ class ExchangePublicUniverseProvider:
             ):
                 frame = _call(endpoint, lambda symbol=symbol: client.stock_info_sh_name_code(symbol=symbol))
                 hashes[endpoint] = frame_hash(frame)
+                endpoint_response_counts[endpoint] = len(frame)
                 endpoint_counts[endpoint] = len(frame)
                 for item in frame.to_dict("records"):
                     rows.append(_row(
@@ -85,6 +88,7 @@ class ExchangePublicUniverseProvider:
             endpoint = "szse-a-stock-list"
             frame = _call(endpoint, lambda: client.stock_info_sz_name_code(symbol="A股列表"))
             hashes[endpoint] = frame_hash(frame)
+            endpoint_response_counts[endpoint] = len(frame)
             endpoint_counts[endpoint] = len(frame)
             for item in frame.to_dict("records"):
                 panel = str(item.get("板块") or "")
@@ -113,6 +117,18 @@ class ExchangePublicUniverseProvider:
             )
             hashes[scale_endpoint] = frame_hash(scale)
             hashes[list_endpoint] = frame_hash(full)
+            endpoint_response_counts[scale_endpoint] = len(scale)
+            endpoint_response_counts[list_endpoint] = len(full)
+            full, excluded = _listed_as_of(
+                full,
+                date_column="listingDate",
+                code_column="fundCode",
+                exchange="SH",
+                as_of=as_of,
+                endpoint=list_endpoint,
+            )
+            if excluded:
+                future_exclusions[list_endpoint] = excluded
             endpoint_counts[scale_endpoint] = len(scale)
             endpoint_counts[list_endpoint] = len(full)
             scale_ids = set(scale["基金代码"].astype(str).str.zfill(6))
@@ -154,6 +170,18 @@ class ExchangePublicUniverseProvider:
             )
             hashes[daily_endpoint] = frame_hash(daily)
             hashes[detail_endpoint] = frame_hash(detail)
+            endpoint_response_counts[daily_endpoint] = len(daily)
+            endpoint_response_counts[detail_endpoint] = len(detail)
+            detail, excluded = _listed_as_of(
+                detail,
+                date_column="上市日期",
+                code_column="基金代码",
+                exchange="SZ",
+                as_of=as_of,
+                endpoint=detail_endpoint,
+            )
+            if excluded:
+                future_exclusions[detail_endpoint] = excluded
             endpoint_counts[daily_endpoint] = len(daily)
             endpoint_counts[detail_endpoint] = len(detail)
             detail_by_code = {
@@ -219,6 +247,8 @@ class ExchangePublicUniverseProvider:
                 "as_of_date": as_of,
                 "response_sha256": hashes,
                 "endpoint_counts": endpoint_counts,
+                "endpoint_response_counts": endpoint_response_counts,
+                "as_of_excluded_future_instrument_ids": future_exclusions,
                 "requested_scope": {"exchanges": exchanges, "asset_types": assets},
             },
         )
@@ -233,6 +263,58 @@ def _call(name: str, function: Callable[[], Any]) -> pd.DataFrame:
     if frame.empty:
         raise ObservationError(f"Exchange endpoint returned no rows: {name}")
     return frame
+
+
+def _listed_as_of(
+    frame: pd.DataFrame,
+    *,
+    date_column: str,
+    code_column: str,
+    exchange: str,
+    as_of: date,
+    endpoint: str,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    """Select an official current list at one exact date, preserving future audit ids."""
+
+    listed_dates: list[date] = []
+    invalid: list[str] = []
+    for row in frame.to_dict("records"):
+        code = str(row.get(code_column)).split(".", 1)[0].zfill(6)
+        try:
+            listed_dates.append(_required_exchange_date(row.get(date_column)))
+        except (TypeError, ValueError):
+            invalid.append(code)
+    if invalid:
+        raise ObservationError(
+            f"Exchange endpoint has invalid listing dates ({endpoint}): "
+            f"instrument_ids={tuple(f'{item}.{exchange}' for item in invalid[:20])}"
+        )
+    mask = pd.Series(
+        (listed <= as_of for listed in listed_dates),
+        index=frame.index,
+        dtype="boolean",
+    )
+    excluded = tuple(sorted(
+        f"{str(code).split('.', 1)[0].zfill(6)}.{exchange}"
+        for code in frame.loc[~mask, code_column]
+    ))
+    return frame.loc[mask].reset_index(drop=True), excluded
+
+
+def _required_exchange_date(value: Any) -> date:
+    if value is None or pd.isna(value):
+        raise ValueError("missing exchange date")
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if len(raw) >= 10 and raw[4] in {"-", "/"}:
+        return date.fromisoformat(raw[:10].replace("/", "-"))
+    compact = raw[:8]
+    if len(compact) == 8 and compact.isdigit():
+        return date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))
+    raise ValueError(f"invalid exchange date: {value!r}")
 
 
 def _fetch_sse_fund_list() -> pd.DataFrame:
