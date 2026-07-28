@@ -2233,10 +2233,10 @@ def _active_no_trade_instruments(
     safe_placeholder = (
         explicit
         & prices.notna().all(axis=1)
-        & prices.max(axis=1).sub(prices.min(axis=1)).abs().le(1e-12)
+        & prices.eq(prices["open"], axis="index").all(axis=1)
         & volume.notna()
-        & volume.abs().le(1e-9)
-        & (amount.isna() | amount.abs().le(1e-9))
+        & volume.eq(0)
+        & (amount.isna() | amount.eq(0))
     )
     return set(map(str, relevant.loc[~safe_placeholder, "instrument_id"]))
 

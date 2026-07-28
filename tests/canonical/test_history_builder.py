@@ -852,6 +852,7 @@ def test_history_builder_aligns_explicit_suspension_with_flat_zero_turnover_bar(
 
 def test_no_trade_check_accepts_explicit_flat_zero_turnover_placeholder():
     frame = _bars("baostock", ("600000.SH",)).iloc[:1].copy()
+    frame = frame.astype({"volume": "float64", "amount": "float64"})
     frame.loc[:, ["open", "high", "low", "close"]] = 10.0
     frame.loc[:, "volume"] = 0.0
     frame.loc[:, "amount"] = float("nan")
@@ -869,13 +870,17 @@ def test_no_trade_check_accepts_explicit_flat_zero_turnover_placeholder():
     ("field", "value"),
     (
         ("high", 10.1),
+        ("high", 10.0 + 1e-13),
         ("volume", 1.0),
+        ("volume", 1e-10),
         ("amount", 1.0),
+        ("amount", 1e-10),
         ("suspended", False),
     ),
 )
 def test_no_trade_check_rejects_active_or_ambiguous_rows(field, value):
     frame = _bars("baostock", ("600000.SH",)).iloc[:1].copy()
+    frame = frame.astype({"volume": "float64", "amount": "float64"})
     frame.loc[:, ["open", "high", "low", "close"]] = 10.0
     frame.loc[:, "volume"] = 0.0
     frame.loc[:, "amount"] = float("nan")
