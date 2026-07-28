@@ -27,6 +27,7 @@ from fundlab.marketdata import (
     CoverageClaim,
     EvidenceCollectionSpec,
     MarketDataWarehouse,
+    MarketDataError,
     MarketIngestionService,
     MarketTable,
     ObservationPayload,
@@ -46,7 +47,11 @@ from fundlab.marketdata import (
     derive_current_research_snapshot,
     record_no_trade_research_partition,
 )
-from fundlab.marketdata.history import HistoryBuildSpec, HistoryDatabaseBuilder
+from fundlab.marketdata.history import (
+    HistoryBuildSpec,
+    HistoryDatabaseBuilder,
+    find_no_trade_research_partition,
+)
 from fundlab.marketdata.simulation_data import reconcile_simulation_status
 from fundlab.settings import DailyAccountSettings, FoundationSettings
 from fundlab.strategies import FileIntentSource, StaticAllocationSource
@@ -61,6 +66,7 @@ from fundlab.trading import (
 PIPELINE_VERSION = "daily-pipeline-v1"
 CALENDAR_PROVIDERS = ("baostock", "sina-calendar")
 NO_TRADE_PROVIDERS = ("tickflow", "xtquant", "baostock")
+DIRECT_LIMIT_PROVIDERS = ("xtquant", "eastmoney-efinance")
 
 
 class DailyRunInProgress(RuntimeError):
@@ -564,6 +570,42 @@ class DailyPipeline:
             for provider, result in status_results.items()
         }))
 
+        direct_limit_results = {
+            provider: self._collect_direct_limit_observations(
+                provider=provider,
+                target=target,
+                instrument_ids=target_ids,
+            )
+            for provider in DIRECT_LIMIT_PROVIDERS
+        }
+        empty_limit_providers = tuple(
+            provider for provider, result in direct_limit_results.items()
+            if not result["observation_ids"]
+        )
+        if empty_limit_providers:
+            raise DailyPipelineBlocked(
+                "limits",
+                "direct price-limit collection produced no usable observations",
+                {
+                    "providers": empty_limit_providers,
+                    "details": {
+                        provider: direct_limit_results[provider]
+                        for provider in empty_limit_providers
+                    },
+                },
+            )
+        stages.append(DailyStage("limits", "ok", {
+            provider: {
+                "observations": len(result["observation_ids"]),
+                "observation_ids": result["observation_ids"],
+                "covered_instruments": result["covered_instruments"],
+                "unresolved_instruments": len(result["unresolved_instrument_ids"]),
+                "unresolved_sample": result["unresolved_instrument_ids"][:20],
+                "request_errors": result["request_errors"][-5:],
+            }
+            for provider, result in direct_limit_results.items()
+        }))
+
         evidence_results = {}
         for kind in ("stock-actions", "etf-actions", "factors"):
             result = SimulationEvidenceCollector(
@@ -599,17 +641,28 @@ class DailyPipeline:
             build_partition_ids=build_partition_ids,
             no_trade_observation_id=no_trade_observation_id,
             universe_observation_id=universe_obs,
+            direct_limit_observation_ids=tuple(sorted({
+                observation_id
+                for result in direct_limit_results.values()
+                for observation_id in result["observation_ids"]
+            })),
         )
         stages.append(DailyStage("candidate", "ok", {"observation_id": candidate_id}))
 
-        validated = SimulationIncrementValidator(
-            self.warehouse, self.report_root,
-        ).validate_and_record(
-            candidate_observation_id=candidate_id,
-            calendar_observation_id=calendar_observation_id,
-            universe_scope=increment_scope,
-            description=f"daily pipeline EOD increment through {target.isoformat()}",
-        )
+        try:
+            validated = SimulationIncrementValidator(
+                self.warehouse, self.report_root,
+            ).validate_and_record(
+                candidate_observation_id=candidate_id,
+                calendar_observation_id=calendar_observation_id,
+                universe_scope=increment_scope,
+                description=f"daily pipeline EOD increment through {target.isoformat()}",
+            )
+        except MarketDataError as exc:
+            raise DailyPipelineBlocked("validate", str(exc), {
+                "error_type": type(exc).__name__,
+                "candidate_observation_id": candidate_id,
+            }) from exc
         stages.append(DailyStage("validate", "ok", {
             "observation_id": validated.observation_id,
         }))
@@ -685,6 +738,121 @@ class DailyPipeline:
             for claim in latest.coverage
         )
         return not complete or latest.observed_at.date() < target
+
+    def _collect_direct_limit_observations(
+        self,
+        *,
+        provider: str,
+        target: date,
+        instrument_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Accumulate immutable per-instrument direct limit successes across retries."""
+
+        requested = tuple(sorted(set(map(str, instrument_ids))))
+        requested_set = set(requested)
+        selected: dict[str, Any] = {}
+
+        def absorb(manifest) -> None:
+            request = manifest.request
+            if (
+                manifest.provider != provider
+                or request.capability is not ProviderCapability.DAILY_STATUS
+                or request.start_date != target
+                or request.end_date != target
+                or not request.parameters.get("instrument_limit_snapshot")
+                or not request.instrument_ids
+                or not set(request.instrument_ids) <= requested_set
+            ):
+                return
+            hashes = manifest.source_metadata.get("response_sha256")
+            errors = manifest.source_metadata.get("request_errors")
+            if not isinstance(hashes, Mapping):
+                return
+            error_ids = set(errors) if isinstance(errors, Mapping) else set()
+            try:
+                frame = self.warehouse.read_observation_table(
+                    manifest.observation_id, MarketTable.DAILY_BARS,
+                )
+            except Exception:
+                return
+            if frame.empty or "instrument_id" not in frame:
+                return
+            frame = frame.loc[
+                frame["instrument_id"].astype(str).isin(request.instrument_ids)
+                & frame["session_date"].astype(str).eq(target.isoformat())
+                & frame["price_mode"].astype(str).eq("raw")
+            ].copy()
+            if frame.empty:
+                return
+            for column in ("previous_close", "limit_up", "limit_down"):
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            valid = frame.loc[
+                frame[["previous_close", "limit_up", "limit_down"]].notna().all(axis=1)
+                & frame["previous_close"].gt(0)
+                & frame["limit_up"].gt(0)
+                & frame["limit_down"].gt(0)
+            ]
+            valid_ids = tuple(map(str, valid["instrument_id"]))
+            duplicate_ids = set(map(
+                str,
+                valid.loc[
+                    valid["instrument_id"].astype(str).duplicated(keep=False),
+                    "instrument_id",
+                ],
+            ))
+            for instrument_id in valid_ids:
+                if (
+                    instrument_id not in duplicate_ids
+                    and instrument_id in hashes
+                    and instrument_id not in error_ids
+                    and instrument_id not in selected
+                ):
+                    selected[instrument_id] = manifest
+
+        for manifest in self.warehouse.observations(provider=provider):
+            absorb(manifest)
+
+        request_errors: list[str] = []
+        batch_size = min(self.settings.daily.batch_size, 100)
+        parameters: dict[str, Any] = {"instrument_limit_snapshot": True}
+        if provider == "eastmoney-efinance":
+            parameters.update({
+                "max_workers": 16,
+                "retries": 3,
+                "retry_backoff_seconds": 0.25,
+                "timeout_seconds": 20,
+            })
+        for _round in range(2):
+            unresolved = tuple(sorted(requested_set - set(selected)))
+            if not unresolved:
+                break
+            for index in range(0, len(unresolved), batch_size):
+                batch = unresolved[index:index + batch_size]
+                request = ProviderRequest(
+                    ProviderCapability.DAILY_STATUS,
+                    target,
+                    target,
+                    batch,
+                    parameters,
+                )
+                try:
+                    manifest = self.ingestion.capture(provider, request)
+                except Exception as exc:
+                    request_errors.append(
+                        f"{','.join(batch[:3])}:{type(exc).__name__}:{str(exc)[:240]}"
+                    )
+                    continue
+                absorb(manifest)
+
+        unresolved = tuple(sorted(requested_set - set(selected)))
+        return {
+            "observation_ids": tuple(sorted({
+                manifest.observation_id for manifest in selected.values()
+            })),
+            "covered_instruments": len(selected),
+            "unresolved_instrument_ids": unresolved,
+            "request_errors": tuple(request_errors),
+        }
 
     @staticmethod
     def _only_missing_sources(reasons: Any) -> bool:
@@ -825,6 +993,17 @@ class DailyPipeline:
         end: date,
         instrument_ids: tuple[str, ...],
     ) -> str:
+        existing = find_no_trade_research_partition(
+            self.warehouse,
+            predecessor_snapshot_id=predecessor_snapshot_id,
+            universe_observation_id=universe_observation_id,
+            calendar_observation_id=calendar_observation_id,
+            start_date=start,
+            end_date=end,
+            instrument_ids=instrument_ids,
+        )
+        if existing is not None:
+            return existing.observation_id
         source_ids = []
         request = ProviderRequest(
             ProviderCapability.DAILY_BARS_RAW, start, end, instrument_ids,
@@ -902,6 +1081,7 @@ class DailyPipeline:
         build_partition_ids: tuple[str, ...],
         no_trade_observation_id: str | None,
         universe_observation_id: str,
+        direct_limit_observation_ids: tuple[str, ...],
     ) -> str:
         research = self.warehouse.load_snapshot(research_snapshot_id)
         instruments = self.warehouse.query_loaded_snapshot_table(
@@ -968,6 +1148,7 @@ class DailyPipeline:
             *evidence_results["stock-actions"].observation_ids,
             *evidence_results["etf-actions"].observation_ids,
             *evidence_results["factors"].observation_ids,
+            *direct_limit_observation_ids,
             universe_observation_id,
         }))
         observed_at = max(

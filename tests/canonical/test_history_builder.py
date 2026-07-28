@@ -17,6 +17,7 @@ from fundlab.common.canonical import stable_digest
 from fundlab.marketdata import (
     CanonicalMarketData,
     CoverageClaim,
+    CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     HistoryBuildSpec,
     HistoryDatabaseBuilder,
     MarketDataWarehouse,
@@ -31,6 +32,7 @@ from fundlab.marketdata import (
     derive_current_research_snapshot,
 )
 from fundlab.marketdata.history import _exclusive_build_lock
+from fundlab.marketdata.schema import empty_table
 
 
 START = date(2026, 7, 13)
@@ -893,6 +895,78 @@ def test_no_trade_check_rejects_active_or_ambiguous_rows(field, value):
         start_date=START,
         end_date=END,
     ) == {"600000.SH"}
+
+
+def test_no_trade_partition_reuse_requires_the_exact_validated_boundary(tmp_path):
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    target = ("600000.SH",)
+    universe_id = "obs-universe-boundary"
+    calendar_id = "obs-calendar-boundary"
+    predecessor_id = "snap-predecessor-boundary"
+    manifest = warehouse.record_observation(ObservationPayload(
+        history_module.NO_TRADE_RESEARCH_PROVIDER,
+        datetime(2026, 7, 15, 1, 0, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            START,
+            END,
+            target,
+            {
+                "kind": "independent-no-trade-consensus",
+                "input_observation_ids": (universe_id, calendar_id),
+            },
+        ),
+        {
+            MarketTable.INSTRUMENTS: _master().loc[
+                _master()["instrument_id"].eq(target[0])
+            ].reset_index(drop=True),
+            MarketTable.DAILY_BARS: empty_table(
+                MarketTable.DAILY_BARS, include_lineage=True,
+            ),
+        },
+        (
+            CoverageClaim(MarketTable.INSTRUMENTS, True, instrument_ids=target),
+            CoverageClaim(MarketTable.DAILY_BARS, True, START, END, target),
+        ),
+        {
+            "kind": "field_level_reconciliation",
+            "reconciliation_ready": True,
+            "partition_quality": {
+                "validated": True,
+                "validator_version": history_module.NO_TRADE_RESEARCH_VALIDATOR_VERSION,
+                "readiness": ReadinessProfile.RESEARCH_PRICE.value,
+                "instrument_ids": target,
+                "start_date": START,
+                "end_date": END,
+                "universe_definition": CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+                "universe_as_of": END,
+                "row_count": 0,
+                "predecessor_snapshot_id": predecessor_id,
+                "input_observation_ids": (calendar_id, universe_id),
+            },
+        },
+    ))
+
+    found = history_module.find_no_trade_research_partition(
+        warehouse,
+        predecessor_snapshot_id=predecessor_id,
+        universe_observation_id=universe_id,
+        calendar_observation_id=calendar_id,
+        start_date=START,
+        end_date=END,
+        instrument_ids=target,
+    )
+
+    assert found is not None and found.observation_id == manifest.observation_id
+    assert history_module.find_no_trade_research_partition(
+        warehouse,
+        predecessor_snapshot_id=predecessor_id,
+        universe_observation_id=universe_id,
+        calendar_observation_id="obs-different-calendar",
+        start_date=START,
+        end_date=END,
+        instrument_ids=target,
+    ) is None
 
 
 def test_current_research_projection_uses_exact_exchange_membership_and_disjoint_supplement(

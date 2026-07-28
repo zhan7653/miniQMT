@@ -1474,6 +1474,16 @@ class SimulationIncrementValidator:
             frame = self.warehouse.read_observation_table(
                 observation_id, MarketTable.DAILY_BARS,
             )
+            if manifest.request.parameters.get("instrument_limit_snapshot"):
+                hashes = manifest.source_metadata.get("response_sha256")
+                errors = manifest.source_metadata.get("request_errors")
+                if not isinstance(hashes, Mapping):
+                    continue
+                error_ids = set(errors) if isinstance(errors, Mapping) else set()
+                approved_ids = set(map(str, hashes)) - set(map(str, error_ids))
+                frame = frame.loc[
+                    frame["instrument_id"].astype(str).isin(approved_ids)
+                ]
             frame = frame.loc[
                 frame["instrument_id"].astype(str).isin(instrument_ids)
                 & frame["session_date"].astype(str).between(
@@ -1492,7 +1502,20 @@ class SimulationIncrementValidator:
             combined = pd.concat(pieces, ignore_index=True).sort_values(
                 [*keys, "observed_at"], kind="stable",
             )
-            provider_bars[backend] = combined.drop_duplicates(keys, keep="last")
+            # Daily direct-limit snapshots intentionally carry no OHLC, while
+            # historical/status rows usually carry OHLC but no direct limits.
+            # Preserve the latest independently sourced row of each evidence
+            # type instead of letting the newer sparse snapshot erase prices.
+            price_rows = combined.loc[
+                combined[["high", "low"]].notna().all(axis=1)
+            ].drop_duplicates(keys, keep="last")
+            limit_rows = combined.loc[
+                combined[["limit_up", "limit_down"]].notna().all(axis=1)
+            ].drop_duplicates(keys, keep="last")
+            selected = pd.concat((price_rows, limit_rows), ignore_index=True)
+            provider_bars[backend] = selected.drop_duplicates(
+                [*keys, "_audit_observation_id"], keep="last",
+            ).reset_index(drop=True)
         if len(provider_bars) < 2:
             raise SnapshotNotReadyError(
                 "Simulation increment needs two independent daily provider backends"

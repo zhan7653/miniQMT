@@ -45,6 +45,8 @@ from fundlab.marketdata.warehouse import MarketDataWarehouse
 DEFAULT_HISTORY_START = date(2010, 1, 1)
 DEFAULT_SOURCE_PAIR = ("tickflow", "baostock")
 HISTORY_BUILD_SCHEMA_VERSION = 6
+NO_TRADE_RESEARCH_PROVIDER = "canonical-no-trade-reconciler-r2-v1"
+NO_TRADE_RESEARCH_VALIDATOR_VERSION = "no-trade-research-r2-v1"
 _HELD_BUILD_LOCKS: set[Path] = set()
 _HELD_BUILD_LOCKS_GUARD = Lock()
 
@@ -148,6 +150,77 @@ class CurrentResearchResult:
 
     def to_dict(self) -> dict[str, Any]:
         return to_primitive(self)
+
+
+def find_no_trade_research_partition(
+    warehouse: MarketDataWarehouse,
+    *,
+    predecessor_snapshot_id: str,
+    universe_observation_id: str,
+    calendar_observation_id: str,
+    start_date: date,
+    end_date: date,
+    instrument_ids: tuple[str, ...],
+) -> ObservationManifest | None:
+    """Return a previously validated exact no-trade partition, if one exists."""
+
+    target = tuple(sorted(set(map(str, instrument_ids))))
+    if not target or start_date > end_date:
+        return None
+    for manifest in reversed(warehouse.observations(provider=NO_TRADE_RESEARCH_PROVIDER)):
+        request = manifest.request
+        quality = manifest.source_metadata.get("partition_quality")
+        if (
+            request.capability is not ProviderCapability.CANONICAL_RECONCILIATION
+            or request.start_date != start_date
+            or request.end_date != end_date
+            or request.instrument_ids != target
+            or request.parameters.get("kind") != "independent-no-trade-consensus"
+            or not manifest.source_metadata.get("reconciliation_ready")
+            or not isinstance(quality, Mapping)
+            or not quality.get("validated")
+            or quality.get("validator_version") != NO_TRADE_RESEARCH_VALIDATOR_VERSION
+            or quality.get("readiness") != ReadinessProfile.RESEARCH_PRICE.value
+            or tuple(map(str, quality.get("instrument_ids", ()))) != target
+            or str(quality.get("start_date"))[:10] != start_date.isoformat()
+            or str(quality.get("end_date"))[:10] != end_date.isoformat()
+            or quality.get("universe_definition")
+            != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE
+            or str(quality.get("universe_as_of"))[:10] != end_date.isoformat()
+            or quality.get("predecessor_snapshot_id") != predecessor_snapshot_id
+            or quality.get("row_count") != 0
+        ):
+            continue
+        input_ids = set(map(str, request.parameters.get("input_observation_ids", ())))
+        quality_input_ids = tuple(map(str, quality.get("input_observation_ids", ())))
+        available_tables = {item.table for item in manifest.files}
+        if (
+            not {universe_observation_id, calendar_observation_id} <= input_ids
+            or quality_input_ids != tuple(sorted(input_ids))
+            or not {
+                MarketTable.INSTRUMENTS, MarketTable.DAILY_BARS,
+            } <= available_tables
+        ):
+            continue
+        instrument_claims = tuple(
+            claim for claim in manifest.coverage
+            if claim.table is MarketTable.INSTRUMENTS and claim.complete
+        )
+        bar_claims = tuple(
+            claim for claim in manifest.coverage
+            if claim.table is MarketTable.DAILY_BARS and claim.complete
+        )
+        if (
+            len(instrument_claims) != 1
+            or instrument_claims[0].instrument_ids != target
+            or len(bar_claims) != 1
+            or bar_claims[0].start_date != start_date
+            or bar_claims[0].end_date != end_date
+            or bar_claims[0].instrument_ids != target
+        ):
+            continue
+        return manifest
+    return None
 
 
 def record_no_trade_research_partition(
@@ -286,7 +359,7 @@ def record_no_trade_research_partition(
     }))
     quality = {
         "validated": True,
-        "validator_version": "no-trade-research-r2-v1",
+        "validator_version": NO_TRADE_RESEARCH_VALIDATOR_VERSION,
         "readiness": ReadinessProfile.RESEARCH_PRICE.value,
         "instrument_ids": target,
         "start_date": start_date,
@@ -297,12 +370,12 @@ def record_no_trade_research_partition(
         "independent_empty_backends": {
             key: dict(sorted(value.items())) for key, value in sorted(evidence.items())
         },
-            "predecessor_last_traded_close": last_close,
-            "predecessor_snapshot_id": predecessor_snapshot_id,
+        "predecessor_last_traded_close": last_close,
+        "predecessor_snapshot_id": predecessor_snapshot_id,
         "input_observation_ids": input_ids,
     }
     return warehouse.record_observation(ObservationPayload(
-        "canonical-no-trade-reconciler-r2-v1",
+        NO_TRADE_RESEARCH_PROVIDER,
         observed_at,
         ProviderRequest(
             ProviderCapability.CANONICAL_RECONCILIATION,

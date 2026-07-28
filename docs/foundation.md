@@ -200,7 +200,8 @@ one validated canonical calendar observation, resolve the latest completed sessi
 configured cutoff, and — when the published snapshot is behind — run the increment path end to end
 (two-source history build with a BaoStock adjudicator, automatic no-trade consensus for full-window
 suspensions, current-research derivation, xtquant/BaoStock status collection, action and factor
-evidence collection, candidate composition, increment validation, atomic componentized publish).
+evidence collection, target-date xtquant/Eastmoney direct price-limit snapshots, candidate
+composition, increment validation, atomic componentized publish).
 Afterwards every account configured under `daily:` in `config/fundlab.yaml` is advanced session by
 session to the published head with its intent source (`static` weights or `agent-file` decisions).
 

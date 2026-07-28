@@ -19,13 +19,14 @@ from fundlab.marketdata import (
     ProviderRequest,
     SnapshotPlan,
     SourceSlice,
+    TradeRuleError,
     UniverseScope,
 )
 from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
 from fundlab.marketdata.schema import empty_table
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
-from fundlab.pipeline.daily import DailyPipelineBlocked
+from fundlab.pipeline.daily import DIRECT_LIMIT_PROVIDERS, DailyPipelineBlocked
 from fundlab.settings import (
     DailyAccountSettings,
     DailySettings,
@@ -485,6 +486,45 @@ class _DailyFixtureProvider:
             )
         if request.capability is ProviderCapability.DAILY_STATUS:
             frame = _daily_increment_bars(request)
+            if request.parameters.get("instrument_limit_snapshot"):
+                valid = frame.loc[
+                    frame[["previous_close", "limit_up", "limit_down"]]
+                    .notna().all(axis=1)
+                ]
+                completed = tuple(sorted(set(map(str, valid["instrument_id"]))))
+                errors = {
+                    instrument_id: "missing_limit_prices"
+                    for instrument_id in request.instrument_ids
+                    if instrument_id not in completed
+                }
+                frame = frame.copy()
+                frame[["open", "high", "low", "close", "amount"]] = None
+                frame["volume"] = 0
+                frame["suspended"] = None
+                return ObservationPayload(
+                    self.name,
+                    observed_at,
+                    request,
+                    {MarketTable.DAILY_BARS: frame},
+                    (CoverageClaim(
+                        MarketTable.DAILY_BARS,
+                        set(completed) == set(request.instrument_ids),
+                        request.start_date,
+                        request.end_date,
+                        request.instrument_ids,
+                    ),),
+                    {
+                        "backend_group": self.name,
+                        "response_sha256": {
+                            instrument_id: f"sha256-limit-{instrument_id}"
+                            for instrument_id in completed
+                        },
+                        "request_errors": errors,
+                        "status_fields": (
+                            "previous_close", "limit_up", "limit_down",
+                        ),
+                    },
+                )
             if self.name == "baostock":
                 frame[["open", "high", "low", "close", "amount"]] = None
                 frame["volume"] = 0
@@ -569,6 +609,7 @@ def _daily_extension_registry() -> ProviderRegistry:
             ProviderCapability.DAILY_STATUS,
             ProviderCapability.ADJUSTMENT_FACTORS,
         })),
+        ("eastmoney-efinance", frozenset({ProviderCapability.DAILY_STATUS})),
         ("cninfo-public", frozenset({ProviderCapability.CORPORATE_ACTIONS})),
         ("eastmoney-fund-public", frozenset({ProviderCapability.CORPORATE_ACTIONS})),
     ):
@@ -823,7 +864,9 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
     assert by_name["bars"].detail["included"] == len(_DAILY_BASE_IDS)
     assert by_name["bars"].detail["excluded"] == 1
     assert by_name["new_instruments"].detail["instrument_ids"] == (_DAILY_NEW_ID,)
-    for stage in ("research", "status", "evidence", "candidate", "validate", "extend"):
+    for stage in (
+        "research", "status", "limits", "evidence", "candidate", "validate", "extend",
+    ):
         assert by_name[stage].status == "ok"
 
     second = pipeline.run(target_date=FUTURE_DAYS[1], skip_accounts=True)
@@ -877,6 +920,39 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
         price_mode="raw",
     )
     assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)
+
+
+def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    def fail_validation(self, **kwargs):
+        raise TradeRuleError(
+            "Price-limit audit needs two direct provider limit values for "
+            "000001.SZ/2026-07-15"
+        )
+
+    monkeypatch.setattr(
+        daily_module.SimulationIncrementValidator,
+        "validate_and_record",
+        fail_validation,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    assert result.stages[-1].name == "validate"
+    assert result.stages[-1].detail["error_type"] == "TradeRuleError"
+    assert "two direct provider limit values" in result.stages[-1].detail["reason"]
+    assert result.report_path is not None
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert report["stages"][-1]["name"] == "validate"
 
 
 def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
@@ -954,6 +1030,15 @@ def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
         second_bars.detail["historical_universe_observation_id"]
     )
     assert first_bars.detail["build_id"] == second_bars.detail["build_id"]
+    first_research = next(stage for stage in first.stages if stage.name == "research")
+    second_research = next(stage for stage in second.stages if stage.name == "research")
+    assert first_research.detail["snapshot_id"] == second_research.detail["snapshot_id"]
+    first_limits = next(stage for stage in first.stages if stage.name == "limits")
+    second_limits = next(stage for stage in second.stages if stage.name == "limits")
+    for provider in DIRECT_LIMIT_PROVIDERS:
+        assert first_limits.detail[provider]["observation_ids"] == (
+            second_limits.detail[provider]["observation_ids"]
+        )
     baostock = registry.provider("baostock")
     assert sum(
         request.capability is ProviderCapability.INSTRUMENTS
