@@ -41,6 +41,7 @@ from fundlab.marketdata import (
     SourceSlice,
     StatusCollectionSpec,
     UniverseScope,
+    build_dense_simulation_bars,
     default_provider_registry,
     derive_current_research_snapshot,
     record_no_trade_research_partition,
@@ -578,7 +579,7 @@ class DailyPipeline:
         extended_ids = tuple(sorted(previous_ids.union(target_ids)))
         target_scope = UniverseScope(
             previous_scope.definition,
-            previous_scope.as_of_date,
+            target,
             previous_scope.history_start,
             target,
             survivorship_bias=previous_scope.survivorship_bias,
@@ -848,11 +849,18 @@ class DailyPipeline:
                 increment_scope.history_end.isoformat(),
             )
         ].reset_index(drop=True)
-        bars = reconcile_simulation_status(
+        status_bars = reconcile_simulation_status(
             instruments=instruments,
             research_bars=research_bars,
             dense_status_bars=dense_status,
             stock_st_bars=stock_st,
+            calendar=calendar_window,
+            universe_scope=increment_scope,
+        )
+        bars = build_dense_simulation_bars(
+            instruments=instruments,
+            research_bars=research_bars,
+            status_bars=status_bars,
             calendar=calendar_window,
             universe_scope=increment_scope,
         )

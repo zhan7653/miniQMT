@@ -29,7 +29,7 @@
 | `sources/` | 共 ~4500 | 9 个数据源 + `base.py`(HTTP 传输、哈希、代码转换)。`default_provider_registry()` 注册全部;`source_statuses()` 报告可用性。 |
 | `ingestion.py` | ~70 | `MarketIngestionService`:`capture`(捕获一次具名观测)与 `capture_resumable`(仅当既有观测的完整覆盖声明恰好包住请求边界才复用)。 |
 | `reconciliation.py` | ~650 | `ReconciliationPolicy` / `FieldRule` / `ReconciliationService`:字段级对账,产出带 `kind = "field_level_reconciliation"` 与 `reconciliation_ready` 标记的 canonical 观测;`default_reconciliation_policy` 为缺省策略。 |
-| `history.py` | ~2100 | `HistoryDatabaseBuilder`:可续传(检查点 + 构建锁 + 分片)的多源研究历史构建,缺省源对 `DEFAULT_SOURCE_PAIR = ("tickflow", "baostock")`;窄范围新上市接入可绑定一个已记录且 `as_of_date` 精确匹配的官方 universe observation 作为 master override;`compose_history_snapshot` 拼接互斥分区;`derive_current_research_snapshot` 投影到当前宇宙。 |
+| `history.py` | ~2100 | `HistoryDatabaseBuilder`:可续传(检查点 + 构建锁 + 分片)的多源研究历史构建,缺省源对 `DEFAULT_SOURCE_PAIR = ("tickflow", "baostock")`;窄范围新上市接入可绑定一个已记录的官方 universe observation 作为 master override,但必须同时验证完整 SH/SZ stock/ETF 请求、七个官方端点、表行数/覆盖声明、双重 `as_of_date` 与上市窗口;`compose_history_snapshot` 拼接互斥分区;`derive_current_research_snapshot` 投影到当前宇宙。 |
 | `simulation_data.py` | ~2200 | 模拟数据线:`SimulationEvidenceCollector`(公司行动/因子证据)、`SimulationStatusCollector`(停牌/ST/前收盘)、`build_dense_simulation_bars`、`reconcile_simulation_status`、`SimulationIncrementValidator`(增量验证)、`SimulationSnapshotBuilder`(增量扩展入口)。 |
 | `incremental.py` | ~1300 | `IncrementalCanonicalPublisher`:组件化增量发布(`bootstrap` 一次性迁移、`extend` 例行扩展、`compare` 影子比对、`apply_scoped_update` 范围修订),`IncrementalBuildAudit` 记录是否重开了历史日线组件。 |
 | `trade_rules.py` | ~890 | 交易规则物化:`materialize_daily_trade_rules`(逐日规则与涨跌停)、`resolve_order_quantity_rule` / `resolve_stock_trade_rule`、`audit_provider_price_limits`(用源观测审计涨跌停)、`apply_corroborated_historical_limit_exceptions`。 |
@@ -93,7 +93,7 @@ flowchart LR
 
 - `CanonicalMarketData.open(root, snapshot_id=None, required_readiness=ReadinessProfile.SIMULATION)` — 交易内核与研究的唯一入口;省略 `snapshot_id` 即取 `current.json` 指向的已发布快照。方法:`instrument` / `instruments` / `trading_days` / `next_trading_day` / `bars` / `adjusted_history` / `session`。
 - `PointInTimeMarketView(market_data, as_of)` — 把 `as_of` 钉死后交给策略,策略无法越界看未来。
-- `MarketDataWarehouse(root)` — 管线与 CLI 使用;`fundlab/pipeline/daily.py` 组合 `SimulationStatusCollector` → `SimulationEvidenceCollector` → `SimulationIncrementValidator` → `SimulationSnapshotBuilder` 完成数据段。
+- `MarketDataWarehouse(root)` — 管线与 CLI 使用;`fundlab/pipeline/daily.py` 组合 `SimulationStatusCollector` → `reconcile_simulation_status` → `build_dense_simulation_bars`(研究价仍是 OHLC 权威,状态源只补停牌/ST/前收)→ `SimulationEvidenceCollector` → `SimulationIncrementValidator` → `SimulationSnapshotBuilder` 完成数据段;继任快照的 `UniverseScope.as_of_date` 固定为本次官方清单目标日。
 - 包顶层 `fundlab/marketdata/__init__.py` 重导出全部公共名字,CLI 只从包根导入。
 
 **CLI(`fundlab data ...`,pyproject 注册)**:

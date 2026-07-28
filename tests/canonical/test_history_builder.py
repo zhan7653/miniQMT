@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -11,6 +12,8 @@ from threading import Barrier, Event, Lock
 import pandas as pd
 import pytest
 
+import fundlab.marketdata.history as history_module
+from fundlab.common.canonical import stable_digest
 from fundlab.marketdata import (
     CanonicalMarketData,
     CoverageClaim,
@@ -79,6 +82,88 @@ def _bars(provider: str, requested: tuple[str, ...]) -> pd.DataFrame:
                 "source_payload": None,
             })
     return pd.DataFrame(rows)
+
+
+_OFFICIAL_ENDPOINTS = (
+    "sse-main-stock-list",
+    "sse-star-stock-list",
+    "szse-a-stock-list",
+    "sse-etf-scale-list",
+    "sse-current-full-etf-list",
+    "szse-etf-scale-daily",
+    "szse-current-etf-list",
+)
+
+
+def _official_master(*, new_listed_date: date = START) -> pd.DataFrame:
+    base = _master().copy()
+    new_listing = base.loc[base["instrument_id"].eq("600000.SH")].copy()
+    new_listing.loc[:, "instrument_id"] = "688825.SH"
+    new_listing.loc[:, "local_code"] = "688825"
+    new_listing.loc[:, "name"] = "New STAR"
+    new_listing.loc[:, "listed_date"] = new_listed_date.isoformat()
+    new_listing.loc[:, "board"] = "star"
+    sz_stock = base.loc[base["instrument_id"].eq("600000.SH")].copy()
+    sz_stock.loc[:, "instrument_id"] = "000001.SZ"
+    sz_stock.loc[:, "exchange"] = "SZ"
+    sz_stock.loc[:, "local_code"] = "000001"
+    sz_stock.loc[:, "name"] = "SZ Bank"
+    sz_etf = base.loc[base["instrument_id"].eq("510050.SH")].copy()
+    sz_etf.loc[:, "instrument_id"] = "159001.SZ"
+    sz_etf.loc[:, "exchange"] = "SZ"
+    sz_etf.loc[:, "local_code"] = "159001"
+    sz_etf.loc[:, "name"] = "SZ ETF"
+    return pd.concat((base, new_listing, sz_stock, sz_etf), ignore_index=True)
+
+
+def _record_official_master(
+    warehouse: MarketDataWarehouse,
+    frame: pd.DataFrame,
+    *,
+    claim_ids: tuple[str, ...] | None = None,
+):
+    endpoint_counts = {
+        "sse-main-stock-list": 1,
+        "sse-star-stock-list": 1,
+        "szse-a-stock-list": 1,
+        "sse-etf-scale-list": 1,
+        "sse-current-full-etf-list": 1,
+        "szse-etf-scale-daily": 1,
+        "szse-current-etf-list": 1,
+    }
+    return warehouse.record_observation(ObservationPayload(
+        "exchange-public",
+        datetime(2026, 7, 18, 0, 3, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={
+                "exchanges": ("SH", "SZ"),
+                "asset_types": ("stock", "etf"),
+                "as_of_date": END.isoformat(),
+            },
+        ),
+        {MarketTable.INSTRUMENTS: frame},
+        (CoverageClaim(
+            MarketTable.INSTRUMENTS,
+            True,
+            instrument_ids=(
+                tuple(map(str, frame["instrument_id"]))
+                if claim_ids is None else claim_ids
+            ),
+        ),),
+        {
+            "backend_group": "exchange-public",
+            "as_of_date": END.isoformat(),
+            "requested_scope": {
+                "exchanges": ("SH", "SZ"),
+                "asset_types": ("stock", "etf"),
+            },
+            "endpoint_counts": endpoint_counts,
+            "response_sha256": {
+                endpoint: f"sha256-{endpoint}" for endpoint in _OFFICIAL_ENDPOINTS
+            },
+        },
+    ))
 
 
 class _BaoProvider:
@@ -200,27 +285,7 @@ def test_history_builder_can_use_exact_exchange_master_for_new_listing(tmp_path)
     registry.register(_BaoProvider())
     registry.register(_AllTickProvider())
     warehouse = MarketDataWarehouse(tmp_path / "market")
-    official = _master().loc[lambda frame: frame["instrument_id"].eq("600000.SH")].copy()
-    official.loc[:, "instrument_id"] = "688825.SH"
-    official.loc[:, "local_code"] = "688825"
-    official.loc[:, "name"] = "New STAR"
-    official.loc[:, "listed_date"] = START.isoformat()
-    official.loc[:, "board"] = "star"
-    universe = warehouse.record_observation(ObservationPayload(
-        "exchange-public",
-        datetime(2026, 7, 18, 0, 3, tzinfo=timezone.utc),
-        ProviderRequest(
-            ProviderCapability.INSTRUMENTS,
-            parameters={"as_of_date": END.isoformat()},
-        ),
-        {MarketTable.INSTRUMENTS: official},
-        (CoverageClaim(
-            MarketTable.INSTRUMENTS,
-            True,
-            instrument_ids=("688825.SH",),
-        ),),
-        {"backend_group": "exchange-public"},
-    ))
+    universe = _record_official_master(warehouse, _official_master())
     builder = HistoryDatabaseBuilder(
         warehouse, tmp_path / "reports", registry=registry,
     )
@@ -244,6 +309,86 @@ def test_history_builder_can_use_exact_exchange_master_for_new_listing(tmp_path)
         required_readiness=ReadinessProfile.RESEARCH_PRICE,
     )
     assert market.instrument("688825.SH").name == "New STAR"
+
+
+def test_history_builder_rejects_partial_or_out_of_window_exchange_override(tmp_path):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(_AllTickProvider())
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    builder = HistoryDatabaseBuilder(
+        warehouse, tmp_path / "reports", registry=registry,
+    )
+    spec = HistoryBuildSpec(
+        END,
+        start_date=START,
+        instrument_ids=("688825.SH",),
+        exchanges=("SH",),
+    )
+
+    partial = _official_master().loc[
+        lambda frame: frame["instrument_id"].eq("688825.SH")
+    ].copy()
+    partial_observation = _record_official_master(warehouse, partial)
+    with pytest.raises(ValueError, match="row counts"):
+        builder.build(
+            spec,
+            universe_observation_id=partial_observation.observation_id,
+        )
+
+    stale_observation = _record_official_master(
+        warehouse,
+        _official_master(new_listed_date=START.replace(day=START.day - 1)),
+    )
+    with pytest.raises(ValueError, match="complete new listings"):
+        builder.build(
+            spec,
+            universe_observation_id=stale_observation.observation_id,
+        )
+
+
+def test_history_builder_default_lock_identity_remains_backward_compatible(
+    tmp_path, monkeypatch,
+):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(_AllTickProvider())
+    builder = HistoryDatabaseBuilder(
+        MarketDataWarehouse(tmp_path / "market"),
+        tmp_path / "reports",
+        registry=registry,
+    )
+    spec = HistoryBuildSpec(
+        END,
+        start_date=START,
+        instrument_ids=("600000.SH",),
+        exchanges=("SH",),
+    )
+    captured: list[Path] = []
+
+    @contextmanager
+    def capture_lock(path):
+        captured.append(path)
+        yield
+
+    sentinel = object()
+    monkeypatch.setattr(history_module, "_exclusive_build_lock", capture_lock)
+    monkeypatch.setattr(
+        builder,
+        "_build_locked",
+        lambda received, *, universe_observation_id: sentinel,
+    )
+
+    assert builder.build(spec) is sentinel
+    expected = stable_digest({
+        "schema_version": history_module.HISTORY_BUILD_SCHEMA_VERSION,
+        "spec": spec,
+        "universe_provider": builder.universe_provider,
+        "source_pair": builder.source_pair,
+        "adjudicator_provider": builder.adjudicator_provider,
+        "policy_version": builder.policy.version,
+    })[:24]
+    assert captured[0].name == f"{expected}.lock"
 
 
 def test_history_shards_assemble_one_disjoint_published_cohort(tmp_path):

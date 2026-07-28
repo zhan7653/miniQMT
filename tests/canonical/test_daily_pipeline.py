@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import json
 from types import SimpleNamespace
 
@@ -9,13 +9,21 @@ import pandas as pd
 import pytest
 
 from fundlab.marketdata import (
+    CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CoverageClaim,
+    MarketDataWarehouse,
     MarketTable,
     ObservationPayload,
     ProviderCapability,
     ProviderRegistry,
     ProviderRequest,
+    SnapshotPlan,
+    SourceSlice,
+    UniverseScope,
 )
+from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
+from fundlab.marketdata.schema import empty_table
+from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
 from fundlab.pipeline.daily import DailyPipelineBlocked
 from fundlab.settings import (
@@ -25,7 +33,13 @@ from fundlab.settings import (
     FoundationSettings,
 )
 from fundlab.trading import TradingRepository
-from tests.canonical.fixtures import DAYS, FUTURE_DAYS, market_frames, ready_market
+from tests.canonical.fixtures import (
+    DAYS,
+    FUTURE_DAYS,
+    commit_test_snapshot,
+    market_frames,
+    ready_market,
+)
 from tests.canonical.test_trading_kernel import fees, policies
 
 
@@ -278,6 +292,375 @@ def _new_listing_frame(listed_date: date) -> pd.DataFrame:
     }])
 
 
+_DAILY_BASE_IDS = ("000001.SZ", "159001.SZ", "510050.SH", "600000.SH")
+_DAILY_NEW_ID = "688825.SH"
+_DAILY_ENDPOINT_COUNTS = {
+    "sse-main-stock-list": 1,
+    "sse-star-stock-list": 1,
+    "szse-a-stock-list": 1,
+    "sse-etf-scale-list": 1,
+    "sse-current-full-etf-list": 1,
+    "szse-etf-scale-daily": 1,
+    "szse-current-etf-list": 1,
+}
+
+
+def _daily_base_instruments() -> pd.DataFrame:
+    template = market_frames()[MarketTable.INSTRUMENTS].iloc[0].to_dict()
+    rows = []
+    for instrument_id, exchange, asset_type, name, listed_date in (
+        ("600000.SH", "SH", "stock", "Bank A", "1999-11-10"),
+        ("000001.SZ", "SZ", "stock", "Bank B", "1991-04-03"),
+        ("510050.SH", "SH", "etf", "SH ETF", "2005-02-23"),
+        ("159001.SZ", "SZ", "etf", "SZ ETF", "2006-02-21"),
+    ):
+        row = dict(template)
+        row.update({
+            "instrument_id": instrument_id,
+            "exchange": exchange,
+            "local_code": instrument_id.split(".", 1)[0],
+            "asset_type": asset_type,
+            "name": name,
+            "listed_date": listed_date,
+            "board": "main",
+            "price_tick": 0.001 if asset_type == "etf" else 0.01,
+            "exchange_product_class": (
+                "sse-fund-subclass-03" if instrument_id == "510050.SH" else
+                "szse-ETF|股票基金" if instrument_id == "159001.SZ" else None
+            ),
+        })
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("instrument_id", kind="stable").reset_index(drop=True)
+
+
+def _daily_official_instruments() -> pd.DataFrame:
+    return pd.concat((
+        _daily_base_instruments(),
+        _new_listing_frame(FUTURE_DAYS[0]),
+    ), ignore_index=True).sort_values("instrument_id", kind="stable").reset_index(drop=True)
+
+
+def _daily_calendar() -> pd.DataFrame:
+    base = calendar_frame()
+    return pd.concat((base, base.assign(exchange="SZ")), ignore_index=True)
+
+
+def _daily_increment_bars(request: ProviderRequest) -> pd.DataFrame:
+    sessions = tuple(
+        day for day in (*DAYS, *FUTURE_DAYS)
+        if request.start_date <= day <= request.end_date
+    )
+    rows = []
+    for ordinal, instrument_id in enumerate(request.instrument_ids):
+        for session_ordinal, day in enumerate(sessions):
+            close = 10.0 + ordinal + session_ordinal
+            previous_close = close - 0.5
+            tick = Decimal("0.001") if instrument_id in {
+                "159001.SZ", "510050.SH",
+            } else Decimal("0.01")
+            bounded = instrument_id != _DAILY_NEW_ID
+            limit_up = limit_down = None
+            if bounded:
+                previous = Decimal(str(previous_close))
+                limit_up = float(
+                    (previous * Decimal("1.10") / tick).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP,
+                    ) * tick
+                )
+                limit_down = float(
+                    (previous * Decimal("0.90") / tick).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP,
+                    ) * tick
+                )
+            rows.append({
+                "instrument_id": instrument_id,
+                "session_date": day.isoformat(),
+                "price_mode": "raw",
+                "open": close,
+                "high": close + 0.1,
+                "low": close - 0.1,
+                "close": close,
+                "volume": 1_000_000,
+                "amount": close * 1_000_000,
+                "suspended": False,
+                "is_st": None,
+                "price_limit_state": "unknown",
+                "previous_close": previous_close,
+                "limit_up": limit_up,
+                "limit_down": limit_down,
+                "source_payload": None,
+            })
+    return pd.DataFrame(rows)
+
+
+class _DailyFixtureProvider:
+    def __init__(self, name: str, capabilities: frozenset[ProviderCapability]):
+        self.name = name
+        self.capabilities = capabilities
+
+    def observe(self, request: ProviderRequest) -> ObservationPayload:
+        observed_at = datetime(2026, 7, 18, 1, 0, tzinfo=timezone.utc)
+        if request.capability is ProviderCapability.TRADING_CALENDAR:
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.CALENDAR: _daily_calendar()},
+                (CoverageClaim(
+                    MarketTable.CALENDAR,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                ),),
+                {"backend_group": self.name},
+            )
+        if request.capability is ProviderCapability.INSTRUMENTS:
+            frame = (
+                _daily_official_instruments()
+                if self.name == "exchange-public" else _daily_base_instruments()
+            )
+            metadata = {"backend_group": self.name}
+            if self.name == "exchange-public":
+                metadata.update({
+                    "as_of_date": request.parameters["as_of_date"],
+                    "requested_scope": {
+                        "exchanges": tuple(request.parameters["exchanges"]),
+                        "asset_types": tuple(request.parameters["asset_types"]),
+                    },
+                    "endpoint_counts": _DAILY_ENDPOINT_COUNTS,
+                    "response_sha256": {
+                        endpoint: f"sha256-{endpoint}"
+                        for endpoint in _DAILY_ENDPOINT_COUNTS
+                    },
+                })
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.INSTRUMENTS: frame},
+                (CoverageClaim(
+                    MarketTable.INSTRUMENTS,
+                    True,
+                    instrument_ids=tuple(map(str, frame["instrument_id"])),
+                ),),
+                metadata,
+            )
+        if request.capability is ProviderCapability.DAILY_BARS_RAW:
+            frame = _daily_increment_bars(request)
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.DAILY_BARS: frame},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.name},
+            )
+        if request.capability is ProviderCapability.DAILY_STATUS:
+            frame = _daily_increment_bars(request)
+            if self.name == "baostock":
+                frame[["open", "high", "low", "close", "amount"]] = None
+                frame["volume"] = 0
+                frame["is_st"] = False
+                frame[["limit_up", "limit_down"]] = None
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.DAILY_BARS: frame},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.name},
+            )
+        if request.capability is ProviderCapability.CORPORATE_ACTIONS:
+            metadata = {
+                "backend_group": self.name,
+                "response_sha256": {
+                    instrument_id: {"fixture": f"sha256-{instrument_id}"}
+                    for instrument_id in request.instrument_ids
+                },
+                "request_errors": {},
+                "invalid_lifecycle": {},
+            }
+            if self.name == "eastmoney-fund-public":
+                metadata["parser_policy"] = EASTMONEY_ETF_ACTION_POLICY
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.CORPORATE_ACTIONS: empty_table(
+                    MarketTable.CORPORATE_ACTIONS, include_lineage=True,
+                )},
+                (CoverageClaim(
+                    MarketTable.CORPORATE_ACTIONS,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                metadata,
+            )
+        if request.capability is ProviderCapability.ADJUSTMENT_FACTORS:
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.ADJUSTMENT_FACTORS: empty_table(
+                    MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+                )},
+                (CoverageClaim(
+                    MarketTable.ADJUSTMENT_FACTORS,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.name},
+            )
+        raise AssertionError(f"unsupported fixture request: {self.name}/{request.capability}")
+
+
+def _daily_extension_registry() -> ProviderRegistry:
+    registry = ProviderRegistry()
+    for name, capabilities in (
+        ("baostock", frozenset({
+            ProviderCapability.TRADING_CALENDAR,
+            ProviderCapability.INSTRUMENTS,
+            ProviderCapability.DAILY_BARS_RAW,
+            ProviderCapability.DAILY_STATUS,
+        })),
+        ("sina-calendar", frozenset({ProviderCapability.TRADING_CALENDAR})),
+        ("exchange-public", frozenset({ProviderCapability.INSTRUMENTS})),
+        ("tickflow", frozenset({ProviderCapability.DAILY_BARS_RAW})),
+        ("xtquant", frozenset({
+            ProviderCapability.DAILY_BARS_RAW,
+            ProviderCapability.DAILY_STATUS,
+            ProviderCapability.ADJUSTMENT_FACTORS,
+        })),
+        ("cninfo-public", frozenset({ProviderCapability.CORPORATE_ACTIONS})),
+        ("eastmoney-fund-public", frozenset({ProviderCapability.CORPORATE_ACTIONS})),
+    ):
+        registry.register(_DailyFixtureProvider(name, capabilities))
+    return registry
+
+
+def _ready_multi_asset_market(path) -> None:
+    warehouse = MarketDataWarehouse(path)
+    instruments = _daily_base_instruments()
+    calendar = _daily_calendar()
+    original_bars = market_frames()[MarketTable.DAILY_BARS]
+    bars = pd.concat((
+        original_bars.assign(instrument_id=instrument_id)
+        for instrument_id in _DAILY_BASE_IDS
+    ), ignore_index=True)
+    tables = {
+        MarketTable.INSTRUMENTS: instruments,
+        MarketTable.CALENDAR: calendar,
+        MarketTable.DAILY_BARS: bars,
+        MarketTable.CORPORATE_ACTIONS: empty_table(
+            MarketTable.CORPORATE_ACTIONS, include_lineage=True,
+        ),
+        MarketTable.ADJUSTMENT_FACTORS: empty_table(
+            MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+        ),
+    }
+    observed = warehouse.record_observation(ObservationPayload(
+        "daily-extension-predecessor",
+        datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            DAYS[0],
+            DAYS[-1],
+            _DAILY_BASE_IDS,
+        ),
+        tables,
+        (
+            CoverageClaim(
+                MarketTable.INSTRUMENTS,
+                True,
+                instrument_ids=_DAILY_BASE_IDS,
+            ),
+            CoverageClaim(MarketTable.CALENDAR, True, DAYS[0], FUTURE_DAYS[-1]),
+            CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                DAYS[0],
+                DAYS[-1],
+                _DAILY_BASE_IDS,
+            ),
+            CoverageClaim(
+                MarketTable.CORPORATE_ACTIONS,
+                True,
+                DAYS[0],
+                DAYS[-1],
+                _DAILY_BASE_IDS,
+            ),
+            CoverageClaim(
+                MarketTable.ADJUSTMENT_FACTORS,
+                True,
+                DAYS[0],
+                DAYS[-1],
+                _DAILY_BASE_IDS,
+            ),
+        ),
+        {"kind": "field_level_reconciliation", "reconciliation_ready": True},
+    ))
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[-1],
+        DAYS[0],
+        DAYS[-1],
+        survivorship_bias=True,
+        instrument_ids=_DAILY_BASE_IDS,
+    )
+    legacy = commit_test_snapshot(warehouse, SnapshotPlan(
+        (
+            SourceSlice(
+                observed.observation_id,
+                MarketTable.INSTRUMENTS,
+                "daily new-listing predecessor fixture",
+                _DAILY_BASE_IDS,
+            ),
+            SourceSlice(
+                observed.observation_id,
+                MarketTable.CALENDAR,
+                "daily new-listing predecessor fixture",
+                start_date=DAYS[0],
+                end_date=FUTURE_DAYS[-1],
+            ),
+            *(
+                SourceSlice(
+                    observed.observation_id,
+                    table,
+                    "daily new-listing predecessor fixture",
+                    _DAILY_BASE_IDS,
+                    DAYS[0],
+                    DAYS[-1],
+                )
+                for table in (
+                    MarketTable.DAILY_BARS,
+                    MarketTable.CORPORATE_ACTIONS,
+                    MarketTable.ADJUSTMENT_FACTORS,
+                )
+            ),
+        ),
+        "daily new-listing predecessor fixture",
+        universe_scope=scope,
+    ))
+    predecessor = IncrementalCanonicalPublisher(warehouse).bootstrap(legacy.snapshot_id)
+    warehouse._replace_current_pointer(predecessor)
+
+
 def test_daily_new_listing_supplement_uses_official_exact_master(tmp_path):
     report = tmp_path / "new-listing-build.json"
     report.write_text(json.dumps({
@@ -369,3 +752,70 @@ def test_daily_new_listing_supplement_fails_closed_without_two_source_evidence(t
             start=FUTURE_DAYS[0],
             end=FUTURE_DAYS[0],
         )
+
+
+def test_daily_new_listing_runs_through_componentized_increment_and_publication(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "ok", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    assert result.snapshot_id is not None
+    by_name = {stage.name: stage for stage in result.stages}
+    assert by_name["bars"].detail["included"] == len(_DAILY_BASE_IDS)
+    assert by_name["bars"].detail["excluded"] == 1
+    assert by_name["new_instruments"].detail["instrument_ids"] == (_DAILY_NEW_ID,)
+    for stage in ("research", "status", "evidence", "candidate", "validate", "extend"):
+        assert by_name[stage].status == "ok"
+
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    assert warehouse.current_snapshot_id() == result.snapshot_id
+    published = warehouse.load_snapshot(result.snapshot_id)
+    scope = published.plan.universe_scope
+    assert scope is not None
+    assert scope.as_of_date == scope.history_end == FUTURE_DAYS[0]
+    assert set(scope.instrument_ids) == {*_DAILY_BASE_IDS, _DAILY_NEW_ID}
+    increment_bars = warehouse.query_loaded_snapshot_table(
+        published,
+        MarketTable.DAILY_BARS,
+        instrument_ids=scope.instrument_ids,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)

@@ -386,15 +386,20 @@ class HistoryDatabaseBuilder:
         It does not change the default historical build path.
         """
         self.warehouse.initialize()
-        lock_id = stable_digest({
+        lock_identity: dict[str, Any] = {
             "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
             "spec": spec,
             "universe_provider": self.universe_provider,
-            "universe_observation_id": universe_observation_id,
             "source_pair": self.source_pair,
             "adjudicator_provider": self.adjudicator_provider,
             "policy_version": self.policy.version,
-        })[:24]
+        }
+        # Preserve the exact pre-override lock identity for the default path.
+        # This keeps old and upgraded processes mutually exclusive while they
+        # share the same build/checkpoint identity during a rolling upgrade.
+        if universe_observation_id is not None:
+            lock_identity["universe_observation_id"] = universe_observation_id
+        lock_id = stable_digest(lock_identity)[:24]
         lock_path = self.warehouse.root / "builds" / ".locks" / f"{lock_id}.lock"
         with _exclusive_build_lock(lock_path):
             return self._build_locked(
@@ -424,41 +429,15 @@ class HistoryDatabaseBuilder:
             universe, _ = self._capture_exact(
                 self.universe_provider, universe_request, refresh=spec.refresh,
             )
+            universe_frame = self.warehouse.read_observation_table(
+                universe.observation_id, MarketTable.INSTRUMENTS,
+            )
         else:
             universe = self.warehouse.load_observation(universe_observation_id)
-            if universe.provider != "exchange-public":
-                raise ValueError(
-                    "Explicit history universe override must be an exchange-public observation"
-                )
-            if universe.request.capability is not ProviderCapability.INSTRUMENTS:
-                raise ValueError(
-                    "Explicit history universe observation must carry instrument metadata"
-                )
-            declared_as_of = universe.request.parameters.get("as_of_date")
-            if str(declared_as_of) != spec.universe_as_of.isoformat():
-                raise ValueError(
-                    "Explicit history universe observation as_of_date does not match the "
-                    f"build scope: {declared_as_of!r} != {spec.universe_as_of.isoformat()!r}"
-                )
-            covered = tuple(
-                claim for claim in universe.coverage
-                if claim.table is MarketTable.INSTRUMENTS and claim.complete
+            universe_frame = self.warehouse.read_observation_table(
+                universe.observation_id, MarketTable.INSTRUMENTS,
             )
-            if not covered:
-                raise ValueError(
-                    "Explicit history universe observation has no complete instrument claim"
-                )
-            requested = set(spec.instrument_ids)
-            if requested and not any(
-                requested <= set(claim.instrument_ids) for claim in covered
-            ):
-                raise ValueError(
-                    "Explicit history universe observation does not completely cover the "
-                    "requested instruments"
-                )
-        universe_frame = self.warehouse.read_observation_table(
-            universe.observation_id, MarketTable.INSTRUMENTS,
-        )
+            _validate_explicit_history_universe(universe, universe_frame, spec)
         eligible, not_in_master = _select_universe(universe_frame, spec)
         cohort_id = _cohort_id(
             spec,
@@ -1816,6 +1795,197 @@ def _record_current_master_observation(
             "partition_quality": partition_quality,
         },
     ))
+
+
+def _validate_explicit_history_universe(
+    universe: ObservationManifest,
+    frame: pd.DataFrame,
+    spec: HistoryBuildSpec,
+) -> None:
+    """Accept only a complete official current-universe proof for new listings."""
+
+    if universe.provider != "exchange-public":
+        raise ValueError(
+            "Explicit history universe override must be an exchange-public observation"
+        )
+    if universe.request.capability is not ProviderCapability.INSTRUMENTS:
+        raise ValueError(
+            "Explicit history universe observation must carry instrument metadata"
+        )
+    if universe.request.instrument_ids:
+        raise ValueError(
+            "Explicit history universe observation must cover the full official request"
+        )
+
+    expected_exchanges = {"SH", "SZ"}
+    expected_assets = {"stock", "etf"}
+    request_exchanges = {
+        str(item).upper()
+        for item in universe.request.parameters.get("exchanges", ())
+    }
+    request_assets = {
+        str(item).lower()
+        for item in universe.request.parameters.get("asset_types", ())
+    }
+    if request_exchanges != expected_exchanges or request_assets != expected_assets:
+        raise ValueError(
+            "Explicit history universe observation must request the complete SH/SZ "
+            "stock/ETF scope"
+        )
+
+    declared_as_of = universe.request.parameters.get("as_of_date")
+    source_as_of = universe.source_metadata.get("as_of_date")
+    if (
+        str(declared_as_of)[:10] != spec.universe_as_of.isoformat()
+        or str(source_as_of)[:10] != spec.universe_as_of.isoformat()
+    ):
+        raise ValueError(
+            "Explicit history universe observation as_of_date does not match the "
+            f"build scope: request={declared_as_of!r} source={source_as_of!r} "
+            f"expected={spec.universe_as_of.isoformat()!r}"
+        )
+    requested_scope = universe.source_metadata.get("requested_scope")
+    if not isinstance(requested_scope, Mapping):
+        raise ValueError(
+            "Explicit history universe observation has no source requested_scope"
+        )
+    source_exchanges = {
+        str(item).upper() for item in requested_scope.get("exchanges", ())
+    }
+    source_assets = {
+        str(item).lower() for item in requested_scope.get("asset_types", ())
+    }
+    if source_exchanges != expected_exchanges or source_assets != expected_assets:
+        raise ValueError(
+            "Explicit history universe source metadata does not prove the complete "
+            "SH/SZ stock/ETF scope"
+        )
+    if str(universe.source_metadata.get("backend_group")) != "exchange-public":
+        raise ValueError(
+            "Explicit history universe observation has an unexpected backend group"
+        )
+    expected_endpoints = {
+        "sse-main-stock-list",
+        "sse-star-stock-list",
+        "szse-a-stock-list",
+        "sse-etf-scale-list",
+        "sse-current-full-etf-list",
+        "szse-etf-scale-daily",
+        "szse-current-etf-list",
+    }
+    endpoint_counts = universe.source_metadata.get("endpoint_counts")
+    response_hashes = universe.source_metadata.get("response_sha256")
+    if (
+        not isinstance(endpoint_counts, Mapping)
+        or set(map(str, endpoint_counts)) != expected_endpoints
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in endpoint_counts.values()
+        )
+        or not isinstance(response_hashes, Mapping)
+        or set(map(str, response_hashes)) != expected_endpoints
+        or any(not str(value).strip() for value in response_hashes.values())
+    ):
+        raise ValueError(
+            "Explicit history universe source metadata does not prove every official "
+            "SH/SZ stock/ETF endpoint completed"
+        )
+
+    required_columns = {
+        "instrument_id", "exchange", "local_code", "asset_type", "name",
+        "currency", "listed_date", "board", "buy_lot", "price_tick",
+    }
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            "Explicit history universe table misses required metadata columns: "
+            + ",".join(missing_columns)
+        )
+    table_ids = tuple(map(str, frame["instrument_id"]))
+    if not table_ids or len(table_ids) != len(set(table_ids)):
+        raise ValueError(
+            "Explicit history universe table is empty or has duplicate instruments"
+        )
+    if (
+        not set(map(str, frame["exchange"])) <= expected_exchanges
+        or not set(map(str, frame["asset_type"])) <= expected_assets
+    ):
+        raise ValueError(
+            "Explicit history universe table contains instruments outside SH/SZ stock/ETF"
+        )
+    category_counts = {
+        (exchange, asset_type): int(len(group))
+        for (exchange, asset_type), group in frame.groupby(
+            ["exchange", "asset_type"], dropna=False,
+        )
+    }
+    expected_category_counts = {
+        ("SH", "stock"): (
+            endpoint_counts["sse-main-stock-list"]
+            + endpoint_counts["sse-star-stock-list"]
+        ),
+        ("SZ", "stock"): endpoint_counts["szse-a-stock-list"],
+        ("SH", "etf"): endpoint_counts["sse-current-full-etf-list"],
+        ("SZ", "etf"): endpoint_counts["szse-etf-scale-daily"],
+    }
+    if category_counts != expected_category_counts:
+        raise ValueError(
+            "Explicit history universe table row counts do not match the completed "
+            "official endpoint counts"
+        )
+    covered = tuple(
+        claim for claim in universe.coverage
+        if claim.table is MarketTable.INSTRUMENTS and claim.complete
+    )
+    if len(covered) != 1 or set(covered[0].instrument_ids) != set(table_ids):
+        raise ValueError(
+            "Explicit history universe rows do not match one exact complete coverage claim"
+        )
+
+    requested = set(spec.instrument_ids)
+    if not requested:
+        raise ValueError(
+            "Explicit history universe override requires an exact non-empty instrument scope"
+        )
+    selected = frame.loc[frame["instrument_id"].astype(str).isin(requested)].copy()
+    if set(map(str, selected["instrument_id"])) != requested:
+        raise ValueError(
+            "Explicit history universe observation does not contain every requested instrument"
+        )
+    if (
+        not set(map(str, selected["exchange"])) <= set(spec.exchanges)
+        or not set(map(str, selected["asset_type"])) <= set(spec.asset_types)
+    ):
+        raise ValueError(
+            "Explicit history universe instruments fall outside the build categories"
+        )
+
+    invalid_fields: dict[str, tuple[str, ...]] = {}
+    invalid_dates: dict[str, str] = {}
+    for row in selected.to_dict("records"):
+        instrument_id = str(row["instrument_id"])
+        missing = tuple(
+            field for field in sorted(required_columns - {"instrument_id"})
+            if row.get(field) is None
+            or bool(pd.isna(row.get(field)))
+            or not str(row.get(field)).strip()
+        )
+        if missing:
+            invalid_fields[instrument_id] = missing
+            continue
+        try:
+            listed = date.fromisoformat(str(row["listed_date"])[:10])
+        except ValueError:
+            invalid_dates[instrument_id] = str(row["listed_date"])
+            continue
+        if not spec.start_date <= listed <= spec.end_date:
+            invalid_dates[instrument_id] = listed.isoformat()
+    if invalid_fields or invalid_dates:
+        raise ValueError(
+            "Explicit history universe instruments are not complete new listings inside "
+            f"{spec.start_date.isoformat()}..{spec.end_date.isoformat()}: "
+            f"missing={invalid_fields!r} listed_dates={invalid_dates!r}"
+        )
 
 
 def _select_universe(
