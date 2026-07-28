@@ -15,6 +15,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -24,6 +25,7 @@ from fundlab.common.canonical import canonical_json, stable_digest, to_primitive
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CanonicalMarketData,
+    CorporateActionReconciliationResult,
     CoverageClaim,
     EvidenceCollectionSpec,
     MarketDataWarehouse,
@@ -38,15 +40,19 @@ from fundlab.marketdata import (
     SimulationIncrementValidator,
     SimulationSnapshotBuilder,
     SimulationStatusCollector,
+    SnapshotNotReadyError,
     SnapshotPlan,
     SourceSlice,
     StatusCollectionSpec,
     UniverseScope,
+    build_factor_audit_candidates,
     build_dense_simulation_bars,
     default_provider_registry,
     derive_current_research_snapshot,
+    reconcile_corporate_action_factors,
     record_no_trade_research_partition,
 )
+from fundlab.marketdata.schema import empty_table
 from fundlab.marketdata.history import (
     HistoryBuildSpec,
     HistoryDatabaseBuilder,
@@ -67,6 +73,8 @@ PIPELINE_VERSION = "daily-pipeline-v1"
 CALENDAR_PROVIDERS = ("baostock", "sina-calendar")
 NO_TRADE_PROVIDERS = ("tickflow", "xtquant", "baostock")
 DIRECT_LIMIT_PROVIDERS = ("xtquant", "eastmoney-efinance")
+FACTOR_AUDIT_PROVIDER = "canonical-tickflow-adjusted-factor-audit-r2-v1"
+FACTOR_AUDIT_VERSION = "adjusted-price-factor-audit-r2-v1"
 
 
 class DailyRunInProgress(RuntimeError):
@@ -632,7 +640,7 @@ class DailyPipeline:
             survivorship_bias=previous_scope.survivorship_bias,
             instrument_ids=target_ids,
         )
-        candidate_id = self._compose_candidate(
+        candidate_id, factor_detail = self._compose_candidate(
             research_snapshot_id=research.snapshot_id,
             calendar_frame=calendar_frame,
             increment_scope=increment_scope,
@@ -647,6 +655,7 @@ class DailyPipeline:
                 for observation_id in result["observation_ids"]
             })),
         )
+        stages.append(DailyStage("factor_reconciliation", "ok", factor_detail))
         stages.append(DailyStage("candidate", "ok", {"observation_id": candidate_id}))
 
         try:
@@ -1070,6 +1079,346 @@ class DailyPipeline:
             })
         return combined.snapshot_id
 
+    def _reconcile_action_factor_evidence(
+        self,
+        *,
+        instruments: pd.DataFrame,
+        actions: pd.DataFrame,
+        primary_factors: pd.DataFrame,
+        bars: pd.DataFrame,
+        calendar_frame: pd.DataFrame,
+        increment_scope: UniverseScope,
+    ) -> tuple[
+        CorporateActionReconciliationResult,
+        tuple[str, ...],
+        Mapping[str, Any],
+    ]:
+        candidates = build_factor_audit_candidates(
+            instruments=instruments,
+            actions=actions,
+            factors=primary_factors,
+            universe_scope=increment_scope,
+            daily_bars=bars,
+        )
+        audit_observation_ids: list[str] = []
+        corroborating = empty_table(
+            MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+        )
+        baostock_reused = False
+        adjusted_reused: dict[str, bool] = {}
+        adjusted_candidate_count = 0
+        if candidates:
+            candidate_ids = tuple(sorted(candidates))
+            baostock_request = ProviderRequest(
+                ProviderCapability.ADJUSTMENT_FACTORS,
+                increment_scope.history_start,
+                increment_scope.history_end,
+                candidate_ids,
+            )
+            baostock, baostock_reused = self.ingestion.capture_resumable(
+                "baostock", baostock_request,
+            )
+            baostock_factors = self.warehouse.read_observation_table(
+                baostock.observation_id, MarketTable.ADJUSTMENT_FACTORS,
+            )
+            audit_observation_ids.append(baostock.observation_id)
+            unresolved = self._unmatched_factor_candidates(
+                candidates, baostock_factors,
+            )
+            corroborating = baostock_factors
+            if unresolved:
+                prior_open = tuple(sorted({
+                    str(value) for value in calendar_frame.loc[
+                        calendar_frame["is_open"].fillna(False).astype(bool)
+                        & calendar_frame["session_date"].astype(str).lt(
+                            increment_scope.history_start.isoformat()
+                        ),
+                        "session_date",
+                    ]
+                }))
+                if not prior_open:
+                    raise SnapshotNotReadyError(
+                        "Adjusted-price factor audit has no prior open session"
+                    )
+                audit_start = date.fromisoformat(prior_open[-1])
+                audit_ids = tuple(sorted(unresolved))
+                request_parameters = {
+                    "batch_size": min(self.settings.daily.batch_size, 100),
+                }
+                raw, raw_reused = self.ingestion.capture_resumable(
+                    "tickflow",
+                    ProviderRequest(
+                        ProviderCapability.DAILY_BARS_RAW,
+                        audit_start,
+                        increment_scope.history_end,
+                        audit_ids,
+                        request_parameters,
+                    ),
+                )
+                adjusted, adjusted_was_reused = self.ingestion.capture_resumable(
+                    "tickflow",
+                    ProviderRequest(
+                        ProviderCapability.DAILY_BARS_ADJUSTED,
+                        audit_start,
+                        increment_scope.history_end,
+                        audit_ids,
+                        request_parameters,
+                    ),
+                )
+                adjusted_reused = {
+                    "raw": raw_reused,
+                    "adjusted": adjusted_was_reused,
+                }
+                factor_rows = self._derive_adjusted_price_factor_rows(
+                    raw_bars=self.warehouse.read_observation_table(
+                        raw.observation_id, MarketTable.DAILY_BARS,
+                    ),
+                    adjusted_bars=self.warehouse.read_observation_table(
+                        adjusted.observation_id, MarketTable.DAILY_BARS,
+                    ),
+                    candidates=unresolved,
+                    raw_observation_id=raw.observation_id,
+                    adjusted_observation_id=adjusted.observation_id,
+                )
+                adjusted_candidate_count = sum(map(len, unresolved.values()))
+                dependency_ids = {
+                    baostock.observation_id,
+                    raw.observation_id,
+                    adjusted.observation_id,
+                }
+                for frame in (actions, primary_factors, bars):
+                    if "source_observation_id" not in frame:
+                        continue
+                    relevant = frame.loc[
+                        frame["instrument_id"].astype(str).isin(audit_ids),
+                        "source_observation_id",
+                    ].dropna()
+                    dependency_ids.update(
+                        str(value) for value in relevant
+                        if str(value).strip() not in {"", "<NA>", "None"}
+                    )
+                input_ids = tuple(sorted(dependency_ids))
+                quality = {
+                    "validated": True,
+                    "validator_version": FACTOR_AUDIT_VERSION,
+                    "audit_start": audit_start,
+                    "start_date": increment_scope.history_start,
+                    "end_date": increment_scope.history_end,
+                    "factor_candidates": {
+                        key: dict(sorted(value.items()))
+                        for key, value in sorted(unresolved.items())
+                    },
+                    "input_observation_ids": input_ids,
+                    "row_count": len(factor_rows),
+                }
+                audit = self.warehouse.record_observation(ObservationPayload(
+                    FACTOR_AUDIT_PROVIDER,
+                    max(
+                        self.warehouse.load_observation(item).observed_at
+                        for item in input_ids
+                    ),
+                    ProviderRequest(
+                        ProviderCapability.CANONICAL_RECONCILIATION,
+                        increment_scope.history_start,
+                        increment_scope.history_end,
+                        audit_ids,
+                        {
+                            "kind": "adjusted-price-factor-audit",
+                            "validator_version": FACTOR_AUDIT_VERSION,
+                            "audit_start": audit_start,
+                            "input_observation_ids": input_ids,
+                        },
+                    ),
+                    {MarketTable.ADJUSTMENT_FACTORS: factor_rows},
+                    (CoverageClaim(
+                        MarketTable.ADJUSTMENT_FACTORS,
+                        True,
+                        increment_scope.history_start,
+                        increment_scope.history_end,
+                        audit_ids,
+                        "TickFlow raw/forward-adjusted ratio shift matches official action",
+                    ),),
+                    {
+                        "kind": "field_level_reconciliation",
+                        "reconciliation_ready": True,
+                        "factor_audit_quality": quality,
+                        "input_observation_ids": input_ids,
+                    },
+                ))
+                audit_observation_ids.append(audit.observation_id)
+                tickflow_factors = self.warehouse.read_observation_table(
+                    audit.observation_id, MarketTable.ADJUSTMENT_FACTORS,
+                )
+                corroborating = pd.concat(
+                    (corroborating, tickflow_factors), ignore_index=True,
+                )
+
+        reconciled = reconcile_corporate_action_factors(
+            instruments=instruments,
+            actions=actions,
+            factors=primary_factors,
+            corroborating_factors=corroborating,
+            universe_scope=increment_scope,
+            daily_bars=bars,
+        )
+        detail = {
+            "candidate_events": sum(map(len, candidates.values())),
+            "baostock_observation_id": (
+                audit_observation_ids[0] if candidates else None
+            ),
+            "baostock_reused": baostock_reused,
+            "adjusted_price_candidates": adjusted_candidate_count,
+            "adjusted_price_reused": adjusted_reused,
+            "audit_observation_ids": tuple(audit_observation_ids),
+            "reconciled_actions": len(reconciled.actions),
+            "reconciled_factors": len(reconciled.factors),
+            "evidence_hash": reconciled.evidence_hash,
+        }
+        return reconciled, tuple(audit_observation_ids), detail
+
+    @staticmethod
+    def _unmatched_factor_candidates(
+        candidates: Mapping[str, Mapping[str, float]],
+        factors: pd.DataFrame,
+    ) -> dict[str, dict[str, float]]:
+        rows = factors.to_dict("records")
+        unresolved: dict[str, dict[str, float]] = {}
+        for instrument_id, events in candidates.items():
+            for event_date, expected in events.items():
+                matched = False
+                for row in rows:
+                    if str(row.get("instrument_id")) != instrument_id:
+                        continue
+                    try:
+                        factor_date = date.fromisoformat(
+                            str(row.get("effective_date"))[:10]
+                        )
+                        multiplier = float(row.get("price_multiplier"))
+                    except (TypeError, ValueError):
+                        continue
+                    distance = abs(
+                        (factor_date - date.fromisoformat(event_date)).days
+                    )
+                    if (
+                        isfinite(multiplier)
+                        and multiplier > 0
+                        and distance <= 31
+                        and abs(multiplier - expected) / expected <= 0.03
+                    ):
+                        matched = True
+                        break
+                if not matched:
+                    unresolved.setdefault(instrument_id, {})[event_date] = expected
+        return unresolved
+
+    @staticmethod
+    def _derive_adjusted_price_factor_rows(
+        *,
+        raw_bars: pd.DataFrame,
+        adjusted_bars: pd.DataFrame,
+        candidates: Mapping[str, Mapping[str, float]],
+        raw_observation_id: str,
+        adjusted_observation_id: str,
+    ) -> pd.DataFrame:
+        keys = ["instrument_id", "session_date"]
+        raw = raw_bars.loc[
+            raw_bars["price_mode"].astype(str).eq("raw"),
+            [*keys, "close"],
+        ].rename(columns={"close": "raw_close"})
+        adjusted = adjusted_bars.loc[
+            adjusted_bars["price_mode"].astype(str).eq("adjusted"),
+            [*keys, "close"],
+        ].rename(columns={"close": "adjusted_close"})
+        if raw.duplicated(keys).any() or adjusted.duplicated(keys).any():
+            raise SnapshotNotReadyError(
+                "Adjusted-price factor audit source has duplicate daily keys"
+            )
+        joined = raw.merge(adjusted, on=keys, how="inner", validate="one_to_one")
+        joined["raw_close"] = pd.to_numeric(joined["raw_close"], errors="coerce")
+        joined["adjusted_close"] = pd.to_numeric(
+            joined["adjusted_close"], errors="coerce",
+        )
+        joined = joined.loc[
+            joined[["raw_close", "adjusted_close"]].notna().all(axis=1)
+            & joined["raw_close"].gt(0)
+            & joined["adjusted_close"].gt(0)
+        ].copy()
+        joined["adjustment_ratio"] = (
+            joined["adjusted_close"] / joined["raw_close"]
+        )
+        rows: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for instrument_id, events in sorted(candidates.items()):
+            instrument = joined.loc[
+                joined["instrument_id"].astype(str).eq(instrument_id)
+            ].sort_values("session_date", kind="stable")
+            for event_date, expected in sorted(events.items()):
+                before = instrument.loc[
+                    instrument["session_date"].astype(str).lt(event_date)
+                ].tail(1)
+                event = instrument.loc[
+                    instrument["session_date"].astype(str).eq(event_date)
+                ]
+                if before.empty or len(event) != 1:
+                    failures.append(f"{instrument_id}/{event_date}:missing_ratio_boundary")
+                    continue
+                prior_ratio = float(before.iloc[0]["adjustment_ratio"])
+                event_ratio = float(event.iloc[0]["adjustment_ratio"])
+                multiplier = prior_ratio / event_ratio
+                relative = abs(multiplier - expected) / expected
+                if (
+                    not isfinite(multiplier)
+                    or multiplier <= 0
+                    or relative > 0.03
+                ):
+                    failures.append(
+                        f"{instrument_id}/{event_date}:expected={expected:.12g},"
+                        f"observed={multiplier:.12g},relative={relative:.6g}"
+                    )
+                    continue
+                evidence = {
+                    "provider": "tickflow",
+                    "raw_observation_id": raw_observation_id,
+                    "adjusted_observation_id": adjusted_observation_id,
+                    "prior_session": str(before.iloc[0]["session_date"])[:10],
+                    "event_session": event_date,
+                    "prior_adjusted_to_raw_ratio": prior_ratio,
+                    "event_adjusted_to_raw_ratio": event_ratio,
+                    "observed_price_multiplier": multiplier,
+                    "expected_action_multiplier": expected,
+                    "relative_difference": relative,
+                }
+                rows.append({
+                    "factor_id": "factor-" + stable_digest({
+                        "kind": FACTOR_AUDIT_VERSION,
+                        "instrument_id": instrument_id,
+                        "event_date": event_date,
+                        "evidence": evidence,
+                    })[:24],
+                    "instrument_id": instrument_id,
+                    "effective_date": event_date,
+                    "known_date": event_date,
+                    "price_multiplier": multiplier,
+                    "field_lineage": canonical_json({
+                        "kind": FACTOR_AUDIT_VERSION,
+                        "semantics": "forward-adjusted/raw ratio shift at official event",
+                    }),
+                    "source_payload": canonical_json({
+                        "raw": {},
+                        "adjusted_price_audit": evidence,
+                    }),
+                })
+        if failures:
+            raise SnapshotNotReadyError(
+                "Adjusted-price factor audit failed: " + "; ".join(failures[:10])
+            )
+        return pd.DataFrame(
+            rows,
+            columns=empty_table(
+                MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+            ).columns,
+        )
+
     def _compose_candidate(
         self,
         *,
@@ -1082,7 +1431,7 @@ class DailyPipeline:
         no_trade_observation_id: str | None,
         universe_observation_id: str,
         direct_limit_observation_ids: tuple[str, ...],
-    ) -> str:
+    ) -> tuple[str, Mapping[str, Any]]:
         research = self.warehouse.load_snapshot(research_snapshot_id)
         instruments = self.warehouse.query_loaded_snapshot_table(
             research, MarketTable.INSTRUMENTS,
@@ -1140,6 +1489,25 @@ class DailyPipeline:
             date_column="effective_date",
             scope=increment_scope,
         )
+        try:
+            reconciled, factor_audit_observation_ids, factor_detail = (
+                self._reconcile_action_factor_evidence(
+                    instruments=instruments,
+                    actions=actions,
+                    primary_factors=factors,
+                    bars=bars,
+                    calendar_frame=calendar_frame,
+                    increment_scope=increment_scope,
+                )
+            )
+        except DailyPipelineBlocked:
+            raise
+        except Exception as exc:
+            raise DailyPipelineBlocked("factors", str(exc), {
+                "error_type": type(exc).__name__,
+            }) from exc
+        actions = reconciled.actions
+        factors = reconciled.factors
         input_ids = tuple(sorted({
             *build_partition_ids,
             *(item for item in (no_trade_observation_id,) if item),
@@ -1148,6 +1516,7 @@ class DailyPipeline:
             *evidence_results["stock-actions"].observation_ids,
             *evidence_results["etf-actions"].observation_ids,
             *evidence_results["factors"].observation_ids,
+            *factor_audit_observation_ids,
             *direct_limit_observation_ids,
             universe_observation_id,
         }))
@@ -1203,10 +1572,14 @@ class DailyPipeline:
                     "blockers": (),
                     "unresolved_conflicts": (),
                     "input_observation_ids": input_ids,
+                    "corporate_action_reconciliation": to_primitive(
+                        reconciled.report
+                    ),
+                    "corporate_action_evidence_hash": reconciled.evidence_hash,
                 },
             },
         )
-        return self.warehouse.record_observation(payload).observation_id
+        return self.warehouse.record_observation(payload).observation_id, factor_detail
 
     def _concat_observation_tables(
         self, observation_ids, table: MarketTable,

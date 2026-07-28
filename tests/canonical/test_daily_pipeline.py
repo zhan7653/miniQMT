@@ -18,6 +18,7 @@ from fundlab.marketdata import (
     ProviderRegistry,
     ProviderRequest,
     SnapshotPlan,
+    SnapshotNotReadyError,
     SourceSlice,
     TradeRuleError,
     UniverseScope,
@@ -865,7 +866,8 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
     assert by_name["bars"].detail["excluded"] == 1
     assert by_name["new_instruments"].detail["instrument_ids"] == (_DAILY_NEW_ID,)
     for stage in (
-        "research", "status", "limits", "evidence", "candidate", "validate", "extend",
+        "research", "status", "limits", "evidence", "factor_reconciliation",
+        "candidate", "validate", "extend",
     ):
         assert by_name[stage].status == "ok"
 
@@ -953,6 +955,63 @@ def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monke
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
     assert report["status"] == "blocked"
     assert report["stages"][-1]["name"] == "validate"
+
+
+def test_daily_adjusted_price_factor_audit_only_fills_unmatched_candidates():
+    candidates = {
+        "510050.SH": {"2026-07-28": 0.5},
+        "600000.SH": {"2026-07-28": 0.9},
+    }
+    baostock = pd.DataFrame([{
+        "instrument_id": "600000.SH",
+        "effective_date": "2026-07-28",
+        "price_multiplier": 0.901,
+    }])
+
+    unresolved = DailyPipeline._unmatched_factor_candidates(candidates, baostock)
+
+    assert unresolved == {"510050.SH": {"2026-07-28": 0.5}}
+    raw = pd.DataFrame([
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-27",
+            "price_mode": "raw", "close": 2.0,
+        },
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-28",
+            "price_mode": "raw", "close": 1.0,
+        },
+    ])
+    adjusted = pd.DataFrame([
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-27",
+            "price_mode": "adjusted", "close": 1.0,
+        },
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-28",
+            "price_mode": "adjusted", "close": 1.0,
+        },
+    ])
+
+    factors = DailyPipeline._derive_adjusted_price_factor_rows(
+        raw_bars=raw,
+        adjusted_bars=adjusted,
+        candidates=unresolved,
+        raw_observation_id="obs-raw-factor-audit",
+        adjusted_observation_id="obs-adjusted-factor-audit",
+    )
+
+    assert len(factors) == 1
+    assert factors.iloc[0]["price_multiplier"] == pytest.approx(0.5)
+    payload = json.loads(factors.iloc[0]["source_payload"])
+    assert payload["adjusted_price_audit"]["prior_session"] == "2026-07-27"
+    with pytest.raises(SnapshotNotReadyError, match="expected=0.4"):
+        DailyPipeline._derive_adjusted_price_factor_rows(
+            raw_bars=raw,
+            adjusted_bars=adjusted,
+            candidates={"510050.SH": {"2026-07-28": 0.4}},
+            raw_observation_id="obs-raw-factor-audit",
+            adjusted_observation_id="obs-adjusted-factor-audit",
+        )
 
 
 def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
