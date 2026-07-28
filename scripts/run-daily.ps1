@@ -10,6 +10,18 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
+# Task Scheduler can start with an environment block captured before a user
+# variable was created. Refresh the LLM credential from the current user's
+# environment store without ever persisting it in the repository or log.
+if ([string]::IsNullOrWhiteSpace($env:FUNDLAB_LLM_API_KEY)) {
+    $userLlmApiKey = [Environment]::GetEnvironmentVariable(
+        "FUNDLAB_LLM_API_KEY", "User"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($userLlmApiKey)) {
+        $env:FUNDLAB_LLM_API_KEY = $userLlmApiKey
+    }
+}
+
 $logDir = Join-Path $repo "logs\daily"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"

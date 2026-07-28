@@ -111,8 +111,9 @@ uv run fundlab agent decide --all        # or --account-id paper-agent [--dry-ru
 uv run fundlab agent decide --account-id paper-dividend --force-review --dry-run
 ```
 
-`paper-dividend` starts with `scheduled: false`; perform one real forced dry-run before enabling it.
-Its relay key comes only from `FUNDLAB_LLM_API_KEY`. Optional SMTP mail uses
+`paper-dividend` is enabled for the weekly cadence after a successful real forced dry-run. Repeat
+the command above whenever relay compatibility needs revalidation. Its relay key comes only from
+`FUNDLAB_LLM_API_KEY`. Optional SMTP mail uses
 `FUNDLAB_SMTP_HOST`, `FUNDLAB_SMTP_PORT`, `FUNDLAB_SMTP_USER`, and
 `FUNDLAB_SMTP_PASSWORD`; no credential belongs in YAML. A weekly review may email a new validated
 opportunity without changing the portfolio. A policy or strict-response failure writes no decision

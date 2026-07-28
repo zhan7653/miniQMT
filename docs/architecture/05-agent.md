@@ -117,18 +117,19 @@ FUNDLAB_SMTP_USER
 FUNDLAB_SMTP_PASSWORD
 ```
 
-## 灰度启用
+## 启用状态
 
-`paper-dividend` 已加入模拟账户，但策略初始是 `scheduled: false`。因此账户会随每日
-管线推进并保持现金，`agent decide --all` 不会调用外部模型。先配置密钥后运行：
+`paper-dividend` 已加入模拟账户，并在真实中转预演和本地决策校验通过后设为
+`scheduled: true`。`agent decide --all` 每周最后一个交易日调用外部模型；其他交易日
+返回 hold，不产生模型费用。需要重新验证中转兼容性时运行：
 
 ```powershell
 uv run fundlab agent decide --account-id paper-dividend --force-review --dry-run
 ```
 
-这会真实调用中转并完整验证结果，但不写决策、记忆或邮件。确认后可去掉
-`--dry-run` 做一次人工投递，或把 `scheduled` 改为 `true` 交给周度节奏。Web API
-同样支持 body 字段 `force_review`；仪表盘提供“忽略周度节奏，立即评估”复选框。
+这会真实调用中转并完整验证结果，但不写决策、记忆或邮件。需要人工提前评估时可去掉
+`--dry-run` 做一次投递。Web API 同样支持 body 字段 `force_review`；仪表盘提供
+“忽略周度节奏，立即评估”复选框。
 
 CLI 完整接口：
 
@@ -149,6 +150,6 @@ fundlab agent decide (--account-id X | --all)
 
 - `test_agent_decision.py`：共享时点、策略、服务、文件幂等与并发写入契约；
 - `test_dividend_value_agent.py`：章程边界、候选限制、冷却/强制退出、资料与记忆上限、
-  `/responses` 请求形状、严格解析、瞬时重试、灰度开关、hold 邮件与零决策文件；
+  `/responses` 请求形状、中转兼容子集、严格本地复验、瞬时重试、计划开关、hold 邮件与零决策文件；
 - `test_cli.py` / `test_web_api.py`：CLI 与 Web 共享服务入口；
 - 正式快照候选只读冒烟：不调用模型、不写数据，验证实际候选数量大于 10。

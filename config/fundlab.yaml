@@ -77,9 +77,9 @@ agent:
         511010.SH: "0.9"
     paper-dividend:
       type: dividend-value
-      # Gray release: manual `--force-review --dry-run` first. Flip to true
-      # only after one real Responses call and its decision validation pass.
-      scheduled: false
+      # Enabled after a real Responses dry-run and local decision validation
+      # completed successfully on 2026-07-29.
+      scheduled: true
       charter: agents/dividend-value.yaml
       top_n: 10
       min_yield: "0.04"

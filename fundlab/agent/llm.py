@@ -94,7 +94,6 @@ class ResponsesDividendValueAdviser:
                     "schema": _review_schema(top_n),
                 }
             },
-            "metadata": {"agent": "dividend-value", "prompt_version": _PROMPT_VERSION},
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
@@ -162,7 +161,6 @@ def _review_schema(top_n: int) -> dict[str, object]:
                 "items": {"type": "string", "minLength": 1, "maxLength": 64},
                 "minItems": top_n,
                 "maxItems": top_n,
-                "uniqueItems": True,
             },
             "selection_rationale": {
                 "type": "array",

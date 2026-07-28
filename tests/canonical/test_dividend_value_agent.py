@@ -403,6 +403,11 @@ def test_responses_adapter_uses_plural_endpoint_strict_schema_and_large_cap(monk
     assert captured["body"]["reasoning"] == {"effort": "medium"}
     assert captured["body"]["max_output_tokens"] == 32768
     assert captured["body"]["text"]["format"]["strict"] is True
+    assert "uniqueItems" not in (
+        captured["body"]["text"]["format"]["schema"]["properties"]
+        ["selected_instruments"]
+    )
+    assert "metadata" not in captured["body"]
     assert result.response_id == "resp-1"
 
 
@@ -440,6 +445,24 @@ def test_responses_adapter_rechecks_schema_limits_locally(monkeypatch):
     )
 
     with pytest.raises(ResponsesAPIError, match="invalid action or summary"):
+        adviser.review({"facts": []}, top_n=2)
+
+
+def test_responses_adapter_rejects_duplicate_selections_locally(monkeypatch):
+    monkeypatch.setenv("FUNDLAB_LLM_API_KEY", "test-key")
+    payload = response_payload()
+    structured = json.loads(payload["output"][0]["content"][0]["text"])
+    structured["selected_instruments"][1] = structured["selected_instruments"][0]
+    structured["selection_rationale"][1]["instrument_id"] = (
+        structured["selection_rationale"][0]["instrument_id"]
+    )
+    payload["output"][0]["content"][0]["text"] = json.dumps(structured)
+    adviser = ResponsesDividendValueAdviser(
+        AgentLLMSettings(base_url="https://relay.example/v1"),
+        open_fn=lambda request, *, timeout: FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(ResponsesAPIError, match="empty or duplicated"):
         adviser.review({"facts": []}, top_n=2)
 
 
@@ -591,12 +614,12 @@ def test_overwrite_hold_supersedes_old_future_decision_and_dry_run_does_not(
     ) is None
 
 
-def test_committed_dividend_agent_config_is_gray_and_uses_confirmed_budget():
+def test_committed_dividend_agent_config_is_scheduled_and_uses_confirmed_budget():
     settings = load_foundation_settings(
         Path(__file__).resolve().parents[2] / "config" / "fundlab.yaml"
     )
     policy_settings = settings.agent.policies["paper-dividend"]
-    assert policy_settings.scheduled is False
+    assert policy_settings.scheduled is True
     assert settings.agent.llm.model == "gpt-5.6-sol"
     assert settings.agent.llm.max_output_tokens == 32768
     assert settings.agent.llm.store is False
