@@ -428,6 +428,21 @@ class HistoryDatabaseBuilder:
                 refresh_universe=refresh_universe,
             )
 
+    @staticmethod
+    def default_universe_request(spec: HistoryBuildSpec) -> ProviderRequest:
+        """Return the exact request used by the default historical master path."""
+
+        return ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={
+                "exchanges": tuple(
+                    item for item in spec.exchanges if item in {"SH", "SZ"}
+                ),
+                "asset_types": spec.asset_types,
+                "include_delisted": False,
+            },
+        )
+
     def _build_locked(
         self,
         spec: HistoryBuildSpec,
@@ -439,16 +454,7 @@ class HistoryDatabaseBuilder:
         self.warehouse.initialize()
         self.report_root.mkdir(parents=True, exist_ok=True)
         if universe_observation_id is None:
-            universe_request = ProviderRequest(
-                ProviderCapability.INSTRUMENTS,
-                parameters={
-                    "exchanges": tuple(
-                        item for item in spec.exchanges if item in {"SH", "SZ"}
-                    ),
-                    "asset_types": spec.asset_types,
-                    "include_delisted": False,
-                },
-            )
+            universe_request = self.default_universe_request(spec)
             universe, _ = self._capture_exact(
                 self.universe_provider,
                 universe_request,

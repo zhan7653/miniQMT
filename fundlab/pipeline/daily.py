@@ -392,7 +392,7 @@ class DailyPipeline:
             source_pair=self.settings.daily.source_pair,
             adjudicator_provider=self.settings.daily.adjudicator,
         )
-        build = builder.build(HistoryBuildSpec(
+        history_spec = HistoryBuildSpec(
             start_date=increment_start,
             end_date=target,
             universe_as_of=target,
@@ -401,7 +401,16 @@ class DailyPipeline:
             asset_types=("stock", "etf"),
             batch_size=self.settings.daily.batch_size,
             publish=False,
-        ), refresh_universe=True)
+        )
+        refresh_historical_universe = self._historical_universe_refresh_required(
+            builder.universe_provider,
+            builder.default_universe_request(history_spec),
+            target,
+        )
+        build = builder.build(
+            history_spec,
+            refresh_universe=refresh_historical_universe,
+        )
         build_report = json.loads(Path(build.report).read_text(encoding="utf-8"))
         included_ids = set(map(str, build_report.get("included_instrument_ids", ())))
         excluded: Mapping[str, Any] = build_report.get("excluded", {})
@@ -414,6 +423,10 @@ class DailyPipeline:
             "snapshot_id": build.snapshot_id,
             "included": len(included_ids),
             "excluded": len(excluded),
+            "historical_universe_observation_id": build_report.get(
+                "universe_observation_id"
+            ),
+            "historical_universe_refreshed": refresh_historical_universe,
         }))
 
         missing = tuple(sorted(set(target_ids) - included_ids))
@@ -644,6 +657,34 @@ class DailyPipeline:
             observed.observation_id, MarketTable.INSTRUMENTS,
         )
         return observed.observation_id, frame
+
+    def _historical_universe_refresh_required(
+        self,
+        provider: str,
+        request: ProviderRequest,
+        target: date,
+    ) -> bool:
+        """Refresh once per target boundary, then pin retries to that observation.
+
+        The default historical master has no as-of parameter.  Refreshing it on
+        every retry changes the history/research identities and strands otherwise
+        valid downstream checkpoints.  An exact, complete observation captured no
+        earlier than the target session is already fresh enough for that target;
+        the next target refreshes naturally once this boundary becomes stale.
+        """
+
+        matches = self.warehouse.matching_observations(
+            provider=provider,
+            request=request,
+        )
+        if not matches:
+            return True
+        latest = matches[-1]
+        complete = any(
+            claim.table is MarketTable.INSTRUMENTS and claim.complete
+            for claim in latest.coverage
+        )
+        return not complete or latest.observed_at.date() < target
 
     @staticmethod
     def _only_missing_sources(reasons: Any) -> bool:

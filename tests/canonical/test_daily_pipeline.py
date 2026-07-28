@@ -877,3 +877,85 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
         price_mode="raw",
     )
     assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)
+
+
+def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    real_collector = daily_module.SimulationEvidenceCollector
+
+    class TransientEvidenceCollector:
+        failed_once = False
+
+        def __init__(self, *args, **kwargs):
+            self.delegate = real_collector(*args, **kwargs)
+
+        def collect(self, spec):
+            if spec.kind == "stock-actions" and not self.failed_once:
+                type(self).failed_once = True
+                return SimpleNamespace(
+                    status="incomplete",
+                    blockers=("temporary provider failure",),
+                    observation_ids=(),
+                )
+            return self.delegate.collect(spec)
+
+    monkeypatch.setattr(
+        daily_module, "SimulationEvidenceCollector", TransientEvidenceCollector,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    first = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+    second = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert first.status == "blocked"
+    assert first.stages[-1].name == "evidence"
+    assert second.status == "ok", [
+        (stage.name, stage.status, stage.detail) for stage in second.stages
+    ]
+    first_bars = next(stage for stage in first.stages if stage.name == "bars")
+    second_bars = next(stage for stage in second.stages if stage.name == "bars")
+    assert first_bars.detail["historical_universe_refreshed"] is True
+    assert second_bars.detail["historical_universe_refreshed"] is False
+    assert first_bars.detail["historical_universe_observation_id"] == (
+        second_bars.detail["historical_universe_observation_id"]
+    )
+    assert first_bars.detail["build_id"] == second_bars.detail["build_id"]
+    baostock = registry.provider("baostock")
+    assert sum(
+        request.capability is ProviderCapability.INSTRUMENTS
+        for request in baostock.calls
+    ) == 1
