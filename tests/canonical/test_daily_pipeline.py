@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -248,3 +249,123 @@ def test_scoped_events_and_missing_source_reasons():
     assert not DailyPipeline._only_missing_sources(["missing_source:tickflow", "critical_conflict:close"])
     assert not DailyPipeline._only_missing_sources([])
     assert not DailyPipeline._only_missing_sources(None)
+    assert DailyPipeline._only_not_in_historical_master(["not_in_historical_master"])
+    assert not DailyPipeline._only_not_in_historical_master([
+        "not_in_historical_master", "missing_source:tickflow",
+    ])
+
+
+def _new_listing_frame(listed_date: date) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "instrument_id": "688825.SH",
+        "exchange": "SH",
+        "local_code": "688825",
+        "asset_type": "stock",
+        "name": "New STAR",
+        "currency": "CNY",
+        "listed_date": listed_date.isoformat(),
+        "delisted_date": None,
+        "board": "star",
+        "exchange_product_class": None,
+        "buy_lot": 100,
+        "quantity_step": None,
+        "odd_lot_sell_all": None,
+        "price_tick": 0.01,
+        "sell_delay_sessions": None,
+        "price_limit_ratio": None,
+        "field_lineage": None,
+        "source_payload": None,
+    }])
+
+
+def test_daily_new_listing_supplement_uses_official_exact_master(tmp_path):
+    report = tmp_path / "new-listing-build.json"
+    report.write_text(json.dumps({
+        "included_instrument_ids": ["688825.SH"],
+        "excluded": {},
+        "canonical_observation_ids": ["obs-new-canonical"],
+    }), encoding="utf-8")
+
+    class Builder:
+        seen = None
+
+        def build(self, spec, *, universe_observation_id=None):
+            self.seen = (spec, universe_observation_id)
+            return SimpleNamespace(
+                report=report,
+                snapshot_id="snap-new-listing",
+                blockers=(),
+                build_id="history-new-listing",
+            )
+
+    builder = Builder()
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry_with_calendars(),
+    )
+
+    snapshot_id, partitions, detail = pipeline._build_new_instrument_supplement(
+        builder=builder,
+        universe_observation_id="obs-exchange-official",
+        official_frame=_new_listing_frame(FUTURE_DAYS[0]),
+        instrument_ids=("688825.SH",),
+        start=FUTURE_DAYS[0],
+        end=FUTURE_DAYS[0],
+    )
+
+    assert snapshot_id == "snap-new-listing"
+    assert partitions == ("obs-new-canonical",)
+    assert detail["instrument_ids"] == ("688825.SH",)
+    assert builder.seen[0].instrument_ids == ("688825.SH",)
+    assert builder.seen[1] == "obs-exchange-official"
+
+
+def test_daily_new_listing_supplement_fails_closed_outside_increment_window(tmp_path):
+    class Builder:
+        def build(self, spec, *, universe_observation_id=None):  # pragma: no cover
+            raise AssertionError("metadata validation must happen before source capture")
+
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry_with_calendars(),
+    )
+
+    with pytest.raises(DailyPipelineBlocked, match="exact onboarding scope"):
+        pipeline._build_new_instrument_supplement(
+            builder=Builder(),
+            universe_observation_id="obs-exchange-official",
+            official_frame=_new_listing_frame(DAYS[0]),
+            instrument_ids=("688825.SH",),
+            start=FUTURE_DAYS[0],
+            end=FUTURE_DAYS[0],
+        )
+
+
+def test_daily_new_listing_supplement_fails_closed_without_two_source_evidence(tmp_path):
+    report = tmp_path / "new-listing-incomplete.json"
+    report.write_text(json.dumps({
+        "included_instrument_ids": [],
+        "excluded": {"688825.SH": ["missing_source:xtquant"]},
+        "canonical_observation_ids": [],
+    }), encoding="utf-8")
+
+    class Builder:
+        def build(self, spec, *, universe_observation_id=None):
+            return SimpleNamespace(
+                report=report,
+                snapshot_id=None,
+                blockers=("excluded_instruments:1",),
+                build_id="history-new-listing-incomplete",
+            )
+
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry_with_calendars(),
+    )
+
+    with pytest.raises(DailyPipelineBlocked, match="exact reconciled partition"):
+        pipeline._build_new_instrument_supplement(
+            builder=Builder(),
+            universe_observation_id="obs-exchange-official",
+            official_frame=_new_listing_frame(FUTURE_DAYS[0]),
+            instrument_ids=("688825.SH",),
+            start=FUTURE_DAYS[0],
+            end=FUTURE_DAYS[0],
+        )

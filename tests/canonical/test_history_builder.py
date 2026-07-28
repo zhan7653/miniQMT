@@ -195,6 +195,57 @@ def test_history_builder_publishes_only_exact_two_source_scope_and_resumes(tmp_p
     assert repeated.report == first.report
 
 
+def test_history_builder_can_use_exact_exchange_master_for_new_listing(tmp_path):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(_AllTickProvider())
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    official = _master().loc[lambda frame: frame["instrument_id"].eq("600000.SH")].copy()
+    official.loc[:, "instrument_id"] = "688825.SH"
+    official.loc[:, "local_code"] = "688825"
+    official.loc[:, "name"] = "New STAR"
+    official.loc[:, "listed_date"] = START.isoformat()
+    official.loc[:, "board"] = "star"
+    universe = warehouse.record_observation(ObservationPayload(
+        "exchange-public",
+        datetime(2026, 7, 18, 0, 3, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={"as_of_date": END.isoformat()},
+        ),
+        {MarketTable.INSTRUMENTS: official},
+        (CoverageClaim(
+            MarketTable.INSTRUMENTS,
+            True,
+            instrument_ids=("688825.SH",),
+        ),),
+        {"backend_group": "exchange-public"},
+    ))
+    builder = HistoryDatabaseBuilder(
+        warehouse, tmp_path / "reports", registry=registry,
+    )
+
+    result = builder.build(
+        HistoryBuildSpec(
+            END,
+            start_date=START,
+            instrument_ids=("688825.SH",),
+            exchanges=("SH",),
+        ),
+        universe_observation_id=universe.observation_id,
+    )
+
+    assert result.status == "complete"
+    assert result.included_instruments == 1
+    assert result.universe_observation_id == universe.observation_id
+    market = CanonicalMarketData.open(
+        tmp_path / "market",
+        result.snapshot_id,
+        required_readiness=ReadinessProfile.RESEARCH_PRICE,
+    )
+    assert market.instrument("688825.SH").name == "New STAR"
+
+
 def test_history_shards_assemble_one_disjoint_published_cohort(tmp_path):
     registry = ProviderRegistry()
     registry.register(_BaoProvider())

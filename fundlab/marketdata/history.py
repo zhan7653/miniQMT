@@ -372,34 +372,90 @@ class HistoryDatabaseBuilder:
         self.adjudicator_provider = adjudicator_provider
         self.policy = policy or default_reconciliation_policy(ReadinessProfile.RESEARCH_PRICE)
 
-    def build(self, spec: HistoryBuildSpec) -> HistoryBuildResult:
+    def build(
+        self,
+        spec: HistoryBuildSpec,
+        *,
+        universe_observation_id: str | None = None,
+    ) -> HistoryBuildResult:
+        """Build one exact price partition.
+
+        ``universe_observation_id`` is an explicit, already-recorded master
+        override for narrowly scoped work such as onboarding an exchange-
+        announced new listing before the default historical master catches up.
+        It does not change the default historical build path.
+        """
         self.warehouse.initialize()
         lock_id = stable_digest({
             "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
             "spec": spec,
             "universe_provider": self.universe_provider,
+            "universe_observation_id": universe_observation_id,
             "source_pair": self.source_pair,
             "adjudicator_provider": self.adjudicator_provider,
             "policy_version": self.policy.version,
         })[:24]
         lock_path = self.warehouse.root / "builds" / ".locks" / f"{lock_id}.lock"
         with _exclusive_build_lock(lock_path):
-            return self._build_locked(spec)
+            return self._build_locked(
+                spec,
+                universe_observation_id=universe_observation_id,
+            )
 
-    def _build_locked(self, spec: HistoryBuildSpec) -> HistoryBuildResult:
+    def _build_locked(
+        self,
+        spec: HistoryBuildSpec,
+        *,
+        universe_observation_id: str | None,
+    ) -> HistoryBuildResult:
         self.warehouse.initialize()
         self.report_root.mkdir(parents=True, exist_ok=True)
-        universe_request = ProviderRequest(
-            ProviderCapability.INSTRUMENTS,
-            parameters={
-                "exchanges": tuple(item for item in spec.exchanges if item in {"SH", "SZ"}),
-                "asset_types": spec.asset_types,
-                "include_delisted": False,
-            },
-        )
-        universe, _ = self._capture_exact(
-            self.universe_provider, universe_request, refresh=spec.refresh,
-        )
+        if universe_observation_id is None:
+            universe_request = ProviderRequest(
+                ProviderCapability.INSTRUMENTS,
+                parameters={
+                    "exchanges": tuple(
+                        item for item in spec.exchanges if item in {"SH", "SZ"}
+                    ),
+                    "asset_types": spec.asset_types,
+                    "include_delisted": False,
+                },
+            )
+            universe, _ = self._capture_exact(
+                self.universe_provider, universe_request, refresh=spec.refresh,
+            )
+        else:
+            universe = self.warehouse.load_observation(universe_observation_id)
+            if universe.provider != "exchange-public":
+                raise ValueError(
+                    "Explicit history universe override must be an exchange-public observation"
+                )
+            if universe.request.capability is not ProviderCapability.INSTRUMENTS:
+                raise ValueError(
+                    "Explicit history universe observation must carry instrument metadata"
+                )
+            declared_as_of = universe.request.parameters.get("as_of_date")
+            if str(declared_as_of) != spec.universe_as_of.isoformat():
+                raise ValueError(
+                    "Explicit history universe observation as_of_date does not match the "
+                    f"build scope: {declared_as_of!r} != {spec.universe_as_of.isoformat()!r}"
+                )
+            covered = tuple(
+                claim for claim in universe.coverage
+                if claim.table is MarketTable.INSTRUMENTS and claim.complete
+            )
+            if not covered:
+                raise ValueError(
+                    "Explicit history universe observation has no complete instrument claim"
+                )
+            requested = set(spec.instrument_ids)
+            if requested and not any(
+                requested <= set(claim.instrument_ids) for claim in covered
+            ):
+                raise ValueError(
+                    "Explicit history universe observation does not completely cover the "
+                    "requested instruments"
+                )
         universe_frame = self.warehouse.read_observation_table(
             universe.observation_id, MarketTable.INSTRUMENTS,
         )

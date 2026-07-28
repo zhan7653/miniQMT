@@ -371,6 +371,7 @@ class DailyPipeline:
         universe_obs, official_frame = self._official_universe(target)
         official_ids = set(map(str, official_frame["instrument_id"]))
         previous_ids = set(previous_scope.instrument_ids)
+        new_ids = tuple(sorted(official_ids - previous_ids))
         removed = tuple(sorted(previous_ids - official_ids))
         if removed:
             raise DailyPipelineBlocked("universe", "official universe removed predecessor instruments", {
@@ -380,16 +381,17 @@ class DailyPipeline:
         stages.append(DailyStage("universe", "ok", {
             "universe_observation_id": universe_obs,
             "official_instruments": len(official_ids),
-            "new_instruments": len(official_ids - previous_ids),
+            "new_instruments": len(new_ids),
         }))
 
-        build = HistoryDatabaseBuilder(
+        builder = HistoryDatabaseBuilder(
             self.warehouse,
             self.report_root,
             registry=self.registry,
             source_pair=self.settings.daily.source_pair,
             adjudicator_provider=self.settings.daily.adjudicator,
-        ).build(HistoryBuildSpec(
+        )
+        build = builder.build(HistoryBuildSpec(
             start_date=increment_start,
             end_date=target,
             universe_as_of=target,
@@ -418,7 +420,13 @@ class DailyPipeline:
             item for item in missing
             if item in previous_ids and self._only_missing_sources(excluded.get(item))
         )
-        unexplained = tuple(sorted(set(missing) - set(no_trade_only)))
+        new_master_missing = tuple(
+            item for item in missing
+            if item in new_ids and self._only_not_in_historical_master(excluded.get(item))
+        )
+        unexplained = tuple(sorted(
+            set(missing) - set(no_trade_only) - set(new_master_missing)
+        ))
         if unexplained:
             raise DailyPipelineBlocked("bars", "instruments missing for reasons other than no-trade", {
                 "unexplained_sample": unexplained[:20],
@@ -429,6 +437,28 @@ class DailyPipeline:
             })
 
         research_source_id = build.snapshot_id
+        supplement_snapshot_ids: tuple[str, ...] = ()
+        build_partition_ids = tuple(
+            map(str, build_report.get("canonical_observation_ids", ()))
+        )
+        if new_master_missing:
+            supplement_id, supplement_partitions, detail = (
+                self._build_new_instrument_supplement(
+                    builder=builder,
+                    universe_observation_id=universe_obs,
+                    official_frame=official_frame,
+                    instrument_ids=new_master_missing,
+                    start=increment_start,
+                    end=target,
+                )
+            )
+            supplement_snapshot_ids = (supplement_id,)
+            build_partition_ids = tuple(sorted({
+                *build_partition_ids,
+                *supplement_partitions,
+            }))
+            stages.append(DailyStage("new_instruments", "ok", detail))
+
         no_trade_observation_id: str | None = None
         if no_trade_only:
             no_trade_observation_id = self._record_no_trade(
@@ -439,18 +469,21 @@ class DailyPipeline:
                 end=target,
                 instrument_ids=no_trade_only,
             )
+            stages.append(DailyStage("no_trade", "ok", {
+                "instruments": no_trade_only,
+                "observation_id": no_trade_observation_id,
+            }))
+
+        if supplement_snapshot_ids or no_trade_observation_id is not None:
             research_source_id = self._combine_partitions(
                 main_snapshot_id=build.snapshot_id,
+                supplement_snapshot_ids=supplement_snapshot_ids,
                 no_trade_observation_id=no_trade_observation_id,
                 no_trade_ids=no_trade_only,
                 target_ids=target_ids,
                 start=increment_start,
                 end=target,
             )
-            stages.append(DailyStage("no_trade", "ok", {
-                "instruments": no_trade_only,
-                "observation_id": no_trade_observation_id,
-            }))
 
         research = derive_current_research_snapshot(
             self.warehouse,
@@ -524,7 +557,7 @@ class DailyPipeline:
             increment_scope=increment_scope,
             status_results=status_results,
             evidence_results=evidence_results,
-            build_partition_ids=tuple(build_report.get("canonical_observation_ids", ())),
+            build_partition_ids=build_partition_ids,
             no_trade_observation_id=no_trade_observation_id,
             universe_observation_id=universe_obs,
         )
@@ -592,6 +625,118 @@ class DailyPipeline:
             return False
         return all(str(item).startswith("missing_source:") for item in reasons)
 
+    @staticmethod
+    def _only_not_in_historical_master(reasons: Any) -> bool:
+        return (
+            isinstance(reasons, (list, tuple))
+            and tuple(map(str, reasons)) == ("not_in_historical_master",)
+        )
+
+    def _build_new_instrument_supplement(
+        self,
+        *,
+        builder: HistoryDatabaseBuilder,
+        universe_observation_id: str,
+        official_frame: pd.DataFrame,
+        instrument_ids: tuple[str, ...],
+        start: date,
+        end: date,
+    ) -> tuple[str, tuple[str, ...], Mapping[str, Any]]:
+        """Build a disjoint exact partition for exchange-announced new listings."""
+        selected = official_frame.loc[
+            official_frame["instrument_id"].astype(str).isin(instrument_ids)
+        ].copy()
+        if (
+            len(selected) != len(instrument_ids)
+            or selected["instrument_id"].astype(str).nunique() != len(instrument_ids)
+        ):
+            raise DailyPipelineBlocked(
+                "new_instruments",
+                "official new-instrument master is missing or duplicated",
+                {"instrument_ids": instrument_ids},
+            )
+        required = (
+            "exchange", "local_code", "asset_type", "name", "currency",
+            "listed_date", "board", "buy_lot", "price_tick",
+        )
+        invalid_fields: dict[str, tuple[str, ...]] = {}
+        invalid_dates: dict[str, str] = {}
+        for row in selected.to_dict("records"):
+            instrument_id = str(row["instrument_id"])
+            missing_fields = tuple(
+                field for field in required
+                if row.get(field) is None
+                or pd.isna(row.get(field))
+                or not str(row.get(field)).strip()
+            )
+            if missing_fields:
+                invalid_fields[instrument_id] = missing_fields
+                continue
+            try:
+                listed = date.fromisoformat(str(row["listed_date"]))
+            except ValueError:
+                invalid_dates[instrument_id] = str(row["listed_date"])
+                continue
+            if not start <= listed <= end:
+                invalid_dates[instrument_id] = listed.isoformat()
+        if invalid_fields or invalid_dates:
+            raise DailyPipelineBlocked(
+                "new_instruments",
+                "new-instrument metadata is outside the exact onboarding scope",
+                {
+                    "invalid_fields": invalid_fields,
+                    "invalid_listed_dates": invalid_dates,
+                    "onboarding_start": start.isoformat(),
+                    "onboarding_end": end.isoformat(),
+                },
+            )
+
+        result = builder.build(
+            HistoryBuildSpec(
+                start_date=start,
+                end_date=end,
+                universe_as_of=end,
+                instrument_ids=instrument_ids,
+                exchanges=("SH", "SZ"),
+                asset_types=("stock", "etf"),
+                batch_size=min(self.settings.daily.batch_size, len(instrument_ids)),
+                publish=False,
+            ),
+            universe_observation_id=universe_observation_id,
+        )
+        report = json.loads(Path(result.report).read_text(encoding="utf-8"))
+        included = tuple(sorted(map(str, report.get("included_instrument_ids", ()))))
+        excluded = report.get("excluded", {})
+        if (
+            result.snapshot_id is None
+            or included != tuple(sorted(instrument_ids))
+            or excluded
+        ):
+            raise DailyPipelineBlocked(
+                "new_instruments",
+                "new-instrument evidence did not produce an exact reconciled partition",
+                {
+                    "instrument_ids": instrument_ids,
+                    "included": included,
+                    "excluded": excluded,
+                    "blockers": result.blockers,
+                },
+            )
+        partitions = tuple(map(str, report.get("canonical_observation_ids", ())))
+        if not partitions:
+            raise DailyPipelineBlocked(
+                "new_instruments",
+                "new-instrument partition has no canonical observation evidence",
+                {"instrument_ids": instrument_ids},
+            )
+        return result.snapshot_id, partitions, {
+            "instrument_ids": instrument_ids,
+            "build_id": result.build_id,
+            "snapshot_id": result.snapshot_id,
+            "canonical_observation_ids": partitions,
+            "universe_observation_id": universe_observation_id,
+        }
+
     def _record_no_trade(
         self,
         *,
@@ -625,7 +770,8 @@ class DailyPipeline:
         self,
         *,
         main_snapshot_id: str,
-        no_trade_observation_id: str,
+        supplement_snapshot_ids: tuple[str, ...],
+        no_trade_observation_id: str | None,
         no_trade_ids: tuple[str, ...],
         target_ids: tuple[str, ...],
         start: date,
@@ -633,16 +779,20 @@ class DailyPipeline:
     ) -> str:
         main = self.warehouse.load_snapshot(main_snapshot_id)
         selections = [*main.plan.selections]
-        reason = "daily pipeline no-trade consensus for full-window suspensions"
-        selections.extend((
-            SourceSlice(
-                no_trade_observation_id, MarketTable.INSTRUMENTS, reason, no_trade_ids,
-            ),
-            SourceSlice(
-                no_trade_observation_id, MarketTable.DAILY_BARS, reason, no_trade_ids,
-                start, end,
-            ),
-        ))
+        for snapshot_id in supplement_snapshot_ids:
+            supplement = self.warehouse.load_snapshot(snapshot_id)
+            selections.extend(supplement.plan.selections)
+        if no_trade_observation_id is not None:
+            reason = "daily pipeline no-trade consensus for full-window suspensions"
+            selections.extend((
+                SourceSlice(
+                    no_trade_observation_id, MarketTable.INSTRUMENTS, reason, no_trade_ids,
+                ),
+                SourceSlice(
+                    no_trade_observation_id, MarketTable.DAILY_BARS, reason, no_trade_ids,
+                    start, end,
+                ),
+            ))
         scope = UniverseScope(
             CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
             end,
