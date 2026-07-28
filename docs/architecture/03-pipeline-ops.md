@@ -41,7 +41,7 @@ flowchart TD
     TGT -- "目标日 ≤ 已发布数据头" --> UTD["data: up_to_date → 退出码 0"]
     TGT --> U["universe: exchange-public 官方全量清单<br/>前任标的被移除 → 阻断"]
     U --> H["bars: HistoryDatabaseBuilder 增量构建<br/>双源 tickflow+xtquant, 仲裁 baostock"]
-    H --> NEW["交易所已确认、但历史主表尚未收录的新上市代码:<br/>只按上市日窗口建立官方主表补充分区"]
+    H --> NEW["交易所已确认、但历史主表尚未收录的新上市代码:<br/>首日按上市窗口补充;后续只凭连续已发布前序快照延续"]
     NEW --> NT["旧标的缺失仅允许 no-trade:<br/>tickflow/xtquant/baostock 三源无成交共识<br/>其余缺失原因 → 阻断"]
     NT --> RS["research: derive_current_research_snapshot<br/>不完整 → 阻断"]
     RS --> SE["status: xtquant+baostock 停牌/ST/前收<br/>与双源 research OHLC 合成 dense bars<br/>evidence: stock-actions / etf-actions / factors"]
@@ -57,7 +57,7 @@ flowchart TD
 ### 幂等性与被阻断后的恢复
 
 - 全程幂等:源观测捕获走 `capture_resumable`(同范围已完整则复用);已验证的日历观测按输入观测 ID 精确匹配复用(`_matching_validated_calendar`);目标日不超过已发布数据头时直接 `up_to_date`;账户按 run 链头推进,重复运行不会重放会话。
-- 新上市标的不会触发全历史重建：仅当代码来自当日 `exchange-public` 完整主表（完整 SH/SZ stock/ETF 请求、七个端点均成功、端点行数与表/唯一 complete claim 一致、request/source 两处 `as_of_date` 都等于目标日）、`listed_date` 落在本次增量窗口、关键元数据齐全时，`HistoryDatabaseBuilder` 才以该不可变官方观测作为显式 master override，对新代码单独采集双源行情并建立互不重叠的补充分区。源行情、状态或后续证据不足仍针对该精确代码失败关闭；更早上市却突然出现的代码视为历史修正，不能伪装成新股自动接入。
+- 新上市标的不会触发全历史重建：daily 每次刷新缺省历史主表观测（行情观测仍按原范围可续传复用）。仅当代码来自当日 `exchange-public` 完整主表（完整 SH/SZ stock/ETF 请求、七个端点均成功、端点行数与表/唯一 complete claim 一致、request/source 两处 `as_of_date` 都等于目标日）、`listed_date` 落在本次增量窗口、关键元数据齐全时，`HistoryDatabaseBuilder` 才以该不可变官方观测作为显式 master override，对新代码单独采集双源行情并建立互不重叠的补充分区。若后续交易日历史主表仍未收录该代码，只能用“当前已发布、组件化、范围连续且标的身份完全一致”的模拟前序快照继续补充；该前序快照 ID 会进入构建身份和 canonical 审计记录。源行情、状态或后续证据不足仍针对该精确代码失败关闭；没有可信前序证明的更早上市代码视为历史修正，不能伪装成新股自动接入。
 - 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。最常见的阻断原因是 MiniQMT 客户端(xtquant 数据源)不在线——这是每次计划运行的**前置条件**。`run-daily.ps1` 失败时会在 `logs/daily/LAST-RUN-BLOCKED` 落一个标记文件(内容为时间戳),下次成功自动删除;人工排查从 `data/reports/daily/` 里对应 `daily-*.md` 的阶段明细入手。
 
 ## 对外接口

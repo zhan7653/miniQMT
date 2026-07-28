@@ -1209,12 +1209,17 @@ class SimulationIncrementValidator:
         calendar_manifest = self.warehouse.load_observation(calendar_observation_id)
         if not any(item.table is MarketTable.CALENDAR for item in calendar_manifest.files):
             raise SnapshotNotReadyError("Simulation increment calendar observation has no calendar")
-        calendar = self.warehouse.read_observation_table(
+        full_calendar = self.warehouse.read_observation_table(
             calendar_observation_id, MarketTable.CALENDAR,
         )
-        calendar = calendar.loc[
-            calendar["exchange"].astype(str).isin(exchanges)
-            & calendar["session_date"].astype(str).between(
+        rule_calendar = full_calendar.loc[
+            full_calendar["exchange"].astype(str).isin(exchanges)
+            & full_calendar["session_date"].astype(str).le(
+                universe_scope.history_end.isoformat()
+            )
+        ].reset_index(drop=True)
+        calendar = rule_calendar.loc[
+            rule_calendar["session_date"].astype(str).between(
                 universe_scope.history_start.isoformat(),
                 universe_scope.history_end.isoformat(),
             )
@@ -1251,7 +1256,7 @@ class SimulationIncrementValidator:
                 universe_observation_id=candidate_observation_id,
             ).rules
         bars = materialize_daily_trade_rules(
-            bars, instruments, calendar, etf_rules=etf_rules,
+            bars, instruments, rule_calendar, etf_rules=etf_rules,
         )
 
         provider_bars, upstream_manifests = self._provider_audit_bars(

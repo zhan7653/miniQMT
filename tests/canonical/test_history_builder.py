@@ -376,7 +376,7 @@ def test_history_builder_default_lock_identity_remains_backward_compatible(
     monkeypatch.setattr(
         builder,
         "_build_locked",
-        lambda received, *, universe_observation_id: sentinel,
+        lambda received, **kwargs: sentinel,
     )
 
     assert builder.build(spec) is sentinel

@@ -377,14 +377,30 @@ class HistoryDatabaseBuilder:
         spec: HistoryBuildSpec,
         *,
         universe_observation_id: str | None = None,
+        trusted_predecessor_snapshot_id: str | None = None,
+        refresh_universe: bool = False,
     ) -> HistoryBuildResult:
         """Build one exact price partition.
 
         ``universe_observation_id`` is an explicit, already-recorded master
         override for narrowly scoped work such as onboarding an exchange-
         announced new listing before the default historical master catches up.
-        It does not change the default historical build path.
+        An older listing is accepted only when ``trusted_predecessor_snapshot_id``
+        proves it is already a member of the current published simulation
+        snapshot.  ``refresh_universe`` refreshes only the default master; source
+        price observations retain their normal resumable behavior.
         """
+        if (
+            trusted_predecessor_snapshot_id is not None
+            and universe_observation_id is None
+        ):
+            raise ValueError(
+                "A trusted predecessor is valid only with an explicit official universe"
+            )
+        if refresh_universe and universe_observation_id is not None:
+            raise ValueError(
+                "An explicit universe observation cannot also request a universe refresh"
+            )
         self.warehouse.initialize()
         lock_identity: dict[str, Any] = {
             "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
@@ -399,12 +415,18 @@ class HistoryDatabaseBuilder:
         # share the same build/checkpoint identity during a rolling upgrade.
         if universe_observation_id is not None:
             lock_identity["universe_observation_id"] = universe_observation_id
+        if trusted_predecessor_snapshot_id is not None:
+            lock_identity["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
         lock_id = stable_digest(lock_identity)[:24]
         lock_path = self.warehouse.root / "builds" / ".locks" / f"{lock_id}.lock"
         with _exclusive_build_lock(lock_path):
             return self._build_locked(
                 spec,
                 universe_observation_id=universe_observation_id,
+                trusted_predecessor_snapshot_id=trusted_predecessor_snapshot_id,
+                refresh_universe=refresh_universe,
             )
 
     def _build_locked(
@@ -412,6 +434,8 @@ class HistoryDatabaseBuilder:
         spec: HistoryBuildSpec,
         *,
         universe_observation_id: str | None,
+        trusted_predecessor_snapshot_id: str | None,
+        refresh_universe: bool,
     ) -> HistoryBuildResult:
         self.warehouse.initialize()
         self.report_root.mkdir(parents=True, exist_ok=True)
@@ -427,7 +451,9 @@ class HistoryDatabaseBuilder:
                 },
             )
             universe, _ = self._capture_exact(
-                self.universe_provider, universe_request, refresh=spec.refresh,
+                self.universe_provider,
+                universe_request,
+                refresh=spec.refresh or refresh_universe,
             )
             universe_frame = self.warehouse.read_observation_table(
                 universe.observation_id, MarketTable.INSTRUMENTS,
@@ -437,7 +463,13 @@ class HistoryDatabaseBuilder:
             universe_frame = self.warehouse.read_observation_table(
                 universe.observation_id, MarketTable.INSTRUMENTS,
             )
-            _validate_explicit_history_universe(universe, universe_frame, spec)
+            _validate_explicit_history_universe(
+                self.warehouse,
+                universe,
+                universe_frame,
+                spec,
+                trusted_predecessor_snapshot_id=trusted_predecessor_snapshot_id,
+            )
         eligible, not_in_master = _select_universe(universe_frame, spec)
         cohort_id = _cohort_id(
             spec,
@@ -445,15 +477,21 @@ class HistoryDatabaseBuilder:
             self.source_pair,
             self.policy.version,
             self.adjudicator_provider,
+            trusted_predecessor_snapshot_id,
         )
-        build_id = "history-" + stable_digest({
+        build_identity: dict[str, Any] = {
             "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
             "spec": spec,
             "universe_observation_id": universe.observation_id,
             "source_pair": self.source_pair,
             "adjudicator_provider": self.adjudicator_provider,
             "policy_version": self.policy.version,
-        })[:24]
+        }
+        if trusted_predecessor_snapshot_id is not None:
+            build_identity["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
+        build_id = "history-" + stable_digest(build_identity)[:24]
         checkpoint_path = self.warehouse.root / "builds" / build_id / "checkpoint.json"
         checkpoint = _read_checkpoint(checkpoint_path, build_id)
         stored_batches = checkpoint.setdefault("batches", {})
@@ -484,10 +522,11 @@ class HistoryDatabaseBuilder:
                 instrument_batch,
                 batch_master,
                 universe,
+                trusted_predecessor_snapshot_id,
             )
             results.append(outcome)
             stored_batches[batch_id] = to_primitive(outcome)
-            checkpoint.update({
+            checkpoint_detail: dict[str, Any] = {
                 "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
                 "build_id": build_id,
                 "cohort_id": cohort_id,
@@ -495,7 +534,12 @@ class HistoryDatabaseBuilder:
                 "universe_observation_id": universe.observation_id,
                 "source_pair": self.source_pair,
                 "policy_version": self.policy.version,
-            })
+            }
+            if trusted_predecessor_snapshot_id is not None:
+                checkpoint_detail["trusted_predecessor_snapshot_id"] = (
+                    trusted_predecessor_snapshot_id
+                )
+            checkpoint.update(checkpoint_detail)
             _write_atomic(checkpoint_path, checkpoint)
 
         canonical = [item for item in results if item.canonical_observation_id]
@@ -602,6 +646,10 @@ class HistoryDatabaseBuilder:
                 "Scope expansion is blocked wherever two-source rows do not agree."
             ),
         }
+        if trusted_predecessor_snapshot_id is not None:
+            report_payload["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
         report_hash = stable_digest(report_payload)[:16]
         report_path = self.report_root / f"history-build-{build_id}-{report_hash}.json"
         if report_path.exists():
@@ -842,6 +890,7 @@ class HistoryDatabaseBuilder:
         instrument_ids: tuple[str, ...],
         batch_master: pd.DataFrame,
         universe: ObservationManifest,
+        trusted_predecessor_snapshot_id: str | None,
     ) -> HistoryBatchResult:
         source_manifests: dict[str, ObservationManifest] = {}
         reused = True
@@ -904,6 +953,7 @@ class HistoryDatabaseBuilder:
             batch_master,
             universe,
             source_manifests,
+            trusted_predecessor_snapshot_id,
         )
         conflict_ids = tuple(sorted(
             instrument_id
@@ -954,6 +1004,7 @@ class HistoryDatabaseBuilder:
                     batch_master,
                     universe,
                     source_manifests,
+                    trusted_predecessor_snapshot_id,
                 )
         canonical = None if payload is None else self.warehouse.record_observation(payload)
         return HistoryBatchResult(
@@ -975,6 +1026,7 @@ class HistoryDatabaseBuilder:
         batch_master: pd.DataFrame,
         universe: ObservationManifest,
         source_manifests: Mapping[str, ObservationManifest],
+        trusted_predecessor_snapshot_id: str | None,
     ) -> tuple[ObservationPayload | None, tuple[str, ...], Mapping[str, tuple[str, ...]]]:
         primary_name, secondary_name = self.source_pair
         primary_manifest = source_manifests[primary_name]
@@ -1259,18 +1311,23 @@ class HistoryDatabaseBuilder:
             primary_manifest.observed_at,
             *(manifest.observed_at for manifest in source_manifests.values()),
         )
+        reconciliation_parameters: dict[str, Any] = {
+            "input_observation_ids": tuple(sorted(source_ids.values())),
+            "universe_observation_id": universe.observation_id,
+            "policy_version": self.policy.version,
+            "readiness": ReadinessProfile.RESEARCH_PRICE.value,
+            "coverage_semantics": "instrument_lifecycle_active_price_sessions",
+        }
+        if trusted_predecessor_snapshot_id is not None:
+            reconciliation_parameters["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
         request = ProviderRequest(
             ProviderCapability.CANONICAL_RECONCILIATION,
             spec.start_date,
             spec.end_date,
             included,
-            {
-                "input_observation_ids": tuple(sorted(source_ids.values())),
-                "universe_observation_id": universe.observation_id,
-                "policy_version": self.policy.version,
-                "readiness": ReadinessProfile.RESEARCH_PRICE.value,
-                "coverage_semantics": "instrument_lifecycle_active_price_sessions",
-            },
+            reconciliation_parameters,
         )
         partition_quality = {
             "validated": True,
@@ -1294,6 +1351,10 @@ class HistoryDatabaseBuilder:
             "universe_definition": CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
             "universe_as_of": spec.universe_as_of,
         }
+        if trusted_predecessor_snapshot_id is not None:
+            partition_quality["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
         payload = ObservationPayload(
             f"canonical-reconciler-{self.policy.version}",
             observed_at,
@@ -1798,9 +1859,12 @@ def _record_current_master_observation(
 
 
 def _validate_explicit_history_universe(
+    warehouse: MarketDataWarehouse,
     universe: ObservationManifest,
     frame: pd.DataFrame,
     spec: HistoryBuildSpec,
+    *,
+    trusted_predecessor_snapshot_id: str | None,
 ) -> None:
     """Accept only a complete official current-universe proof for new listings."""
 
@@ -1960,8 +2024,47 @@ def _validate_explicit_history_universe(
             "Explicit history universe instruments fall outside the build categories"
         )
 
+    trusted_rows: dict[str, Mapping[str, Any]] = {}
+    trusted_history_end: date | None = None
+    if trusted_predecessor_snapshot_id is not None:
+        if warehouse.current_snapshot_id() != trusted_predecessor_snapshot_id:
+            raise ValueError(
+                "Explicit history carry-forward predecessor is not the current snapshot"
+            )
+        predecessor = warehouse.load_snapshot(trusted_predecessor_snapshot_id)
+        predecessor_scope = predecessor.plan.universe_scope
+        if (
+            predecessor.plan.readiness is not ReadinessProfile.SIMULATION
+            or not predecessor.component_selections
+            or predecessor_scope is None
+            or predecessor_scope.definition != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE
+            or date.fromordinal(predecessor_scope.history_end.toordinal() + 1)
+            != spec.start_date
+        ):
+            raise ValueError(
+                "Explicit history carry-forward requires the contiguous current "
+                "componentized simulation predecessor"
+            )
+        predecessor_ids = set(predecessor_scope.instrument_ids)
+        carried_ids = requested & predecessor_ids
+        previous_frame = warehouse.query_loaded_snapshot_table(
+            predecessor,
+            MarketTable.INSTRUMENTS,
+            instrument_ids=tuple(sorted(carried_ids)),
+        )
+        if set(map(str, previous_frame["instrument_id"])) != carried_ids:
+            raise ValueError(
+                "Explicit history carry-forward predecessor instrument rows are incomplete"
+            )
+        trusted_rows = {
+            str(row["instrument_id"]): row
+            for row in previous_frame.to_dict("records")
+        }
+        trusted_history_end = predecessor_scope.history_end
+
     invalid_fields: dict[str, tuple[str, ...]] = {}
     invalid_dates: dict[str, str] = {}
+    invalid_predecessor_identity: dict[str, tuple[str, ...]] = {}
     for row in selected.to_dict("records"):
         instrument_id = str(row["instrument_id"])
         missing = tuple(
@@ -1978,13 +2081,25 @@ def _validate_explicit_history_universe(
         except ValueError:
             invalid_dates[instrument_id] = str(row["listed_date"])
             continue
-        if not spec.start_date <= listed <= spec.end_date:
+        if spec.start_date <= listed <= spec.end_date:
+            continue
+        previous = trusted_rows.get(instrument_id)
+        if previous is None or trusted_history_end is None or listed > trusted_history_end:
             invalid_dates[instrument_id] = listed.isoformat()
-    if invalid_fields or invalid_dates:
+            continue
+        mismatched = tuple(
+            field for field in ("exchange", "local_code", "asset_type", "listed_date")
+            if str(row.get(field))[:10] != str(previous.get(field))[:10]
+        )
+        if mismatched:
+            invalid_predecessor_identity[instrument_id] = mismatched
+    if invalid_fields or invalid_dates or invalid_predecessor_identity:
         raise ValueError(
             "Explicit history universe instruments are not complete new listings inside "
-            f"{spec.start_date.isoformat()}..{spec.end_date.isoformat()}: "
-            f"missing={invalid_fields!r} listed_dates={invalid_dates!r}"
+            "the build window or exact members of the contiguous trusted predecessor: "
+            f"scope={spec.start_date.isoformat()}..{spec.end_date.isoformat()} "
+            f"missing={invalid_fields!r} listed_dates={invalid_dates!r} "
+            f"predecessor_identity={invalid_predecessor_identity!r}"
         )
 
 
@@ -2259,8 +2374,9 @@ def _cohort_id(
     source_pair: tuple[str, str],
     policy_version: str,
     adjudicator_provider: str | None = None,
+    trusted_predecessor_snapshot_id: str | None = None,
 ) -> str:
-    return "cohort-" + stable_digest({
+    identity: dict[str, Any] = {
         "schema_version": HISTORY_BUILD_SCHEMA_VERSION,
         "start_date": spec.start_date,
         "end_date": spec.end_date,
@@ -2272,7 +2388,10 @@ def _cohort_id(
         "adjudicator_provider": adjudicator_provider,
         "policy_version": policy_version,
         "universe_observation_id": universe_observation_id,
-    })[:24]
+    }
+    if trusted_predecessor_snapshot_id is not None:
+        identity["trusted_predecessor_snapshot_id"] = trusted_predecessor_snapshot_id
+    return "cohort-" + stable_digest(identity)[:24]
 
 
 def _chunks(values: tuple[str, ...], size: int):

@@ -401,7 +401,7 @@ class DailyPipeline:
             asset_types=("stock", "etf"),
             batch_size=self.settings.daily.batch_size,
             publish=False,
-        ))
+        ), refresh_universe=True)
         build_report = json.loads(Path(build.report).read_text(encoding="utf-8"))
         included_ids = set(map(str, build_report.get("included_instrument_ids", ())))
         excluded: Mapping[str, Any] = build_report.get("excluded", {})
@@ -425,8 +425,17 @@ class DailyPipeline:
             item for item in missing
             if item in new_ids and self._only_not_in_historical_master(excluded.get(item))
         )
+        carried_master_missing = tuple(
+            item for item in missing
+            if item in previous_ids and self._only_not_in_historical_master(
+                excluded.get(item)
+            )
+        )
         unexplained = tuple(sorted(
-            set(missing) - set(no_trade_only) - set(new_master_missing)
+            set(missing)
+            - set(no_trade_only)
+            - set(new_master_missing)
+            - set(carried_master_missing)
         ))
         if unexplained:
             raise DailyPipelineBlocked("bars", "instruments missing for reasons other than no-trade", {
@@ -442,15 +451,22 @@ class DailyPipeline:
         build_partition_ids = tuple(
             map(str, build_report.get("canonical_observation_ids", ()))
         )
-        if new_master_missing:
+        official_master_missing = tuple(sorted({
+            *new_master_missing,
+            *carried_master_missing,
+        }))
+        if official_master_missing:
             supplement_id, supplement_partitions, detail = (
                 self._build_new_instrument_supplement(
                     builder=builder,
                     universe_observation_id=universe_obs,
                     official_frame=official_frame,
-                    instrument_ids=new_master_missing,
+                    instrument_ids=official_master_missing,
                     start=increment_start,
                     end=target,
+                    trusted_predecessor_snapshot_id=(
+                        predecessor.snapshot_id if carried_master_missing else None
+                    ),
                 )
             )
             supplement_snapshot_ids = (supplement_id,)
@@ -458,7 +474,16 @@ class DailyPipeline:
                 *build_partition_ids,
                 *supplement_partitions,
             }))
-            stages.append(DailyStage("new_instruments", "ok", detail))
+            detail = {
+                **detail,
+                "new_instrument_ids": new_master_missing,
+                "carried_instrument_ids": carried_master_missing,
+            }
+            stages.append(DailyStage(
+                "new_instruments" if new_master_missing else "carried_instruments",
+                "ok",
+                detail,
+            ))
 
         no_trade_observation_id: str | None = None
         if no_trade_only:
@@ -642,8 +667,9 @@ class DailyPipeline:
         instrument_ids: tuple[str, ...],
         start: date,
         end: date,
+        trusted_predecessor_snapshot_id: str | None = None,
     ) -> tuple[str, tuple[str, ...], Mapping[str, Any]]:
-        """Build a disjoint exact partition for exchange-announced new listings."""
+        """Build an exact official-master partition for new or already trusted listings."""
         selected = official_frame.loc[
             official_frame["instrument_id"].astype(str).isin(instrument_ids)
         ].copy()
@@ -678,7 +704,9 @@ class DailyPipeline:
             except ValueError:
                 invalid_dates[instrument_id] = str(row["listed_date"])
                 continue
-            if not start <= listed <= end:
+            if listed > end or (
+                listed < start and trusted_predecessor_snapshot_id is None
+            ):
                 invalid_dates[instrument_id] = listed.isoformat()
         if invalid_fields or invalid_dates:
             raise DailyPipelineBlocked(
@@ -692,6 +720,13 @@ class DailyPipeline:
                 },
             )
 
+        build_kwargs: dict[str, str] = {
+            "universe_observation_id": universe_observation_id,
+        }
+        if trusted_predecessor_snapshot_id is not None:
+            build_kwargs["trusted_predecessor_snapshot_id"] = (
+                trusted_predecessor_snapshot_id
+            )
         result = builder.build(
             HistoryBuildSpec(
                 start_date=start,
@@ -703,7 +738,7 @@ class DailyPipeline:
                 batch_size=min(self.settings.daily.batch_size, len(instrument_ids)),
                 publish=False,
             ),
-            universe_observation_id=universe_observation_id,
+            **build_kwargs,
         )
         report = json.loads(Path(result.report).read_text(encoding="utf-8"))
         included = tuple(sorted(map(str, report.get("included_instrument_ids", ()))))
@@ -736,6 +771,7 @@ class DailyPipeline:
             "snapshot_id": result.snapshot_id,
             "canonical_observation_ids": partitions,
             "universe_observation_id": universe_observation_id,
+            "trusted_predecessor_snapshot_id": trusted_predecessor_snapshot_id,
         }
 
     def _record_no_trade(

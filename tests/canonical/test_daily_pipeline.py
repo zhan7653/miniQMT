@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
 from types import SimpleNamespace
@@ -341,8 +341,21 @@ def _daily_official_instruments() -> pd.DataFrame:
 
 
 def _daily_calendar() -> pd.DataFrame:
-    base = calendar_frame()
-    return pd.concat((base, base.assign(exchange="SZ")), ignore_index=True)
+    open_dates = {*DAYS, *FUTURE_DAYS}
+    days = tuple(
+        DAYS[0] + timedelta(days=offset)
+        for offset in range((FUTURE_DAYS[-1] - DAYS[0]).days + 1)
+    )
+    return pd.DataFrame([
+        {
+            "exchange": exchange,
+            "session_date": day.isoformat(),
+            "is_open": day in open_dates,
+            "source_payload": None,
+        }
+        for exchange in ("SH", "SZ")
+        for day in days
+    ])
 
 
 def _daily_increment_bars(request: ProviderRequest) -> pd.DataFrame:
@@ -351,9 +364,16 @@ def _daily_increment_bars(request: ProviderRequest) -> pd.DataFrame:
         if request.start_date <= day <= request.end_date
     )
     rows = []
-    for ordinal, instrument_id in enumerate(request.instrument_ids):
+    base_prices = {
+        "000001.SZ": 10.0,
+        "159001.SZ": 11.0,
+        "510050.SH": 12.0,
+        "600000.SH": 13.0,
+        "688825.SH": 14.0,
+    }
+    for instrument_id in request.instrument_ids:
         for session_ordinal, day in enumerate(sessions):
-            close = 10.0 + ordinal + session_ordinal
+            close = base_prices[instrument_id] + session_ordinal
             previous_close = close - 0.5
             tick = Decimal("0.001") if instrument_id in {
                 "159001.SZ", "510050.SH",
@@ -397,8 +417,10 @@ class _DailyFixtureProvider:
     def __init__(self, name: str, capabilities: frozenset[ProviderCapability]):
         self.name = name
         self.capabilities = capabilities
+        self.calls: list[ProviderRequest] = []
 
     def observe(self, request: ProviderRequest) -> ObservationPayload:
+        self.calls.append(request)
         observed_at = datetime(2026, 7, 18, 1, 0, tzinfo=timezone.utc)
         if request.capability is ProviderCapability.TRADING_CALENDAR:
             return ObservationPayload(
@@ -784,38 +806,74 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
         ),
     )
     _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
     pipeline = DailyPipeline(
         build_settings(tmp_path, ()),
-        registry=_daily_extension_registry(),
+        registry=registry,
         now_fn=lambda: evening_of(FUTURE_DAYS[0]),
     )
 
-    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+    first = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
 
-    assert result.status == "ok", [
-        (stage.name, stage.status, stage.detail) for stage in result.stages
+    assert first.status == "ok", [
+        (stage.name, stage.status, stage.detail) for stage in first.stages
     ]
-    assert result.snapshot_id is not None
-    by_name = {stage.name: stage for stage in result.stages}
+    assert first.snapshot_id is not None
+    by_name = {stage.name: stage for stage in first.stages}
     assert by_name["bars"].detail["included"] == len(_DAILY_BASE_IDS)
     assert by_name["bars"].detail["excluded"] == 1
     assert by_name["new_instruments"].detail["instrument_ids"] == (_DAILY_NEW_ID,)
     for stage in ("research", "status", "evidence", "candidate", "validate", "extend"):
         assert by_name[stage].status == "ok"
 
+    second = pipeline.run(target_date=FUTURE_DAYS[1], skip_accounts=True)
+
+    assert second.status == "ok", [
+        (stage.name, stage.status, stage.detail) for stage in second.stages
+    ]
+    assert second.snapshot_id is not None and second.snapshot_id != first.snapshot_id
+    second_by_name = {stage.name: stage for stage in second.stages}
+    assert "new_instruments" not in second_by_name
+    assert second_by_name["carried_instruments"].detail[
+        "carried_instrument_ids"
+    ] == (_DAILY_NEW_ID,)
+    assert second_by_name["carried_instruments"].detail[
+        "new_instrument_ids"
+    ] == ()
+    assert second_by_name["carried_instruments"].detail[
+        "trusted_predecessor_snapshot_id"
+    ] == first.snapshot_id
+    carried_observation_id = second_by_name["carried_instruments"].detail[
+        "canonical_observation_ids"
+    ][0]
+    carried_observation = MarketDataWarehouse(tmp_path / "market").load_observation(
+        carried_observation_id
+    )
+    assert carried_observation.request.parameters[
+        "trusted_predecessor_snapshot_id"
+    ] == first.snapshot_id
+    assert carried_observation.source_metadata["partition_quality"][
+        "trusted_predecessor_snapshot_id"
+    ] == first.snapshot_id
+    baostock = registry.provider("baostock")
+    assert sum(
+        request.capability is ProviderCapability.INSTRUMENTS
+        for request in baostock.calls
+    ) == 2
+
     warehouse = MarketDataWarehouse(tmp_path / "market")
-    assert warehouse.current_snapshot_id() == result.snapshot_id
-    published = warehouse.load_snapshot(result.snapshot_id)
+    assert warehouse.current_snapshot_id() == second.snapshot_id
+    published = warehouse.load_snapshot(second.snapshot_id)
     scope = published.plan.universe_scope
     assert scope is not None
-    assert scope.as_of_date == scope.history_end == FUTURE_DAYS[0]
+    assert scope.as_of_date == scope.history_end == FUTURE_DAYS[1]
     assert set(scope.instrument_ids) == {*_DAILY_BASE_IDS, _DAILY_NEW_ID}
     increment_bars = warehouse.query_loaded_snapshot_table(
         published,
         MarketTable.DAILY_BARS,
         instrument_ids=scope.instrument_ids,
-        start_date=FUTURE_DAYS[0],
-        end_date=FUTURE_DAYS[0],
+        start_date=FUTURE_DAYS[1],
+        end_date=FUTURE_DAYS[1],
         price_mode="raw",
     )
     assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)
