@@ -850,6 +850,46 @@ def test_history_builder_aligns_explicit_suspension_with_flat_zero_turnover_bar(
     assert bars["session_date"].tolist() == [END.isoformat()]
 
 
+def test_no_trade_check_accepts_explicit_flat_zero_turnover_placeholder():
+    frame = _bars("baostock", ("600000.SH",)).iloc[:1].copy()
+    frame.loc[:, ["open", "high", "low", "close"]] = 10.0
+    frame.loc[:, "volume"] = 0.0
+    frame.loc[:, "amount"] = float("nan")
+    frame.loc[:, "suspended"] = True
+
+    assert history_module._active_no_trade_instruments(
+        frame,
+        applicable={"600000.SH"},
+        start_date=START,
+        end_date=END,
+    ) == set()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("high", 10.1),
+        ("volume", 1.0),
+        ("amount", 1.0),
+        ("suspended", False),
+    ),
+)
+def test_no_trade_check_rejects_active_or_ambiguous_rows(field, value):
+    frame = _bars("baostock", ("600000.SH",)).iloc[:1].copy()
+    frame.loc[:, ["open", "high", "low", "close"]] = 10.0
+    frame.loc[:, "volume"] = 0.0
+    frame.loc[:, "amount"] = float("nan")
+    frame.loc[:, "suspended"] = True
+    frame.loc[:, field] = value
+
+    assert history_module._active_no_trade_instruments(
+        frame,
+        applicable={"600000.SH"},
+        start_date=START,
+        end_date=END,
+    ) == {"600000.SH"}
+
+
 def test_current_research_projection_uses_exact_exchange_membership_and_disjoint_supplement(
     tmp_path,
 ):

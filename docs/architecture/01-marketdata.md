@@ -115,6 +115,7 @@ flowchart LR
 - **观测不可变、来源具名**:`ProviderRegistry.observe` 校验返回的 `provider` 身份与请求一致;`capture_resumable` 只在完整覆盖声明恰好包住请求边界时复用,否则重新采集。
 - **发布原子性与线性历史**:模拟快照只能经 `publish_if_current` 比较-交换发布,前代不是现任即失败;指针替换用临时文件 + `os.replace` + 文件锁,跨进程安全。
 - **增量不重开历史**:`IncrementalBuildAudit` 记录本次构建实际打开的前代日线组件,已发布历史(`increment_start` 之前)不被触碰;未来日历会话的重叠由 `(priority, ordinal)` 叠放决定,最新公告胜出。
+- **无成交证据不等于无行**:全窗口停牌时,有些源返回空表,BaoStock 会返回 `suspended=true` 的平价零成交占位行;两者都可作为独立 no-trade 证据。占位行必须同时满足 OHLC 平价、成交量为零、成交额为空或为零;否则仍视为活跃/含糊证据并失败关闭。
 - **幂等**:历史构建带检查点与构建锁可续传;`SimulationSnapshotBuilder` 的 EOD 报告按内容哈希命名,重跑内容一致则静默,内容冲突即抛错("Immutable simulation EOD report collision")。
 - **哈希绑定**:组件 ID 由规范化帧摘要派生(内容寻址),观测/快照清单逐文件记 sha256,当前指针绑定 manifest 哈希——任何一层被改动都会在读取时暴露。
 - **点时纪律**:所有历史查询必须显式给 `as_of`,`end_date > as_of` 抛错;复权因子按 `known_date` 过滤,复权行剥离执行专属字段;对账候选按独立 `backend_group` 计数,同集团多源不虚增置信。

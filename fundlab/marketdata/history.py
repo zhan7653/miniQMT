@@ -223,13 +223,12 @@ def record_no_trade_research_partition(
         frame = warehouse.read_observation_table(
             manifest.observation_id, MarketTable.DAILY_BARS,
         )
-        active = set(map(str, frame.loc[
-            frame["instrument_id"].isin(applicable)
-            & frame["session_date"].between(
-                start_date.isoformat(), end_date.isoformat(),
-            ),
-            "instrument_id",
-        ]))
+        active = _active_no_trade_instruments(
+            frame,
+            applicable=applicable,
+            start_date=start_date,
+            end_date=end_date,
+        )
         if active:
             raise ValueError(
                 f"No-trade source contains active rows: {manifest.observation_id}/{sorted(active)}"
@@ -2200,6 +2199,46 @@ def _safe_suspension_keys(
             for values in unsafe.itertuples(index=False, name=None)
         )
     return safe
+
+
+def _active_no_trade_instruments(
+    frame: pd.DataFrame,
+    *,
+    applicable: set[str],
+    start_date: date,
+    end_date: date,
+) -> set[str]:
+    """Return ids with anything other than an explicit no-trade placeholder.
+
+    Some upstreams omit a fully suspended session while BaoStock keeps a flat
+    zero-volume row and explicitly marks it suspended.  Both representations
+    mean no trade.  A non-flat price, real volume/amount, or missing suspension
+    flag remains active evidence and must fail closed.
+    """
+
+    relevant = frame.loc[
+        frame["instrument_id"].isin(applicable)
+        & frame["session_date"].between(
+            start_date.isoformat(), end_date.isoformat(),
+        )
+    ].copy()
+    if relevant.empty:
+        return set()
+    explicit = relevant["suspended"].fillna(False).astype(bool)
+    prices = relevant[["open", "high", "low", "close"]].apply(
+        pd.to_numeric, errors="coerce",
+    )
+    volume = pd.to_numeric(relevant["volume"], errors="coerce")
+    amount = pd.to_numeric(relevant["amount"], errors="coerce")
+    safe_placeholder = (
+        explicit
+        & prices.notna().all(axis=1)
+        & prices.max(axis=1).sub(prices.min(axis=1)).abs().le(1e-12)
+        & volume.notna()
+        & volume.abs().le(1e-9)
+        & (amount.isna() | amount.abs().le(1e-9))
+    )
+    return set(map(str, relevant.loc[~safe_placeholder, "instrument_id"]))
 
 
 def _independent_consensus_frame(
