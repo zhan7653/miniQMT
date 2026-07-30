@@ -99,7 +99,7 @@ flowchart TD
 ### 运维脚本与数据目录
 
 - `scripts/register-daily-task.ps1`:注册计划任务 "FundLab Daily"——周二至周六 06:00(`-Time` 可改),在上游数据稳定后处理前一交易日;`StartWhenAvailable` 错过补跑,失败 30 分钟间隔重试 3 次(幂等所以安全),4 小时执行上限,`IgnoreNew` 拒绝并发实例;卸载用 `Unregister-ScheduledTask -TaskName "FundLab Daily" -Confirm:$false`。
-- `scripts/run-daily.ps1`:切到仓库根,在 daily 前尝试 `uv run fundlab agent decide --all`,daily 成功发布后再幂等补一次(用新账本头和新日历为下个交易日预置决策);任一最终决策失败仅记 `LAST-AGENT-HOLD` 标记,契约上等于持有,详见[05-决策 Agent](05-agent.md)。全部输出追加到 `logs/daily/run-<时间戳>.log`;管线失败时维护 `LAST-RUN-BLOCKED` 标记,退出码原样透传给计划任务(触发其重试逻辑)。
+- `scripts/run-daily.ps1`:切到仓库根,在 daily 前尝试 `uv run fundlab agent decide --all`,daily 成功发布后再幂等补一次(用新账本头和新日历为下个交易日预置决策);任一最终决策失败仅记 `LAST-AGENT-HOLD` 标记,契约上等于持有,详见[05-决策 Agent](05-agent.md)。全部输出追加到 `logs/daily/run-<时间戳>.log`;若报告把阻断明确分类为瞬时 provider transport/观测提交故障,脚本最多执行 3 轮 daily(等待 30/60 秒),并复用已落库的不可变观测;观测目录原子提交本身也会有限重试 Windows 短暂文件锁。结构、schema、对账或数据冲突仍立即阻断。最终失败维护 `LAST-RUN-BLOCKED`,退出码透传给计划任务;计划任务的 30 分钟重启仅作为进程级后备。
 - 数据目录布局:
   - `data/warehouse/v2/canonical/{observations,components,snapshots,builds,current.json}` — 观测仓库、组件、快照与当前发布指针;
   - `data/warehouse/v2/trading.sqlite3` — 账户与哈希链账本;

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, time
 import os
+import re
+from time import sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -10,6 +12,7 @@ import pandas as pd
 from fundlab.marketdata.contracts import (
     CoverageClaim,
     MarketTable,
+    ObservationError,
     ObservationPayload,
     PriceMode,
     ProviderCapability,
@@ -69,6 +72,14 @@ class TickFlowProvider:
         batch_size = int(request.parameters.get("batch_size", 100))
         if batch_size < 1 or batch_size > 100:
             raise ValueError("TickFlow batch_size must be between 1 and 100")
+        retry_attempts = int(request.parameters.get("retry_attempts", 4))
+        retry_backoff_seconds = float(
+            request.parameters.get("retry_backoff_seconds", 1.0)
+        )
+        if retry_attempts < 1 or retry_attempts > 10:
+            raise ValueError("TickFlow retry_attempts must be between 1 and 10")
+        if retry_backoff_seconds < 0:
+            raise ValueError("TickFlow retry_backoff_seconds must not be negative")
         common_parameters = {
             "period": "1d",
             "count": int(request.parameters.get("count", 10000)),
@@ -79,23 +90,23 @@ class TickFlowProvider:
         for chunk in _chunks(request.instrument_ids, batch_size):
             if len(chunk) == 1:
                 endpoint = "/v1/klines"
-                payload = self.transport.get_json(
+                payload = self._get_json_with_retry(
                     f"{self.base_url}{endpoint}",
                     parameters={"symbol": chunk[0], **common_parameters},
-                    headers=self._headers(),
-                    timeout=self.timeout,
+                    attempts=retry_attempts,
+                    backoff_seconds=retry_backoff_seconds,
                 )
                 compact_by_instrument = {chunk[0]: payload.get("data")}
             else:
                 endpoint = "/v1/klines/batch"
-                payload = self.transport.get_json(
+                payload = self._get_json_with_retry(
                     f"{self.base_url}{endpoint}",
                     parameters={
                         "symbols": ",".join(chunk),
                         **common_parameters,
                     },
-                    headers=self._headers(),
-                    timeout=self.timeout,
+                    attempts=retry_attempts,
+                    backoff_seconds=retry_backoff_seconds,
                 )
                 data = payload.get("data")
                 compact_by_instrument = data if isinstance(data, dict) else {}
@@ -136,6 +147,10 @@ class TickFlowProvider:
                 "base_url": self.base_url,
                 "authenticated": bool(self.api_key),
                 "adjust": adjust,
+                "transport_retry": {
+                    "attempts": retry_attempts,
+                    "backoff_seconds": retry_backoff_seconds,
+                },
                 "response_sha256": hashes,
                 "requested_scope": {
                     "start_date": request.start_date,
@@ -153,6 +168,43 @@ class TickFlowProvider:
         if self.api_key:
             headers["x-api-key"] = self.api_key
         return headers
+
+    def _get_json_with_retry(
+        self,
+        url: str,
+        *,
+        parameters: dict[str, Any],
+        attempts: int,
+        backoff_seconds: float,
+    ) -> dict[str, Any]:
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.transport.get_json(
+                    url,
+                    parameters=parameters,
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                if attempt == attempts or not _retryable_transport_error(exc):
+                    raise
+                sleep(backoff_seconds * (2 ** (attempt - 1)))
+        raise AssertionError("unreachable")
+
+
+def _retryable_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if not isinstance(exc, ObservationError):
+        return False
+    message = str(exc)
+    if message.startswith("Source request failed:"):
+        return True
+    match = re.match(r"Source HTTP (\d{3}):", message)
+    if not match:
+        return False
+    status = int(match.group(1))
+    return status in {408, 429} or 500 <= status <= 599
 
 
 def _date_ms(value, *, end_of_day: bool) -> int:

@@ -1,7 +1,7 @@
 # Registers the "FundLab Daily" Windows scheduled task: Tuesday-Saturday at
 # 06:00, processing the previous completed trading session, with catch-up if
-# the machine was off and up to 3 retries 30 minutes apart (the pipeline is
-# idempotent, so retries are safe).
+# the machine was off. The wrapper owns short, classified retries; Task
+# Scheduler's retries are a longer-interval fallback for process-level failure.
 #
 # Compatible with Windows PowerShell 5.1 and pwsh 7+.
 # Run from an elevated PowerShell if task registration is denied:
@@ -36,5 +36,5 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName "FundLab Daily" `
     -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
-Write-Host "Registered 'FundLab Daily': Tuesday-Saturday at $Time, catch-up + 3 retries."
+Write-Host "Registered 'FundLab Daily': Tuesday-Saturday at $Time, catch-up + scheduler fallback retries."
 Write-Host "Requirement: keep the MiniQMT client running so xtquant can serve data."

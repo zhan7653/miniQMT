@@ -11,6 +11,7 @@ from fundlab.marketdata import (
     EfinanceProvider,
     ExchangePublicUniverseProvider,
     MarketTable,
+    ObservationError,
     ProviderCapability,
     ProviderRequest,
     SinaEtfProvider,
@@ -324,6 +325,57 @@ def test_tickflow_uses_one_batch_request_for_multiple_instruments():
     assert len(transport.calls) == 1
     assert transport.calls[0][0].endswith("/v1/klines/batch")
     assert len(observed.tables[MarketTable.DAILY_BARS]) == 2
+
+
+def test_tickflow_retries_transient_transport_failure_for_the_same_batch():
+    class TransientTransport(_TickTransport):
+        def get_json(self, url, *, parameters, headers, timeout):
+            self.calls.append((url, parameters, headers, timeout))
+            if len(self.calls) < 3:
+                raise ObservationError(
+                    "Source request failed: The handshake operation timed out"
+                )
+            return {"data": {
+                "timestamp": [1783900800000, 1783987200000],
+                "open": [10.0, 10.5], "high": [10.8, 11.0],
+                "low": [9.9, 10.4], "close": [10.5, 10.8],
+                "volume": [1000, 1200], "amount": [10500.0, 12960.0],
+            }}
+
+    transport = TransientTransport()
+    observed = TickFlowProvider(
+        transport=transport, base_url="https://tickflow.test",
+    ).observe(ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW,
+        START,
+        END,
+        ("600000.SH",),
+        {"retry_attempts": 3, "retry_backoff_seconds": 0},
+    ))
+
+    assert len(transport.calls) == 3
+    assert len(observed.tables[MarketTable.DAILY_BARS]) == 2
+
+
+def test_tickflow_does_not_retry_structural_response_failure():
+    class InvalidResponseTransport(_TickTransport):
+        def get_json(self, url, *, parameters, headers, timeout):
+            self.calls.append((url, parameters, headers, timeout))
+            raise ObservationError("Source returned invalid UTF-8 JSON")
+
+    transport = InvalidResponseTransport()
+    with pytest.raises(ObservationError, match="invalid UTF-8 JSON"):
+        TickFlowProvider(
+            transport=transport, base_url="https://tickflow.test",
+        ).observe(ProviderRequest(
+            ProviderCapability.DAILY_BARS_RAW,
+            START,
+            END,
+            ("600000.SH",),
+            {"retry_attempts": 5, "retry_backoff_seconds": 0},
+        ))
+
+    assert len(transport.calls) == 1
 
 
 def test_tickflow_daily_timestamp_is_interpreted_as_china_session_date():

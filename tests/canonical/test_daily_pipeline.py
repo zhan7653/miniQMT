@@ -269,6 +269,26 @@ def test_scoped_events_and_missing_source_reasons():
     assert not DailyPipeline._only_not_in_historical_master([
         "not_in_historical_master", "missing_source:tickflow",
     ])
+    assert DailyPipeline._only_retryable_provider_errors([
+        "provider_error:tickflow=ObservationError:Source request failed: "
+        "_ssl.c:1011: The handshake operation timed out",
+    ])
+    assert DailyPipeline._only_retryable_provider_errors([
+        "provider_error:tickflow=ObservationError:Source HTTP 503: unavailable",
+    ])
+    assert not DailyPipeline._only_retryable_provider_errors([
+        "provider_error:tickflow=ObservationError:Source returned invalid UTF-8 JSON",
+    ])
+    assert not DailyPipeline._only_retryable_provider_errors([
+        "provider_error:tickflow=ObservationError:Source request failed: timeout;"
+        "xtquant=ValueError:unexpected schema",
+    ])
+    assert DailyPipeline._only_retryable_capture_errors([
+        "688808.SH:PermissionError:[WinError 5] access denied",
+    ])
+    assert not DailyPipeline._only_retryable_capture_errors([
+        "688808.SH:ValueError:unexpected schema",
+    ])
 
 
 def _new_listing_frame(listed_date: date) -> pd.DataFrame:

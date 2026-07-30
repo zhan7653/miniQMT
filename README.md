@@ -42,7 +42,9 @@ Accounts, the session cutoff, and the agent decision directory live in the `dail
 `config/fundlab.yaml`. Exit code 0 means ok or already up to date; exit code 2 means a fail-closed
 gate blocked the run — the reason is in the console JSON and in the ops report under
 `data/reports/daily/`. Re-running after a block resumes from the durable observation warehouse;
-nothing partial is ever published.
+nothing partial is ever published. The scheduled wrapper retries only failures explicitly
+classified as transient provider transport errors (up to three daily attempts, waiting 30 then
+60 seconds); schema, reconciliation, and data-conflict failures still stop immediately.
 
 Schedule it Tuesday-Saturday at 06:00, after the previous trading day's upstream data has settled,
 with catch-up and retries:

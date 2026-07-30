@@ -23,9 +23,35 @@ if ([string]::IsNullOrWhiteSpace($env:FUNDLAB_LLM_API_KEY)) {
 }
 
 $logDir = Join-Path $repo "logs\daily"
+$dailyReportDir = Join-Path $repo "data\reports\daily"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 $logFile = Join-Path $logDir "run-$stamp.log"
+
+function Test-DailyFailureRetryable {
+    param([datetime]$AttemptStarted)
+
+    $latestReport = Get-ChildItem -Path $dailyReportDir -Filter "daily-*.json" `
+            -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $AttemptStarted.AddSeconds(-2) } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $latestReport) {
+        return $false
+    }
+    try {
+        $report = Get-Content -Raw -LiteralPath $latestReport.FullName |
+            ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    return @(
+        $report.stages |
+            Where-Object {
+                $_.status -eq "blocked" -and $_.detail.retryable -eq $true
+            }
+    ).Count -gt 0
+}
 
 # Pre-run attempt: consume the previous snapshot only, so a catch-up run can
 # still receive the decision that was knowable before its first session.
@@ -43,9 +69,28 @@ if ($agentCode -ne 0) {
     Remove-Item -Force (Join-Path $logDir "LAST-AGENT-HOLD") -ErrorAction SilentlyContinue
 }
 
-"[$stamp] fundlab daily run starting" | Tee-Object -FilePath $logFile -Append
-& uv run fundlab daily run *>> $logFile
-$code = $LASTEXITCODE
+$maxDailyAttempts = 3
+$code = 1
+for ($attempt = 1; $attempt -le $maxDailyAttempts; $attempt++) {
+    "[$stamp] fundlab daily run starting (attempt $attempt/$maxDailyAttempts)" |
+        Tee-Object -FilePath $logFile -Append
+    $attemptStarted = Get-Date
+    & uv run fundlab daily run *>> $logFile
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+        break
+    }
+    $retryable = $code -eq 2 -and (
+        Test-DailyFailureRetryable -AttemptStarted $attemptStarted
+    )
+    if (-not $retryable -or $attempt -eq $maxDailyAttempts) {
+        break
+    }
+    $delaySeconds = 30 * [math]::Pow(2, $attempt - 1)
+    "[$stamp] transient provider failure; retrying in $delaySeconds seconds" |
+        Tee-Object -FilePath $logFile -Append
+    Start-Sleep -Seconds $delaySeconds
+}
 
 if ($code -eq 0) {
     "[$stamp] daily run ok" | Tee-Object -FilePath $logFile -Append

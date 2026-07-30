@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -465,12 +466,18 @@ class DailyPipeline:
             - set(carried_master_missing)
         ))
         if unexplained:
+            retryable = all(
+                self._only_retryable_provider_errors(excluded.get(item))
+                for item in unexplained
+            )
             raise DailyPipelineBlocked("bars", "instruments missing for reasons other than no-trade", {
                 "unexplained_sample": unexplained[:20],
                 "unexplained_count": len(unexplained),
                 "excluded_reasons_sample": {
                     item: excluded.get(item) for item in unexplained[:10]
                 },
+                "retryable": retryable,
+                "retry_class": "transient_provider_transport" if retryable else None,
             })
 
         research_source_id = build.snapshot_id
@@ -591,6 +598,12 @@ class DailyPipeline:
             if not result["observation_ids"]
         )
         if empty_limit_providers:
+            retryable = all(
+                self._only_retryable_capture_errors(
+                    direct_limit_results[provider]["request_errors"]
+                )
+                for provider in empty_limit_providers
+            )
             raise DailyPipelineBlocked(
                 "limits",
                 "direct price-limit collection produced no usable observations",
@@ -600,6 +613,8 @@ class DailyPipeline:
                         provider: direct_limit_results[provider]
                         for provider in empty_limit_providers
                     },
+                    "retryable": retryable,
+                    "retry_class": "transient_observation_commit" if retryable else None,
                 },
             )
         stages.append(DailyStage("limits", "ok", {
@@ -874,6 +889,44 @@ class DailyPipeline:
         return (
             isinstance(reasons, (list, tuple))
             and tuple(map(str, reasons)) == ("not_in_historical_master",)
+        )
+
+    @staticmethod
+    def _only_retryable_provider_errors(reasons: Any) -> bool:
+        if not isinstance(reasons, (list, tuple)) or not reasons:
+            return False
+        for reason in map(str, reasons):
+            if not reason.startswith("provider_error:"):
+                return False
+            failures = reason.removeprefix("provider_error:").split(";")
+            if not failures or any("=" not in failure for failure in failures):
+                return False
+            for failure in failures:
+                detail = failure.split("=", 1)[1]
+                if detail.startswith(("TimeoutError:", "ConnectionError:")):
+                    continue
+                if detail.startswith("ObservationError:Source request failed:"):
+                    continue
+                match = re.match(
+                    r"ObservationError:Source HTTP (\d{3}):", detail,
+                )
+                if match:
+                    status = int(match.group(1))
+                    if status in {408, 429} or 500 <= status <= 599:
+                        continue
+                return False
+        return True
+
+    @staticmethod
+    def _only_retryable_capture_errors(errors: Any) -> bool:
+        if not isinstance(errors, (list, tuple)) or not errors:
+            return False
+        return all(
+            ":PermissionError:[WinError 5]" in str(error)
+            or ":TimeoutError:" in str(error)
+            or ":ConnectionError:" in str(error)
+            or ":ObservationError:Source request failed:" in str(error)
+            for error in errors
         )
 
     def _build_new_instrument_supplement(

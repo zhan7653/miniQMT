@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from time import sleep
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
@@ -224,7 +225,22 @@ class MarketDataWarehouse:
             if _manifest_identity(existing) != _manifest_identity(manifest):
                 raise IntegrityError(f"Observation id collision: {observation_id}")
             return existing
-        os.replace(temporary, target)
+        for attempt in range(4):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                # Windows scanners and indexers can briefly hold a newly written
+                # directory.  Preserve the atomic rename contract, but tolerate
+                # that transient lock instead of discarding a valid observation.
+                if target.exists():
+                    existing = self.load_observation(observation_id)
+                    if _manifest_identity(existing) != _manifest_identity(manifest):
+                        raise IntegrityError(f"Observation id collision: {observation_id}")
+                    return existing
+                if attempt == 3:
+                    raise
+                sleep(0.05 * (2 ** attempt))
         return self.load_observation(observation_id)
 
     def observation_path(self, observation_id: str) -> Path:

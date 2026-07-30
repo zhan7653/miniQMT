@@ -4,6 +4,8 @@ import multiprocessing
 
 import pytest
 
+import fundlab.marketdata.warehouse as warehouse_module
+
 from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata import (
     CanonicalMarketData,
@@ -84,6 +86,29 @@ def test_observation_snapshot_and_point_in_time_portal_are_immutable(tmp_path):
     assert list(bars["source_observation_id"].unique()) == [observed.observation_id]
     with pytest.raises(ValueError, match="point-in-time"):
         portal.adjusted_history(["600000.SH"], DAYS[0], DAYS[2], as_of=DAYS[1])
+
+
+def test_observation_commit_retries_transient_windows_permission_error(
+    tmp_path, monkeypatch,
+):
+    real_replace = warehouse_module.os.replace
+    calls = 0
+
+    def flaky_replace(source, target):
+        nonlocal calls
+        if str(source).find(".observation-") >= 0:
+            calls += 1
+            if calls == 1:
+                raise PermissionError(5, "temporary scanner lock")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(warehouse_module.os, "replace", flaky_replace)
+    observed = MarketDataWarehouse(tmp_path / "market").record_observation(
+        observation()
+    )
+
+    assert observed.observation_id.startswith("obs-")
+    assert calls == 2
 
 
 def test_loaded_snapshot_query_does_not_repeat_whole_snapshot_verification(
