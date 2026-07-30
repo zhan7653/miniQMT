@@ -576,8 +576,14 @@ class DailyPipeline:
                 batch_size=50,
             ))
             if result.status != "complete":
+                retryable = self._only_retryable_collection_blockers(
+                    result.blockers,
+                    consequence_prefixes=("missing_status_instruments:",),
+                )
                 raise DailyPipelineBlocked("status", f"{provider} status collection incomplete", {
                     "blockers": result.blockers,
+                    "retryable": retryable,
+                    "retry_class": "transient_provider_or_commit" if retryable else None,
                 })
             status_results[provider] = result
         stages.append(DailyStage("status", "ok", {
@@ -600,7 +606,10 @@ class DailyPipeline:
         if empty_limit_providers:
             retryable = all(
                 self._only_retryable_capture_errors(
-                    direct_limit_results[provider]["request_errors"]
+                    (
+                        *direct_limit_results[provider]["request_errors"],
+                        *direct_limit_results[provider]["provider_errors"],
+                    )
                 )
                 for provider in empty_limit_providers
             )
@@ -638,8 +647,14 @@ class DailyPipeline:
                 kind=kind,
             ))
             if result.status != "complete":
+                retryable = self._only_retryable_collection_blockers(
+                    result.blockers,
+                    consequence_prefixes=(f"missing_{kind}_instruments:",),
+                )
                 raise DailyPipelineBlocked("evidence", f"{kind} evidence collection incomplete", {
                     "blockers": result.blockers,
+                    "retryable": retryable,
+                    "retry_class": "transient_provider_or_commit" if retryable else None,
                 })
             evidence_results[kind] = result
         stages.append(DailyStage("evidence", "ok", {
@@ -775,6 +790,7 @@ class DailyPipeline:
         requested = tuple(sorted(set(map(str, instrument_ids))))
         requested_set = set(requested)
         selected: dict[str, Any] = {}
+        provider_errors: set[str] = set()
 
         def absorb(manifest) -> None:
             request = manifest.request
@@ -790,6 +806,11 @@ class DailyPipeline:
                 return
             hashes = manifest.source_metadata.get("response_sha256")
             errors = manifest.source_metadata.get("request_errors")
+            if isinstance(errors, Mapping):
+                provider_errors.update(
+                    str(error)[:240] for error in errors.values()
+                    if str(error).strip()
+                )
             if not isinstance(hashes, Mapping):
                 return
             error_ids = set(errors) if isinstance(errors, Mapping) else set()
@@ -876,6 +897,7 @@ class DailyPipeline:
             "covered_instruments": len(selected),
             "unresolved_instrument_ids": unresolved,
             "request_errors": tuple(request_errors),
+            "provider_errors": tuple(sorted(provider_errors)),
         }
 
     @staticmethod
@@ -903,31 +925,54 @@ class DailyPipeline:
                 return False
             for failure in failures:
                 detail = failure.split("=", 1)[1]
-                if detail.startswith(("TimeoutError:", "ConnectionError:")):
-                    continue
-                if detail.startswith("ObservationError:Source request failed:"):
-                    continue
-                match = re.match(
-                    r"ObservationError:Source HTTP (\d{3}):", detail,
-                )
-                if match:
-                    status = int(match.group(1))
-                    if status in {408, 429} or 500 <= status <= 599:
-                        continue
-                return False
+                if not DailyPipeline._retryable_failure_text(detail):
+                    return False
         return True
 
     @staticmethod
     def _only_retryable_capture_errors(errors: Any) -> bool:
         if not isinstance(errors, (list, tuple)) or not errors:
             return False
-        return all(
-            ":PermissionError:[WinError 5]" in str(error)
-            or ":TimeoutError:" in str(error)
-            or ":ConnectionError:" in str(error)
-            or ":ObservationError:Source request failed:" in str(error)
-            for error in errors
+        return all(DailyPipeline._retryable_failure_text(error) for error in errors)
+
+    @staticmethod
+    def _only_retryable_collection_blockers(
+        blockers: Any,
+        *,
+        consequence_prefixes: tuple[str, ...],
+    ) -> bool:
+        if not isinstance(blockers, (list, tuple)) or not blockers:
+            return False
+        primary = tuple(
+            str(blocker) for blocker in blockers
+            if not any(
+                str(blocker).startswith(prefix)
+                or f":{prefix}" in str(blocker)
+                for prefix in consequence_prefixes
+            )
         )
+        return bool(primary) and all(
+            DailyPipeline._retryable_failure_text(blocker) for blocker in primary
+        )
+
+    @staticmethod
+    def _retryable_failure_text(error: Any) -> bool:
+        text = str(error)
+        if any(token in text for token in (
+            "TimeoutError:",
+            "ConnectionError:",
+            "PermissionError:[WinError 5]",
+            "ObservationError:Source request failed:",
+            "ObservationError: Source request failed:",
+        )):
+            return True
+        match = re.search(r"Source HTTP (\d{3}):", text)
+        if not match:
+            match = re.search(r"HTTP Error (\d{3})(?:\D|$)", text)
+        if not match:
+            return False
+        status = int(match.group(1))
+        return status in {408, 429} or 500 <= status <= 599
 
     def _build_new_instrument_supplement(
         self,

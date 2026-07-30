@@ -6,6 +6,40 @@
 # xtquant provider; if it is offline the data stage blocks and the next run
 # resumes where it stopped.
 
+param([switch]$FunctionsOnly)
+
+function Test-DailyFailureRetryable {
+    param(
+        [Parameter(Mandatory = $true)][string]$DailyReportDir,
+        [Parameter(Mandatory = $true)][datetime]$AttemptStarted
+    )
+
+    $latestReport = Get-ChildItem -Path $DailyReportDir -Filter "daily-*.json" `
+            -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $AttemptStarted.AddSeconds(-2) } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $latestReport) {
+        return $false
+    }
+    try {
+        $report = Get-Content -Raw -LiteralPath $latestReport.FullName |
+            ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    return @(
+        $report.stages |
+            Where-Object {
+                $_.status -eq "blocked" -and $_.detail.retryable -eq $true
+            }
+    ).Count -gt 0
+}
+
+if ($FunctionsOnly) {
+    return
+}
+
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
@@ -27,31 +61,6 @@ $dailyReportDir = Join-Path $repo "data\reports\daily"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 $logFile = Join-Path $logDir "run-$stamp.log"
-
-function Test-DailyFailureRetryable {
-    param([datetime]$AttemptStarted)
-
-    $latestReport = Get-ChildItem -Path $dailyReportDir -Filter "daily-*.json" `
-            -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -ge $AttemptStarted.AddSeconds(-2) } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    if ($null -eq $latestReport) {
-        return $false
-    }
-    try {
-        $report = Get-Content -Raw -LiteralPath $latestReport.FullName |
-            ConvertFrom-Json
-    } catch {
-        return $false
-    }
-    return @(
-        $report.stages |
-            Where-Object {
-                $_.status -eq "blocked" -and $_.detail.retryable -eq $true
-            }
-    ).Count -gt 0
-}
 
 # Pre-run attempt: consume the previous snapshot only, so a catch-up run can
 # still receive the decision that was knowable before its first session.
@@ -81,7 +90,9 @@ for ($attempt = 1; $attempt -le $maxDailyAttempts; $attempt++) {
         break
     }
     $retryable = $code -eq 2 -and (
-        Test-DailyFailureRetryable -AttemptStarted $attemptStarted
+        Test-DailyFailureRetryable `
+            -DailyReportDir $dailyReportDir `
+            -AttemptStarted $attemptStarted
     )
     if (-not $retryable -or $attempt -eq $maxDailyAttempts) {
         break

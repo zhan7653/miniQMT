@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
+from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 import pandas as pd
@@ -289,6 +292,61 @@ def test_scoped_events_and_missing_source_reasons():
     assert not DailyPipeline._only_retryable_capture_errors([
         "688808.SH:ValueError:unexpected schema",
     ])
+    assert DailyPipeline._only_retryable_provider_errors([
+        "provider_error:tickflow=PermissionError:[WinError 5] scanner lock",
+    ])
+    assert DailyPipeline._only_retryable_collection_blockers(
+        [
+            "batch-1:SnapshotNotReadyError:request_errors=ObservationError: "
+            "Source HTTP 514: upstream",
+            "missing_etf-actions_instruments:4",
+        ],
+        consequence_prefixes=("missing_etf-actions_instruments:",),
+    )
+    assert not DailyPipeline._only_retryable_collection_blockers(
+        [
+            "batch-1:SnapshotNotReadyError:request_errors=ObservationError: "
+            "Source HTTP 514: upstream",
+            "batch-2:ValueError:unexpected schema",
+            "missing_etf-actions_instruments:4",
+        ],
+        consequence_prefixes=("missing_etf-actions_instruments:",),
+    )
+
+
+def test_daily_wrapper_reads_structured_retryable_report(tmp_path):
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell is unavailable")
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    report = report_dir / "daily-test.json"
+    script = Path(__file__).parents[2] / "scripts" / "run-daily.ps1"
+
+    def classify(retryable: bool) -> str:
+        report.write_text(json.dumps({
+            "stages": [{
+                "name": "evidence",
+                "status": "blocked",
+                "detail": {"retryable": retryable},
+            }],
+        }), encoding="utf-8")
+        command = (
+            f". '{str(script).replace(chr(39), chr(39) * 2)}' -FunctionsOnly; "
+            "Test-DailyFailureRetryable "
+            f"-DailyReportDir '{str(report_dir).replace(chr(39), chr(39) * 2)}' "
+            "-AttemptStarted (Get-Date).AddMinutes(-1)"
+        )
+        completed = subprocess.run(
+            [pwsh, "-NoProfile", "-Command", command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    assert classify(True) == "True"
+    assert classify(False) == "False"
 
 
 def _new_listing_frame(listed_date: date) -> pd.DataFrame:
