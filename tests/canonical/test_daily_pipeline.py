@@ -312,6 +312,41 @@ def test_scoped_events_and_missing_source_reasons():
         ],
         consequence_prefixes=("missing_etf-actions_instruments:",),
     )
+    assert not DailyPipeline._only_retryable_collection_blockers(
+        [
+            "batch-1:SnapshotNotReadyError:evidence remains unresolved "
+            "invalid={} request_errors=000001.SZ:ObservationError: Source HTTP 514: "
+            "upstream;000002.SZ:ValueError:unexpected schema",
+            "missing_etf-actions_instruments:2",
+        ],
+        consequence_prefixes=("missing_etf-actions_instruments:",),
+    )
+
+    direct_results = {
+        "xtquant": {
+            "_covered_instrument_ids": ("600000.SH",),
+            "_errors_by_instrument": {},
+        },
+        "eastmoney-efinance": {
+            "_covered_instrument_ids": (),
+            "_errors_by_instrument": {
+                "600000.SH": ("ObservationError: Source HTTP 503: unavailable",),
+            },
+        },
+    }
+    validation_reason = (
+        "Price-limit audit needs two direct provider limit values for "
+        "600000.SH/2026-07-30"
+    )
+    assert DailyPipeline._retryable_direct_limit_validation_failure(
+        validation_reason, direct_results,
+    )
+    direct_results["eastmoney-efinance"]["_errors_by_instrument"]["600000.SH"] = (
+        "ValueError:unexpected schema",
+    )
+    assert not DailyPipeline._retryable_direct_limit_validation_failure(
+        validation_reason, direct_results,
+    )
 
 
 def test_daily_wrapper_reads_structured_retryable_report(tmp_path):

@@ -619,7 +619,11 @@ class DailyPipeline:
                 {
                     "providers": empty_limit_providers,
                     "details": {
-                        provider: direct_limit_results[provider]
+                        provider: {
+                            key: value
+                            for key, value in direct_limit_results[provider].items()
+                            if not key.startswith("_")
+                        }
                         for provider in empty_limit_providers
                     },
                     "retryable": retryable,
@@ -698,9 +702,14 @@ class DailyPipeline:
                 description=f"daily pipeline EOD increment through {target.isoformat()}",
             )
         except MarketDataError as exc:
+            retryable = self._retryable_direct_limit_validation_failure(
+                str(exc), direct_limit_results,
+            )
             raise DailyPipelineBlocked("validate", str(exc), {
                 "error_type": type(exc).__name__,
                 "candidate_observation_id": candidate_id,
+                "retryable": retryable,
+                "retry_class": "transient_direct_limit_gap" if retryable else None,
             }) from exc
         stages.append(DailyStage("validate", "ok", {
             "observation_id": validated.observation_id,
@@ -791,6 +800,7 @@ class DailyPipeline:
         requested_set = set(requested)
         selected: dict[str, Any] = {}
         provider_errors: set[str] = set()
+        errors_by_instrument: dict[str, set[str]] = {}
 
         def absorb(manifest) -> None:
             request = manifest.request
@@ -811,6 +821,11 @@ class DailyPipeline:
                     str(error)[:240] for error in errors.values()
                     if str(error).strip()
                 )
+                for instrument_id, error in errors.items():
+                    if str(instrument_id) in requested_set and str(error).strip():
+                        errors_by_instrument.setdefault(
+                            str(instrument_id), set(),
+                        ).add(str(error)[:240])
             if not isinstance(hashes, Mapping):
                 return
             error_ids = set(errors) if isinstance(errors, Mapping) else set()
@@ -883,9 +898,10 @@ class DailyPipeline:
                 try:
                     manifest = self.ingestion.capture(provider, request)
                 except Exception as exc:
-                    request_errors.append(
-                        f"{','.join(batch[:3])}:{type(exc).__name__}:{str(exc)[:240]}"
-                    )
+                    detail = f"{type(exc).__name__}:{str(exc)[:240]}"
+                    request_errors.append(f"{','.join(batch[:3])}:{detail}")
+                    for instrument_id in batch:
+                        errors_by_instrument.setdefault(instrument_id, set()).add(detail)
                     continue
                 absorb(manifest)
 
@@ -898,6 +914,11 @@ class DailyPipeline:
             "unresolved_instrument_ids": unresolved,
             "request_errors": tuple(request_errors),
             "provider_errors": tuple(sorted(provider_errors)),
+            "_covered_instrument_ids": tuple(sorted(selected)),
+            "_errors_by_instrument": {
+                instrument_id: tuple(sorted(errors))
+                for instrument_id, errors in sorted(errors_by_instrument.items())
+            },
         }
 
     @staticmethod
@@ -958,6 +979,27 @@ class DailyPipeline:
     @staticmethod
     def _retryable_failure_text(error: Any) -> bool:
         text = str(error)
+        if "request_errors=" in text:
+            prefix, payload = text.split("request_errors=", 1)
+            invalid = re.search(r"invalid=(.*)\s*$", prefix)
+            if invalid and invalid.group(1).strip() not in {"", "{}"}:
+                return False
+            embedded = tuple(
+                item.strip() for item in payload.split(";") if item.strip()
+            )
+            return bool(embedded) and all(
+                DailyPipeline._retryable_atomic_failure(item) for item in embedded
+            )
+        return DailyPipeline._retryable_atomic_failure(text)
+
+    @staticmethod
+    def _retryable_atomic_failure(text: str) -> bool:
+        if re.search(
+            r"(?:^|[;=,:])(?:ValueError|TypeError|IntegrityError|"
+            r"SchemaError|SourceConflictError|TradeRuleError):",
+            text,
+        ):
+            return False
         if any(token in text for token in (
             "TimeoutError:",
             "ConnectionError:",
@@ -973,6 +1015,35 @@ class DailyPipeline:
             return False
         status = int(match.group(1))
         return status in {408, 429} or 500 <= status <= 599
+
+    @staticmethod
+    def _retryable_direct_limit_validation_failure(
+        reason: str,
+        direct_limit_results: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        match = re.search(
+            r"Price-limit audit needs two direct provider limit values for "
+            r"([^/]+)/\d{4}-\d{2}-\d{2}",
+            reason,
+        )
+        if not match:
+            return False
+        instrument_id = match.group(1)
+        missing_results = tuple(
+            result for result in direct_limit_results.values()
+            if instrument_id not in set(result.get("_covered_instrument_ids", ()))
+        )
+        if not missing_results:
+            return False
+        for result in missing_results:
+            by_instrument = result.get("_errors_by_instrument", {})
+            errors = (
+                by_instrument.get(instrument_id, ())
+                if isinstance(by_instrument, Mapping) else ()
+            )
+            if not DailyPipeline._only_retryable_capture_errors(errors):
+                return False
+        return True
 
     def _build_new_instrument_supplement(
         self,
