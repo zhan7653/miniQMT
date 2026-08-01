@@ -1569,6 +1569,83 @@ def test_stock_action_historical_listing_and_quantity_changes_are_exact_blockers
     assert result.observation_ids == ()
 
 
+def test_stock_action_derived_pay_date_does_not_masquerade_as_source_correction(tmp_path):
+    target = "600000.SH"
+    before = _stock_action_row(target, ex_date=DAYS[1])
+    before["pay_date"] = DAYS[1].isoformat()
+    before["source_payload"] = canonical_json({
+        "upstream_action_payload": canonical_json({"raw": {"派息日": None}}),
+        "derived_pay_date": DAYS[1].isoformat(),
+    })
+    after = dict(before)
+    after["pay_date"] = None
+    after["source_payload"] = canonical_json({"raw": {"派息日": None}})
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, predecessor_actions=pd.DataFrame([before]),
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-pay-date-check", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "派息日更正公告", "/correction.pdf",
+        )),
+        {target: (after,)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert not any(
+        item.startswith("HistoricalActionCorrectionError:")
+        for item in result.blockers
+    )
+
+
+def test_stock_action_source_native_pay_date_change_is_exact_blocker(tmp_path):
+    target = "600000.SH"
+    before = _stock_action_row(target, ex_date=DAYS[1])
+    before["pay_date"] = DAYS[1].isoformat()
+    before["source_payload"] = canonical_json({
+        "upstream_action_payload": canonical_json({
+            "raw": {"派息日": DAYS[1].isoformat()},
+        }),
+    })
+    after = dict(before)
+    after["pay_date"] = DAYS[2].isoformat()
+    after["source_payload"] = canonical_json({
+        "raw": {"派息日": DAYS[2].isoformat()},
+    })
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, predecessor_actions=pd.DataFrame([before]),
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-pay-date-change", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "派息日更正公告", "/correction.pdf",
+        )),
+        {target: (after,)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    correction = next(
+        item for item in result.blockers
+        if item.startswith("HistoricalActionCorrectionError:")
+    )
+    assert '"pay_date":"2026-07-15"' in correction
+    assert '"pay_date":"2026-07-14"' in correction
+
+
 def test_stock_action_same_scope_reuses_announcement_scan_and_canonical_observation(tmp_path):
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
     target = "600000.SH"

@@ -3043,7 +3043,7 @@ def _historical_action_corrections(
 
 
 def _source_native_action_value(item: Mapping[str, Any], field: str) -> Any:
-    if field not in {"listing_date", "quantity_multiplier"}:
+    if field not in {"pay_date", "listing_date", "quantity_multiplier"}:
         return _action_comparison_value(item.get(field))
     payload: Any = item.get("source_payload")
     for _ in range(2):
@@ -3056,6 +3056,13 @@ def _source_native_action_value(item: Mapping[str, Any], field: str) -> Any:
             break
         if isinstance(payload.get("raw"), Mapping):
             raw = payload["raw"]
+            if field == "pay_date":
+                action_type = str(item.get("action_type"))
+                if action_type == "cash_dividend":
+                    return _action_comparison_value(raw.get("派息日"))
+                if action_type == "rights_issue":
+                    return _action_comparison_value(raw.get("配股缴款截止日"))
+                return None
             if field == "listing_date":
                 key = (
                     "配股上市日"
