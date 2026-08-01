@@ -1239,6 +1239,33 @@ def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending
     assert result.observation_ids
 
 
+def test_stock_action_execution_signal_overrides_generic_tips_wording(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-implementation-tips", target, "2026-07-15T08:00:00+08:00",
+            "category_qyfpxzcs_szsh", "关于年度权益分派实施公告的提示性公告",
+            "/implementation-tips.pdf",
+        )),
+        {target: ()},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    assert result.unresolved_instrument_ids == (target,)
+    report = json.loads(result.report.read_text(encoding="utf-8"))
+    assert report["ignored_announcements"] == []
+    assert report["actionable_affected_instrument_ids"] == [target]
+
+
 def test_stock_action_proposals_and_h_only_notices_are_audited_without_detail_calls(tmp_path):
     instrument_ids = ("600000.SH", "600001.SH", "600002.SH")
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(

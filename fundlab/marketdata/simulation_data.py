@@ -3010,16 +3010,14 @@ def _ignored_stock_action_announcement_reason(
         return None
     if _is_correction_announcement(announcement):
         return None
-    if any(token in compact for token in (
-        "预案", "提议", "提示性",
-    )):
+    if any(token in compact for token in ("预案", "提议")):
         return "non_executable_proposal"
     if any(token in compact for token in (
         "实施", "除权除息", "股权登记", "派息日", "股份到账", "配股缴款", "配股上市",
     )):
         return None
     if any(token in compact for token in (
-        "利润分配方案", "分红方案", "可分配利润进行现金分红",
+        "提示性", "利润分配方案", "分红方案", "可分配利润进行现金分红",
     )):
         return "non_executable_proposal"
     return None
