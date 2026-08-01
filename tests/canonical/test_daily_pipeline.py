@@ -74,19 +74,31 @@ def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive
         "request_errors=510050.SH:TimeoutError:timed out",
         "missing_etf-actions_instruments:1",
     )
-    assert DailyPipeline._quarantinable_action_collection(transient_action_gap)
+    assert DailyPipeline._quarantinable_action_collection(
+        transient_action_gap, ("510050.SH",),
+    )
     assert not DailyPipeline._quarantinable_action_collection((
         transient_action_gap[0].replace(
             "invalid={}", 'invalid={"510050.SH":{"reason":"bad lifecycle"}}',
         ),
         transient_action_gap[1],
-    ))
+    ), ("510050.SH",))
     assert not DailyPipeline._quarantinable_action_collection((
         transient_action_gap[0].replace(
             "TimeoutError:timed out", "ValueError:unexpected schema",
         ),
         transient_action_gap[1],
-    ))
+    ), ("510050.SH",))
+    assert not DailyPipeline._quarantinable_action_collection((
+        transient_action_gap[0].replace(
+            "request_errors=510050.SH:TimeoutError:timed out",
+            "request_errors=",
+        ),
+        transient_action_gap[1],
+    ), ("510050.SH",))
+    assert not DailyPipeline._quarantinable_action_collection(
+        transient_action_gap, ("510050.SH", "510300.SH"),
+    )
 
     assert DailyPipeline._action_gap_instrument_ids({
         "reasons_by_instrument": {
@@ -156,6 +168,65 @@ def test_quarantine_allows_five_consecutive_sessions_and_blocks_the_sixth():
     }
     with pytest.raises(DailyPipelineBlocked, match="consecutive-session boundary"):
         pipeline._finalize_quarantine(**kwargs)
+
+
+def test_persistent_quarantine_uses_current_contiguous_tail_not_historical_max():
+    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+
+    instrument_id = "600000.SH"
+    sessions = tuple(date(2026, 7, day) for day in (21, 22, 23, 24, 25, 28, 29))
+    old = {
+        "instrument_ids": (instrument_id,),
+        "increment_sessions": {
+            instrument_id: tuple(item.isoformat() for item in sessions[:5]),
+        },
+        "consecutive_sessions": {instrument_id: 5},
+        "reasons_by_instrument": {instrument_id: ("old-gap",)},
+    }
+    current = {
+        "instrument_ids": (instrument_id,),
+        "increment_sessions": {instrument_id: (sessions[-1].isoformat(),)},
+        "consecutive_sessions": {instrument_id: 1},
+        "reasons_by_instrument": {instrument_id: ("new-gap",)},
+    }
+    rules = (
+        (DATA_GAP_QUARANTINE_RULE_ID,) * 5
+        + ("cn-stock-main-v1", DATA_GAP_QUARANTINE_RULE_ID)
+    )
+    bars = pd.DataFrame({
+        "instrument_id": [instrument_id] * len(sessions),
+        "session_date": [item.isoformat() for item in sessions],
+        "trade_rule_id": rules,
+    })
+    manifests = {
+        "obs-old": SimpleNamespace(source_metadata={"degraded_quarantine": old}),
+        "obs-current": SimpleNamespace(source_metadata={"degraded_quarantine": current}),
+    }
+    pipeline = object.__new__(DailyPipeline)
+    pipeline.warehouse = SimpleNamespace(
+        load_observation=lambda observation_id: manifests[observation_id],
+        query_loaded_snapshot_table=lambda *args, **kwargs: bars,
+    )
+    snapshot = SimpleNamespace(plan=SimpleNamespace(
+        selections=(
+            SimpleNamespace(observation_id="obs-old"),
+            SimpleNamespace(observation_id="obs-current"),
+        ),
+        universe_scope=UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            sessions[-1],
+            sessions[0],
+            sessions[-1],
+            survivorship_bias=True,
+            instrument_ids=(instrument_id,),
+        ),
+    ))
+
+    detail = pipeline._snapshot_degraded_quarantine(snapshot)
+
+    assert detail["instrument_ids"] == (instrument_id,)
+    assert detail["consecutive_sessions"] == {instrument_id: 1}
+    assert detail["reasons_by_instrument"] == {instrument_id: ("new-gap",)}
 
 
 class CalendarProvider:

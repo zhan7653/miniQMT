@@ -729,7 +729,9 @@ class DailyPipeline:
                     result, "unresolved_instrument_ids", (),
                 ))
                 quarantinable = bool(unresolved_ids) and (
-                    self._quarantinable_action_collection(result.blockers)
+                    self._quarantinable_action_collection(
+                        result.blockers, unresolved_ids,
+                    )
                     if kind.endswith("-actions") else retryable
                 )
                 if not quarantinable:
@@ -1086,10 +1088,14 @@ class DailyPipeline:
         )
 
     @staticmethod
-    def _quarantinable_action_collection(blockers: Any) -> bool:
+    def _quarantinable_action_collection(
+        blockers: Any,
+        unresolved_instrument_ids: Any,
+    ) -> bool:
         """Only availability gaps qualify; parser/schema/lifecycle errors stay hard."""
 
-        if not isinstance(blockers, (list, tuple)) or not blockers:
+        unresolved = set(map(str, unresolved_instrument_ids))
+        if not unresolved or not isinstance(blockers, (list, tuple)) or not blockers:
             return False
         primary = tuple(
             str(blocker) for blocker in blockers
@@ -1098,21 +1104,40 @@ class DailyPipeline:
         )
         if not primary:
             return False
+        claimed: set[str] = set()
+        transport_covered: set[str] = set()
         for blocker in primary:
             if "evidence remains unresolved:" not in blocker:
                 return False
-            match = re.search(r"invalid=(.*?)\s+request_errors=(.*)$", blocker)
-            if match is None or match.group(1).strip() != "{}":
-                return False
-            request_errors = tuple(
-                item.strip() for item in match.group(2).split(";") if item.strip()
+            match = re.search(
+                r"count=(\d+)\s+ids=([^\s]+)\s+invalid=(.*?)\s+"
+                r"request_errors=(.*)$",
+                blocker,
             )
-            if request_errors and not all(
+            if match is None or match.group(3).strip() != "{}":
+                return False
+            blocker_ids = set(filter(None, match.group(2).split(",")))
+            if int(match.group(1)) != len(blocker_ids):
+                return False
+            claimed.update(blocker_ids)
+            request_errors = tuple(
+                item.strip() for item in match.group(4).split(";") if item.strip()
+            )
+            if not request_errors or not all(
                 DailyPipeline._retryable_atomic_failure(item)
                 for item in request_errors
             ):
                 return False
-        return True
+            for error in request_errors:
+                error_match = re.match(
+                    r"([^:]+):(?:TimeoutError|ConnectionError|PermissionError|"
+                    r"ObservationError|HTTP Error|Source HTTP)",
+                    error,
+                )
+                if error_match is None:
+                    return False
+                transport_covered.update(filter(None, error_match.group(1).split(",")))
+        return claimed == unresolved and unresolved <= transport_covered
 
     @staticmethod
     def _action_gap_instrument_ids(
@@ -1218,27 +1243,61 @@ class DailyPipeline:
                 records.append(detail)
         if not records:
             return None
-        instrument_ids = tuple(sorted({
+        candidate_ids = tuple(sorted({
             str(instrument_id)
             for record in records
             for instrument_id in record.get("instrument_ids", ())
         }))
-        reasons: dict[str, set[str]] = {item: set() for item in instrument_ids}
-        consecutive: dict[str, int] = {item: 0 for item in instrument_ids}
-        for record in records:
-            record_reasons = record.get("reasons_by_instrument", {})
-            if isinstance(record_reasons, Mapping):
-                for instrument_id, values in record_reasons.items():
-                    if str(instrument_id) not in reasons:
-                        continue
-                    reasons[str(instrument_id)].update(map(str, values))
-            record_counts = record.get("consecutive_sessions", {})
-            if isinstance(record_counts, Mapping):
-                for instrument_id, value in record_counts.items():
-                    if str(instrument_id) in consecutive:
-                        consecutive[str(instrument_id)] = max(
-                            consecutive[str(instrument_id)], int(value),
-                        )
+        scope = snapshot.plan.universe_scope
+        if scope is None:
+            return None
+        bars = self.warehouse.query_loaded_snapshot_table(
+            snapshot,
+            MarketTable.DAILY_BARS,
+            instrument_ids=candidate_ids,
+            start_date=scope.history_end - timedelta(days=45),
+            end_date=scope.history_end,
+            price_mode="raw",
+        )
+        active_ids: list[str] = []
+        consecutive: dict[str, int] = {}
+        reasons: dict[str, tuple[str, ...]] = {}
+        active_records: list[Mapping[str, Any]] = []
+        for instrument_id in candidate_ids:
+            rows = bars.loc[
+                bars["instrument_id"].astype(str).eq(instrument_id)
+            ].sort_values("session_date", ascending=False, kind="stable")
+            if rows.empty or str(rows.iloc[0]["trade_rule_id"]) != DATA_GAP_QUARANTINE_RULE_ID:
+                continue
+            count = 0
+            for rule in map(str, rows["trade_rule_id"]):
+                if rule != DATA_GAP_QUARANTINE_RULE_ID:
+                    break
+                count += 1
+            latest_session = str(rows.iloc[0]["session_date"])[:10]
+            matching_records = []
+            for record in records:
+                sessions_by_instrument = record.get("increment_sessions", {})
+                if not isinstance(sessions_by_instrument, Mapping):
+                    continue
+                sessions = tuple(map(str, sessions_by_instrument.get(instrument_id, ())))
+                if latest_session in sessions:
+                    matching_records.append((max(sessions), record))
+            if not matching_records:
+                continue
+            selected_record = max(matching_records, key=lambda item: item[0])[1]
+            record_reasons = selected_record.get("reasons_by_instrument", {})
+            values = (
+                record_reasons.get(instrument_id, ())
+                if isinstance(record_reasons, Mapping) else ()
+            )
+            active_ids.append(instrument_id)
+            consecutive[instrument_id] = count
+            reasons[instrument_id] = tuple(sorted(set(map(str, values))))
+            active_records.append(selected_record)
+        instrument_ids = tuple(sorted(active_ids))
+        if not instrument_ids:
+            return None
         return {
             "policy": "daily-instrument-data-gap-quarantine-v1",
             "persistent": True,
@@ -1248,7 +1307,7 @@ class DailyPipeline:
             "reasons_by_instrument": {
                 item: tuple(sorted(reasons[item])) for item in instrument_ids
             },
-            "source_partition_count": len(records),
+            "source_partition_count": len({id(record) for record in active_records}),
             "valuation_policy": "last_trusted_price_stale",
             "execution_policy": "prohibit_and_defer_pending_orders",
         }
