@@ -1263,7 +1263,7 @@ def test_stock_action_relevant_correction_with_empty_detail_stays_pending(tmp_pa
     )
 
 
-def test_stock_action_irrelevant_correction_is_resolved_after_successful_detail(tmp_path):
+def test_stock_action_irrelevant_correction_needs_two_distinct_empty_confirmations(tmp_path):
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
     target = "600000.SH"
     provider = _AnnouncementTargetedCninfoProvider(
@@ -1286,7 +1286,49 @@ def test_stock_action_irrelevant_correction_is_resolved_after_successful_detail(
     pending = json.loads((
         warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
     ).read_text(encoding="utf-8"))
-    assert pending["instruments"] == {}
+    item = pending["instruments"][target]["announcements"][0]
+    assert item["state"] == "confirming_no_action"
+    assert len(item["confirmation_observation_ids"]) == 1
+
+
+def test_stock_action_second_distinct_empty_confirmation_clears_irrelevant_correction(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    pending_path = (
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    )
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(json.dumps({
+        "schema_version": 2,
+        "instruments": {target: {
+            "first_seen_date": DAYS[1].isoformat(),
+            "last_attempt_date": DAYS[2].isoformat(),
+            "state": "confirming_no_action",
+            "announcements": ({
+                "announcement_id": "notice-unrelated-correction",
+                "instrument_id": target,
+                "announcement_time": "2026-07-15T08:00:00Z",
+                "category": "category_bcgz_szsh",
+                "title": "年度报告会计差错更正公告",
+                "document_url": "/correction.pdf",
+                "state": "confirming_no_action",
+                "confirmation_observation_ids": ("obs-prior-distinct",),
+            },),
+        }},
+    }), encoding="utf-8")
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at, _announcement_scan(), {target: ()},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert json.loads(pending_path.read_text(encoding="utf-8"))["instruments"] == {}
 
 
 def test_stock_action_resolves_pending_per_announcement_not_per_stock(tmp_path):

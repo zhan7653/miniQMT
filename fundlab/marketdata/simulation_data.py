@@ -695,6 +695,17 @@ class SimulationEvidenceCollector:
                     str(announcement.get("category")) == "category_bcgz_szsh"
                     and not _is_action_relevant_correction(announcement)
                 ):
+                    confirmations = set(map(
+                        str, announcement.get("confirmation_observation_ids", ()),
+                    ))
+                    confirmations.add(selected[instrument_id].observation_id)
+                    if len(confirmations) >= 2:
+                        continue
+                    remaining.append({
+                        **announcement,
+                        "state": "confirming_no_action",
+                        "confirmation_observation_ids": tuple(sorted(confirmations)),
+                    })
                     continue
                 remaining.append({
                     **announcement,
@@ -707,18 +718,23 @@ class SimulationEvidenceCollector:
                 **item,
                 "last_attempt_date": scope.history_end.isoformat(),
                 "state": (
-                    "known_future_event"
+                    "awaiting_structured_detail"
+                    if any(
+                        str(value.get("state")) == "awaiting_structured_detail"
+                        for value in remaining
+                    )
+                    else "known_future_event"
                     if has_known_future and all(
                         str(value.get("state")) == "known_future_event"
                         for value in remaining
                     )
-                    else "awaiting_structured_detail"
+                    else "confirming_no_action"
                 ),
                 "announcements": tuple(remaining),
                 "known_pending_after_cutoff": future_actions,
             }
             if any(
-                str(value.get("state")) != "known_future_event"
+                str(value.get("state")) == "awaiting_structured_detail"
                 for value in remaining
             ):
                 awaiting.add(instrument_id)
