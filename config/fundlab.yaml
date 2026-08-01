@@ -57,7 +57,8 @@ agent:
     max_entry_chars: 20000
     max_total_chars: 120000
   notify:
-    # Set a recipient to enable best-effort SMTP opportunity/risk mail.
+    # Optional YAML recipient. FUNDLAB_EMAIL_TO from .env.local takes priority;
+    # when both are empty, FUNDLAB_SMTP_USER receives the notification.
     email_to:
 
   # The daily task attempts scheduled policies before and after publication.

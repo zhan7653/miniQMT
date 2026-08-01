@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
+import os
 import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -294,7 +295,11 @@ def _agent_settings(raw: Any, base: Path) -> AgentSettings:
         max_total_chars=int(memory_raw.get("max_total_chars", 120_000)),
     )
     notify_raw = _optional_mapping(raw, "notify", "agent.notify")
-    email_to = notify_raw.get("email_to")
+    email_to = (
+        os.environ.get("FUNDLAB_EMAIL_TO")
+        or notify_raw.get("email_to")
+        or os.environ.get("FUNDLAB_SMTP_USER")
+    )
     notify = AgentNotificationSettings(
         email_to=None if email_to is None or not str(email_to).strip() else str(email_to).strip(),
     )

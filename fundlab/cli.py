@@ -8,6 +8,7 @@ import sys
 from typing import Mapping, Sequence
 
 from fundlab.common.canonical import canonical_json, to_primitive
+from fundlab.common.local_env import load_local_environment
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CanonicalMarketData,
@@ -259,7 +260,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = load_foundation_settings(args.config)
+        config_path = Path(args.config).resolve()
+        config_root = (
+            config_path.parent.parent
+            if config_path.parent.name == "config" else config_path.parent
+        )
+        load_local_environment(config_root / ".env.local")
+        settings = load_foundation_settings(config_path)
         if args.command == "data":
             return _data(args, settings)
         if args.command == "account":
