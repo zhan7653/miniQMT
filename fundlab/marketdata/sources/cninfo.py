@@ -339,6 +339,11 @@ def _announcement_page_records(
     if isinstance(reported_total, bool) or not isinstance(reported_total, int) or reported_total < 0:
         raise ObservationError("CNInfo announcement response has invalid totalAnnouncement")
     announcements = payload.get("announcements")
+    # The live endpoint represents a valid zero-result page as JSON null.
+    # Accept only that exact total=0 shape; null on a non-empty page remains a
+    # systemic schema/completeness failure.
+    if announcements is None and reported_total == 0:
+        announcements = []
     if not isinstance(announcements, list):
         raise ObservationError("CNInfo announcement response has no announcements list")
     expected_count = min(page_size, max(0, reported_total - (page_number - 1) * page_size))

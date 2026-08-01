@@ -882,7 +882,14 @@ def test_cninfo_announcement_scan_pages_categories_and_deduplicates_records():
 
 
 def test_cninfo_announcement_scan_accepts_complete_empty_window():
-    client = _AnnouncementClient({})
+    client = _AnnouncementClient({
+        (category, 1): {"totalAnnouncement": 0, "announcements": None}
+        for category in (
+            "category_qyfpxzcs_szsh",
+            "category_pg_szsh",
+            "category_bcgz_szsh",
+        )
+    })
     scan = CninfoCorporateActionProvider(client=client).scan_announcements(
         date(2026, 7, 13), date(2026, 7, 14), retries=1,
     )
