@@ -1221,7 +1221,7 @@ def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending
         observed_at,
         _announcement_scan(CninfoAnnouncementRecord(
             "notice-pending", target, "2026-07-15T08:00:00+08:00",
-            "category_qyfpxzcs_szsh", "Dividend notice", "/notice.pdf",
+            "category_qyfpxzcs_szsh", "2025年度利润分配方案实施公告", "/notice.pdf",
         )),
         {target: ()},
     )
@@ -1237,6 +1237,61 @@ def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending
     assert any("PendingAnnouncement:structured lifecycle not available for notice-pending" in item
                for item in result.blockers)
     assert result.observation_ids
+
+
+def test_stock_action_proposals_and_h_only_notices_are_audited_without_detail_calls(tmp_path):
+    instrument_ids = ("600000.SH", "600001.SH", "600002.SH")
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, instrument_ids=instrument_ids,
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(
+            CninfoAnnouncementRecord(
+                "notice-proposal", instrument_ids[0], "2026-07-15T08:00:00+08:00",
+                "category_qyfpxzcs_szsh", "关于2026年半年度利润分配预案的公告",
+                "/proposal.pdf",
+            ),
+            CninfoAnnouncementRecord(
+                "notice-h-only", instrument_ids[1], "2026-07-15T09:00:00+08:00",
+                "category_qyfpxzcs_szsh", "有关派发H股2025年度末期股息之公告（H股公告）",
+                "/h-share.pdf",
+            ),
+            CninfoAnnouncementRecord(
+                "notice-suggest-implement", instrument_ids[2],
+                "2026-07-15T10:00:00+08:00", "category_qyfpxzcs_szsh",
+                "关于董事长提议实施2026年中期利润分配方案的提示性公告",
+                "/suggestion.pdf",
+            ),
+        ),
+        {},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert provider.observe_calls == []
+    report = json.loads(result.report.read_text(encoding="utf-8"))
+    assert set(report["affected_instrument_ids"]) == set(instrument_ids)
+    assert report["actionable_affected_instrument_ids"] == []
+    assert report["ignored_announcement_count"] == 3
+    assert {
+        item["announcement_id"]: item["reason"]
+        for item in report["ignored_announcements"]
+    } == {
+        "notice-h-only": "non_a_share_h_only",
+        "notice-proposal": "non_executable_proposal",
+        "notice-suggest-implement": "non_executable_proposal",
+    }
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))
+    assert pending["instruments"] == {}
 
 
 def test_stock_action_invalid_lifecycle_is_reported_without_masking_key_error(tmp_path):
@@ -1265,7 +1320,7 @@ def test_stock_action_invalid_lifecycle_is_reported_without_masking_key_error(tm
     assert "600000.SH:InvalidLifecycle:see invalid details" in blocker
 
 
-def test_stock_action_relevant_correction_with_empty_detail_stays_pending(tmp_path):
+def test_stock_action_relevant_correction_uses_exact_no_change_confirmation(tmp_path):
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
     target = "600000.SH"
     provider = _AnnouncementTargetedCninfoProvider(
@@ -1284,14 +1339,44 @@ def test_stock_action_relevant_correction_with_empty_detail_stays_pending(tmp_pa
         ),
     )
 
-    assert result.status == "incomplete"
-    assert result.unresolved_instrument_ids == (target,)
+    assert result.status == "complete"
+    assert result.unresolved_instrument_ids == ()
     pending = json.loads((
         warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
     ).read_text(encoding="utf-8"))
-    assert pending["instruments"][target]["announcements"][0]["announcement_id"] == (
-        "notice-correction-pending"
+    item = pending["instruments"][target]["announcements"][0]
+    assert item["announcement_id"] == "notice-correction-pending"
+    assert item["state"] == "confirming_no_action"
+    assert len(item["confirmation_observation_ids"]) == 1
+
+
+def test_stock_action_distribution_adjustment_uses_exact_no_change_confirmation(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-adjustment", target, "2026-07-15T08:00:00Z",
+            "category_qyfpxzcs_szsh", "关于调整年度利润分配现金分红总额的公告",
+            "/adjustment.pdf",
+        )),
+        {target: ()},
     )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert provider.observe_calls == [(target,)]
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))["instruments"][target]
+    assert pending["state"] == "confirming_no_action"
+    assert pending["announcements"][0]["state"] == "confirming_no_action"
 
 
 def test_stock_action_irrelevant_correction_needs_two_distinct_empty_confirmations(tmp_path):

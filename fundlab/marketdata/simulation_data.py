@@ -481,8 +481,22 @@ class SimulationEvidenceCollector:
             and str(item.get("instrument_id", "")) in stock_set
         )
         affected_ids = tuple(sorted({str(item["instrument_id"]) for item in records}))
-        by_instrument: dict[str, list[Mapping[str, Any]]] = {}
+        ignored_announcements: dict[str, Mapping[str, Any]] = {}
+        actionable_records: list[Mapping[str, Any]] = []
         for item in records:
+            reason = _ignored_stock_action_announcement_reason(item)
+            if reason is None:
+                actionable_records.append(item)
+                continue
+            ignored_announcements[str(item["announcement_id"])] = {
+                **dict(item),
+                "reason": reason,
+            }
+        actionable_affected_ids = tuple(sorted({
+            str(item["instrument_id"]) for item in actionable_records
+        }))
+        by_instrument: dict[str, list[Mapping[str, Any]]] = {}
+        for item in actionable_records:
             by_instrument.setdefault(str(item["instrument_id"]), []).append(item)
 
         pending_path = index_root / "pending.json"
@@ -491,7 +505,9 @@ class SimulationEvidenceCollector:
             str(key): value
             for key, value in pending_payload.get("instruments", {}).items()
         } if isinstance(pending_payload.get("instruments", {}), Mapping) else {}
-        for instrument_id, items in by_instrument.items():
+        candidate_ids = set(by_instrument) | set(pending)
+        for instrument_id in tuple(sorted(candidate_ids)):
+            items = by_instrument.get(instrument_id, ())
             existing = pending.get(instrument_id, {})
             old_records = existing.get("announcements", ()) if isinstance(existing, Mapping) else ()
             merged = {
@@ -499,6 +515,19 @@ class SimulationEvidenceCollector:
                 for item in (*old_records, *items)
                 if isinstance(item, Mapping) and item.get("announcement_id")
             }
+            retained: dict[str, Mapping[str, Any]] = {}
+            for announcement_id, announcement in merged.items():
+                reason = _ignored_stock_action_announcement_reason(announcement)
+                if reason is None:
+                    retained[announcement_id] = announcement
+                    continue
+                ignored_announcements[announcement_id] = {
+                    **announcement,
+                    "reason": reason,
+                }
+            if not retained:
+                pending.pop(instrument_id, None)
+                continue
             pending[instrument_id] = {
                 "first_seen_date": (
                     str(existing.get("first_seen_date"))
@@ -508,12 +537,12 @@ class SimulationEvidenceCollector:
                 "last_attempt_date": scope.history_end.isoformat(),
                 "state": "awaiting_structured_detail",
                 "announcements": tuple(
-                    merged[key] for key in sorted(merged)
+                    retained[key] for key in sorted(retained)
                 ),
             }
 
         target_ids = tuple(sorted(
-            (set(affected_ids) | set(pending)) & stock_set
+            (set(actionable_affected_ids) | set(pending)) & stock_set
         ))
         raw_observations = list(self.warehouse.observations(provider="cninfo-public"))
         selected: dict[str, ObservationManifest] = {}
@@ -708,10 +737,7 @@ class SimulationEvidenceCollector:
                     remaining.append({**announcement, "state": "known_future_event"})
                     has_known_future = True
                     continue
-                if (
-                    str(announcement.get("category")) == "category_bcgz_szsh"
-                    and not _is_action_relevant_correction(announcement)
-                ):
+                if _is_correction_announcement(announcement):
                     confirmations = set(map(
                         str, announcement.get("confirmation_observation_ids", ()),
                     ))
@@ -777,8 +803,8 @@ class SimulationEvidenceCollector:
                 request_errors[instrument_id] = "ObservationError:Source request failed: no evidence"
 
         _write_atomic_json(pending_path, {
-            "schema_version": 2,
-            "policy": "cninfo-stock-action-pending-v2",
+            "schema_version": 3,
+            "policy": "cninfo-stock-action-pending-v3",
             "updated_for": scope.history_end,
             "instruments": dict(sorted(pending.items())),
         })
@@ -831,7 +857,7 @@ class SimulationEvidenceCollector:
                 scope.history_end,
                 complete_ids,
                 {
-                    "kind": "stock-actions-announcement-index-r4",
+                    "kind": "stock-actions-announcement-index-r5",
                     "scan_id": scan_id,
                     "predecessor_snapshot_id": predecessor.snapshot_id,
                 },
@@ -860,13 +886,18 @@ class SimulationEvidenceCollector:
                     {
                         "kind": "field_level_reconciliation",
                         "reconciliation_ready": True,
-                        "policy": "stock-actions-announcement-index-r4-v1",
+                        "policy": "stock-actions-announcement-index-r5-v1",
                         "source_snapshot_id": spec.source_snapshot_id,
                         "predecessor_snapshot_id": predecessor.snapshot_id,
                         "announcement_scan_id": scan_id,
                         "announcement_scan_path": str(scan_path),
                         "announcement_scan_hash": stable_digest(scan_payload),
                         "affected_instrument_ids": affected_ids,
+                        "actionable_affected_instrument_ids": actionable_affected_ids,
+                        "ignored_announcements": tuple(
+                            ignored_announcements[key]
+                            for key in sorted(ignored_announcements)
+                        ),
                         "targeted_instrument_ids": target_ids,
                         "detail_requested_instrument_ids": tuple(sorted(
                             detail_requested_ids
@@ -887,7 +918,7 @@ class SimulationEvidenceCollector:
             observation_ids = (manifest.observation_id,)
 
         build_id = "evidence-" + stable_digest({
-            "collector_version": 4,
+            "collector_version": 5,
             "source_snapshot_id": spec.source_snapshot_id,
             "predecessor_snapshot_id": predecessor.snapshot_id,
             "kind": spec.kind,
@@ -895,7 +926,7 @@ class SimulationEvidenceCollector:
         })[:24]
         checkpoint = self.warehouse.root / "builds" / build_id / "checkpoint.json"
         _write_atomic_json(checkpoint, {
-            "schema_version": 4,
+            "schema_version": 5,
             "build_id": build_id,
             "spec": spec,
             "universe_scope": scope,
@@ -903,6 +934,11 @@ class SimulationEvidenceCollector:
             "scan_path": scan_path,
             "pending_path": pending_path,
             "affected_instrument_ids": affected_ids,
+            "actionable_affected_instrument_ids": actionable_affected_ids,
+            "ignored_announcements": tuple(
+                ignored_announcements[key]
+                for key in sorted(ignored_announcements)
+            ),
             "targeted_instrument_ids": target_ids,
             "detail_requested_instrument_ids": tuple(sorted(detail_requested_ids)),
             "reused_detail_instrument_ids": tuple(sorted(reused_detail_ids)),
@@ -923,6 +959,12 @@ class SimulationEvidenceCollector:
             "scan_window": {"start": scan_start, "end": scope.history_end},
             "announcement_count": len(records),
             "affected_instrument_ids": affected_ids,
+            "actionable_affected_instrument_ids": actionable_affected_ids,
+            "ignored_announcement_count": len(ignored_announcements),
+            "ignored_announcements": tuple(
+                ignored_announcements[key]
+                for key in sorted(ignored_announcements)
+            ),
             "targeted_instrument_ids": target_ids,
             "pending_instrument_ids": tuple(sorted(set(pending) & stock_set)),
             "universe_instrument_ids": stock_ids,
@@ -2949,12 +2991,46 @@ def _instrument_listed_date(instruments: pd.DataFrame, instrument_id: str) -> da
     return date.fromisoformat(str(value)[:10])
 
 
-def _is_action_relevant_correction(announcement: Mapping[str, Any]) -> bool:
+def _ignored_stock_action_announcement_reason(
+    announcement: Mapping[str, Any],
+) -> str | None:
+    """Return an audited reason when a disclosure cannot affect A-share lifecycle data.
+
+    The CNInfo distribution category contains proposals and shareholder suggestions
+    as well as implementation notices.  Only the latter can supply an ex-date or a
+    payable/listing event.  Corrections remain actionable because the exact accepted
+    historical business fields must be compared before they can be cleared.
+    """
+
+    title = str(announcement.get("title", "")).strip()
+    compact = "".join(title.split())
+    if "H股" in compact and "A股" not in compact:
+        return "non_a_share_h_only"
+    if str(announcement.get("category", "")) != "category_qyfpxzcs_szsh":
+        return None
+    if _is_correction_announcement(announcement):
+        return None
+    if any(token in compact for token in (
+        "预案", "提议", "提示性",
+    )):
+        return "non_executable_proposal"
+    if any(token in compact for token in (
+        "实施", "除权除息", "股权登记", "派息日", "股份到账", "配股缴款", "配股上市",
+    )):
+        return None
+    if any(token in compact for token in (
+        "利润分配方案", "分红方案", "可分配利润进行现金分红",
+    )):
+        return "non_executable_proposal"
+    return None
+
+
+def _is_correction_announcement(announcement: Mapping[str, Any]) -> bool:
     title = str(announcement.get("title", ""))
-    return any(token in title for token in (
-        "分红", "红利", "利润分配", "权益分派", "派息", "除权", "除息",
-        "送股", "转增", "配股", "股份到账",
-    ))
+    return (
+        str(announcement.get("category", "")) == "category_bcgz_szsh"
+        or any(token in title for token in ("更正", "补充", "调整", "修订"))
+    )
 
 
 def _announcement_matches_action_evidence(
