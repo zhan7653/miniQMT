@@ -442,7 +442,30 @@ class SimulationEvidenceCollector:
                 raise SnapshotNotReadyError(
                     "CNInfo provider does not expose the required announcement index"
                 )
-            scan = scanner(scan_start, scope.history_end)
+            try:
+                scan = scanner(scan_start, scope.history_end)
+            except Exception as exc:
+                scan_audit = getattr(
+                    provider, "last_announcement_scan_audit", {},
+                )
+                failure_payload = {
+                    "schema_version": 1,
+                    "policy": "cninfo-stock-action-announcement-scan-failure-v1",
+                    "start_date": scan_start,
+                    "end_date": scope.history_end,
+                    "error": f"{type(exc).__name__}:{str(exc)[:1000]}",
+                    "scan_audit": (
+                        scan_audit if isinstance(scan_audit, Mapping) else {}
+                    ),
+                }
+                failure_path = index_root / "failures" / (
+                    f"failure-{stable_digest(failure_payload)[:24]}.json"
+                )
+                _write_immutable_json(failure_path, failure_payload)
+                raise SnapshotNotReadyError(
+                    "CNInfo announcement scan failed; immutable audit: "
+                    f"{failure_path}"
+                ) from exc
             scan_payload = to_primitive(scan)
             if not isinstance(scan_payload, Mapping):
                 raise SnapshotNotReadyError("CNInfo announcement scan is not an object")
@@ -468,22 +491,12 @@ class SimulationEvidenceCollector:
             str(key): value
             for key, value in pending_payload.get("instruments", {}).items()
         } if isinstance(pending_payload.get("instruments", {}), Mapping) else {}
-        actionable_categories = {
-            "category_qyfpxzcs_szsh",
-            "category_pg_szsh",
-        }
         for instrument_id, items in by_instrument.items():
-            actionable = tuple(
-                item for item in items
-                if str(item.get("category", "")) in actionable_categories
-            )
-            if not actionable:
-                continue
             existing = pending.get(instrument_id, {})
             old_records = existing.get("announcements", ()) if isinstance(existing, Mapping) else ()
             merged = {
                 str(item["announcement_id"]): dict(item)
-                for item in (*old_records, *actionable)
+                for item in (*old_records, *items)
                 if isinstance(item, Mapping) and item.get("announcement_id")
             }
             pending[instrument_id] = {
@@ -506,6 +519,7 @@ class SimulationEvidenceCollector:
         selected: dict[str, ObservationManifest] = {}
         request_errors: dict[str, str] = {}
         invalid_details: dict[str, Any] = {}
+        detail_request_attempts: list[Mapping[str, Any]] = []
 
         def absorb(manifest: ObservationManifest) -> None:
             if (
@@ -541,13 +555,16 @@ class SimulationEvidenceCollector:
         if not spec.refresh:
             for manifest in raw_observations:
                 absorb(manifest)
+        reused_detail_ids = set(selected)
 
         recovery_errors: dict[str, str] = {}
-        for _round in range(2):
+        detail_requested_ids: set[str] = set()
+        for round_index in range(2):
             unresolved = tuple(sorted(set(target_ids) - set(selected)))
             if not unresolved:
                 break
             for batch in _chunks(unresolved, 10):
+                detail_requested_ids.update(batch)
                 start = min(_instrument_listed_date(indexed, item) for item in batch)
                 request = ProviderRequest(
                     ProviderCapability.CORPORATE_ACTIONS,
@@ -567,11 +584,23 @@ class SimulationEvidenceCollector:
                     )
                 except Exception as exc:
                     detail = f"{type(exc).__name__}:{str(exc)[:240]}"
+                    detail_request_attempts.append({
+                        "round": round_index + 1,
+                        "instrument_ids": batch,
+                        "status": "error",
+                        "error": detail,
+                    })
                     for instrument_id in batch:
                         recovery_errors[instrument_id] = detail
                     continue
                 raw_observations.append(manifest)
                 absorb(manifest)
+                detail_request_attempts.append({
+                    "round": round_index + 1,
+                    "instrument_ids": batch,
+                    "status": "observed",
+                    "observation_id": manifest.observation_id,
+                })
 
         selected_ids = set(selected)
         detail_pieces: list[pd.DataFrame] = []
@@ -633,28 +662,66 @@ class SimulationEvidenceCollector:
                 scope.history_start.isoformat(), scope.history_end.isoformat(),
             )
         ].copy().reset_index(drop=True)
-        current_ids = set(map(str, current_actions.get(
-            "instrument_id", pd.Series(dtype="string"),
-        )))
         awaiting: set[str] = set()
         for instrument_id in tuple(sorted(set(pending) & stock_set)):
+            item = pending.get(instrument_id, {})
+            announcements = tuple(
+                announcement for announcement in item.get("announcements", ())
+                if isinstance(announcement, Mapping)
+            ) if isinstance(item, Mapping) else ()
             if instrument_id not in selected_ids:
                 awaiting.add(instrument_id)
                 continue
-            if instrument_id in current_ids:
+            if instrument_id in historical_corrections:
+                continue
+            instrument_actions = current_actions.loc[
+                current_actions["instrument_id"].astype(str).eq(instrument_id)
+            ]
+            future_actions = known_pending.get(instrument_id, ())
+            remaining: list[Mapping[str, Any]] = []
+            has_known_future = False
+            for announcement in announcements:
+                if _announcement_matches_action_evidence(
+                    announcement, instrument_actions,
+                ):
+                    continue
+                if _announcement_matches_action_evidence(
+                    announcement, future_actions,
+                ):
+                    remaining.append({**announcement, "state": "known_future_event"})
+                    has_known_future = True
+                    continue
+                if (
+                    str(announcement.get("category")) == "category_bcgz_szsh"
+                    and not _is_action_relevant_correction(announcement)
+                ):
+                    continue
+                remaining.append({
+                    **announcement,
+                    "state": "awaiting_structured_detail",
+                })
+            if not remaining:
                 pending.pop(instrument_id, None)
                 continue
-            if instrument_id in known_pending:
-                item = pending.get(instrument_id, {})
-                if isinstance(item, Mapping):
-                    pending[instrument_id] = {
-                        **item,
-                        "last_attempt_date": scope.history_end.isoformat(),
-                        "state": "known_future_event",
-                        "known_pending_after_cutoff": known_pending[instrument_id],
-                    }
-                continue
-            awaiting.add(instrument_id)
+            pending[instrument_id] = {
+                **item,
+                "last_attempt_date": scope.history_end.isoformat(),
+                "state": (
+                    "known_future_event"
+                    if has_known_future and all(
+                        str(value.get("state")) == "known_future_event"
+                        for value in remaining
+                    )
+                    else "awaiting_structured_detail"
+                ),
+                "announcements": tuple(remaining),
+                "known_pending_after_cutoff": future_actions,
+            }
+            if any(
+                str(value.get("state")) != "known_future_event"
+                for value in remaining
+            ):
+                awaiting.add(instrument_id)
 
         unresolved = set(target_ids) - selected_ids
         unresolved.update(awaiting)
@@ -677,8 +744,8 @@ class SimulationEvidenceCollector:
                 request_errors[instrument_id] = "ObservationError:Source request failed: no evidence"
 
         _write_atomic_json(pending_path, {
-            "schema_version": 1,
-            "policy": "cninfo-stock-action-pending-v1",
+            "schema_version": 2,
+            "policy": "cninfo-stock-action-pending-v2",
             "updated_for": scope.history_end,
             "instruments": dict(sorted(pending.items())),
         })
@@ -730,7 +797,7 @@ class SimulationEvidenceCollector:
                 scope.history_end,
                 complete_ids,
                 {
-                    "kind": "stock-actions-announcement-index-r3",
+                    "kind": "stock-actions-announcement-index-r4",
                     "scan_id": scan_id,
                     "predecessor_snapshot_id": predecessor.snapshot_id,
                 },
@@ -759,7 +826,7 @@ class SimulationEvidenceCollector:
                     {
                         "kind": "field_level_reconciliation",
                         "reconciliation_ready": True,
-                        "policy": "stock-actions-announcement-index-r3-v1",
+                        "policy": "stock-actions-announcement-index-r4-v1",
                         "source_snapshot_id": spec.source_snapshot_id,
                         "predecessor_snapshot_id": predecessor.snapshot_id,
                         "announcement_scan_id": scan_id,
@@ -767,6 +834,12 @@ class SimulationEvidenceCollector:
                         "announcement_scan_hash": stable_digest(scan_payload),
                         "affected_instrument_ids": affected_ids,
                         "targeted_instrument_ids": target_ids,
+                        "detail_requested_instrument_ids": tuple(sorted(
+                            detail_requested_ids
+                        )),
+                        "reused_detail_instrument_ids": tuple(sorted(
+                            reused_detail_ids
+                        )),
                         "input_observation_ids": input_ids,
                         "per_instrument_evidence": per_instrument_evidence,
                         "known_pending_after_cutoff": known_pending,
@@ -780,7 +853,7 @@ class SimulationEvidenceCollector:
             observation_ids = (manifest.observation_id,)
 
         build_id = "evidence-" + stable_digest({
-            "collector_version": 3,
+            "collector_version": 4,
             "source_snapshot_id": spec.source_snapshot_id,
             "predecessor_snapshot_id": predecessor.snapshot_id,
             "kind": spec.kind,
@@ -788,7 +861,7 @@ class SimulationEvidenceCollector:
         })[:24]
         checkpoint = self.warehouse.root / "builds" / build_id / "checkpoint.json"
         _write_atomic_json(checkpoint, {
-            "schema_version": 3,
+            "schema_version": 4,
             "build_id": build_id,
             "spec": spec,
             "universe_scope": scope,
@@ -797,6 +870,9 @@ class SimulationEvidenceCollector:
             "pending_path": pending_path,
             "affected_instrument_ids": affected_ids,
             "targeted_instrument_ids": target_ids,
+            "detail_requested_instrument_ids": tuple(sorted(detail_requested_ids)),
+            "reused_detail_instrument_ids": tuple(sorted(reused_detail_ids)),
+            "detail_request_attempts": tuple(detail_request_attempts),
             "unresolved_instrument_ids": tuple(sorted(unresolved)),
             "observation_ids": observation_ids,
         })
@@ -815,9 +891,14 @@ class SimulationEvidenceCollector:
             "affected_instrument_ids": affected_ids,
             "targeted_instrument_ids": target_ids,
             "pending_instrument_ids": tuple(sorted(set(pending) & stock_set)),
-            "requested_instrument_ids": stock_ids,
+            "universe_instrument_ids": stock_ids,
+            "requested_instrument_ids": tuple(sorted(detail_requested_ids)),
+            "reused_detail_instrument_ids": tuple(sorted(reused_detail_ids)),
+            "new_detail_instrument_ids": tuple(sorted(selected_ids - reused_detail_ids)),
+            "completed_target_instrument_ids": tuple(sorted(set(target_ids) - unresolved)),
             "completed_instrument_ids": complete_ids,
             "unresolved_instrument_ids": tuple(sorted(unresolved)),
+            "detail_request_attempts": tuple(detail_request_attempts),
             "historical_corrections": historical_corrections,
             "observation_ids": observation_ids,
             "blockers": tuple(blockers),
@@ -2742,6 +2823,8 @@ def _require_complete_announcement_scan(
     }
     if payload.get("complete") is not True:
         raise SnapshotNotReadyError("CNInfo announcement scan is not complete")
+    if payload.get("policy_version") != "cninfo-corporate-actions-v1":
+        raise SnapshotNotReadyError("CNInfo announcement scan policy version mismatch")
     if (
         str(payload.get("start_date")) != start_date.isoformat()
         or str(payload.get("end_date")) != end_date.isoformat()
@@ -2750,8 +2833,57 @@ def _require_complete_announcement_scan(
     categories = payload.get("categories")
     if not isinstance(categories, (list, tuple)) or not required_categories <= set(map(str, categories)):
         raise SnapshotNotReadyError("CNInfo announcement scan categories are incomplete")
-    if not isinstance(payload.get("page_evidence"), (list, tuple)):
+    page_evidence = payload.get("page_evidence")
+    if not isinstance(page_evidence, (list, tuple)) or not page_evidence:
         raise SnapshotNotReadyError("CNInfo announcement scan has no page evidence")
+    for category in required_categories:
+        entries = tuple(
+            item for item in page_evidence
+            if isinstance(item, Mapping) and str(item.get("category")) == category
+        )
+        initial = tuple(item for item in entries if item.get("check") == "initial")
+        recheck = tuple(item for item in entries if item.get("check") == "recheck")
+        pages = tuple(
+            item for item in entries if item.get("check") in {"initial", "page"}
+        )
+        if len(initial) != 1 or len(recheck) != 1 or not pages:
+            raise SnapshotNotReadyError(
+                f"CNInfo announcement scan page checks are incomplete: {category}"
+            )
+        totals = {item.get("reported_total") for item in entries}
+        if len(totals) != 1 or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in totals
+        ):
+            raise SnapshotNotReadyError(
+                f"CNInfo announcement scan page totals are inconsistent: {category}"
+            )
+        total = next(iter(totals))
+        if sum(int(item.get("record_count", -1)) for item in pages) != total:
+            raise SnapshotNotReadyError(
+                f"CNInfo announcement scan page counts are incomplete: {category}"
+            )
+        if initial[0].get("response_hash") != recheck[0].get("response_hash"):
+            raise SnapshotNotReadyError(
+                f"CNInfo announcement scan first-page evidence drifted: {category}"
+            )
+        for item in entries:
+            response_json = item.get("response_json")
+            response_hash = item.get("response_hash")
+            if not isinstance(response_json, str) or not response_json:
+                raise SnapshotNotReadyError(
+                    f"CNInfo announcement scan raw response is missing: {category}"
+                )
+            try:
+                response_payload = json.loads(response_json)
+            except json.JSONDecodeError as exc:
+                raise SnapshotNotReadyError(
+                    f"CNInfo announcement scan raw response is invalid: {category}"
+                ) from exc
+            if stable_digest(response_payload) != response_hash:
+                raise SnapshotNotReadyError(
+                    f"CNInfo announcement scan response hash mismatch: {category}"
+                )
     records = payload.get("records")
     affected = payload.get("affected_instrument_ids")
     if not isinstance(records, (list, tuple)) or not isinstance(affected, (list, tuple)):
@@ -2783,6 +2915,44 @@ def _instrument_listed_date(instruments: pd.DataFrame, instrument_id: str) -> da
     return date.fromisoformat(str(value)[:10])
 
 
+def _is_action_relevant_correction(announcement: Mapping[str, Any]) -> bool:
+    title = str(announcement.get("title", ""))
+    return any(token in title for token in (
+        "分红", "红利", "利润分配", "权益分派", "派息", "除权", "除息",
+        "送股", "转增", "配股", "股份到账",
+    ))
+
+
+def _announcement_matches_action_evidence(
+    announcement: Mapping[str, Any],
+    evidence: pd.DataFrame | Any,
+) -> bool:
+    category = str(announcement.get("category", ""))
+    expected_types = {
+        "category_qyfpxzcs_szsh": {"cash_dividend", "stock_dividend"},
+        "category_pg_szsh": {"rights_issue"},
+        "category_bcgz_szsh": {
+            "cash_dividend", "stock_dividend", "rights_issue",
+        },
+    }.get(category, set())
+    announcement_date = str(announcement.get("announcement_time", ""))[:10]
+    if not expected_types or len(announcement_date) != 10:
+        return False
+    records = (
+        evidence.to_dict("records")
+        if isinstance(evidence, pd.DataFrame)
+        else tuple(evidence or ())
+    )
+    for item in records:
+        if not isinstance(item, Mapping):
+            continue
+        action_type = str(item.get("action_type", item.get("kind", "")))
+        known_date = str(item.get("known_date", ""))[:10]
+        if action_type in expected_types and known_date == announcement_date:
+            return True
+    return False
+
+
 def _historical_action_corrections(
     *,
     predecessor_actions: pd.DataFrame,
@@ -2793,8 +2963,8 @@ def _historical_action_corrections(
     """Return exact historical business-field differences without mutating history."""
 
     fields = (
-        "known_date", "record_date", "pay_date",
-        "cash_per_share", "share_ratio", "rights_price",
+        "known_date", "record_date", "pay_date", "listing_date",
+        "cash_per_share", "share_ratio", "rights_price", "quantity_multiplier",
     )
 
     def rows(frame: pd.DataFrame, instrument_id: str) -> dict[str, Mapping[str, Any]]:

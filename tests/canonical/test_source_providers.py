@@ -928,6 +928,28 @@ def test_cninfo_announcement_scan_rejects_reported_total_pagination_drift():
         )
 
 
+def test_cninfo_announcement_scan_rejects_duplicate_id_across_pages():
+    category = "category_qyfpxzcs_szsh"
+    client = _AnnouncementClient({
+        (category, 1): {
+            "totalAnnouncement": 2,
+            "announcements": [_announcement("a", "600000")],
+        },
+        (category, 2): {
+            "totalAnnouncement": 2,
+            "announcements": [_announcement("a", "600000")],
+        },
+    })
+    provider = CninfoCorporateActionProvider(client=client)
+
+    with pytest.raises(ObservationError, match="reported number of unique IDs"):
+        provider.scan_announcements(START, END, page_size=1, retries=1)
+
+    audit = provider.last_announcement_scan_audit
+    assert len(audit["responses"]) == 2
+    assert all(item["response_json"] for item in audit["responses"])
+
+
 def test_cninfo_announcement_scan_rejects_first_page_drift():
     category = "category_qyfpxzcs_szsh"
     responses = iter((

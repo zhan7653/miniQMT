@@ -493,10 +493,16 @@ class CninfoCorporateActionProvider:
 
     def __init__(self, *, client: Any | None = None) -> None:
         self._client = client
+        self._last_announcement_scan_audit: dict[str, Any] = {}
 
     @property
     def available(self) -> bool:
         return True
+
+    @property
+    def last_announcement_scan_audit(self) -> Mapping[str, Any]:
+        """Raw successful responses and failures from the latest scan attempt."""
+        return json.loads(canonical_json(self._last_announcement_scan_audit))
 
     def scan_announcements(
         self,
@@ -528,8 +534,19 @@ class CninfoCorporateActionProvider:
         client = self._client or CninfoPublicClient()
         evidence: list[CninfoAnnouncementPageEvidence] = []
         unique: dict[str, CninfoAnnouncementRecord] = {}
+        self._last_announcement_scan_audit = {
+            "schema_version": 1,
+            "policy_version": _ANNOUNCEMENT_POLICY_VERSION,
+            "start_date": start_date,
+            "end_date": end_date,
+            "categories": categories,
+            "page_size": page_size,
+            "status": "running",
+            "responses": [],
+            "failures": [],
+        }
 
-        def fetch(category: str, page_number: int) -> Mapping[str, Any]:
+        def fetch(category: str, page_number: int, check: str) -> Mapping[str, Any]:
             last: Exception | None = None
             for attempt in range(retries):
                 try:
@@ -542,9 +559,24 @@ class CninfoCorporateActionProvider:
                     )
                     if not isinstance(payload, Mapping):
                         raise ObservationError("CNInfo announcement response root is not an object")
+                    self._last_announcement_scan_audit["responses"].append({
+                        "category": category,
+                        "page_number": page_number,
+                        "check": check,
+                        "attempt": attempt + 1,
+                        "response_hash": stable_digest(_plain(payload)),
+                        "response_json": canonical_json(_plain(payload)),
+                    })
                     return payload
                 except Exception as exc:
                     last = exc
+                    self._last_announcement_scan_audit["failures"].append({
+                        "category": category,
+                        "page_number": page_number,
+                        "check": check,
+                        "attempt": attempt + 1,
+                        "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+                    })
                     if attempt + 1 < retries and retry_backoff_seconds:
                         sleep(retry_backoff_seconds * (2 ** attempt))
             assert last is not None
@@ -553,17 +585,19 @@ class CninfoCorporateActionProvider:
             ) from last
 
         for category in categories:
-            first_payload = fetch(category, 1)
+            category_records: list[CninfoAnnouncementRecord] = []
+            first_payload = fetch(category, 1, "initial")
             first_total, first_records = _announcement_page_records(
                 first_payload, category=category, page_number=1, page_size=page_size,
             )
+            category_records.extend(first_records)
             evidence.append(_announcement_evidence(
                 category, 1, first_total, first_records, first_payload, "initial",
             ))
             _merge_announcement_records(unique, first_records)
 
             for page_number in range(2, ceil(first_total / page_size) + 1):
-                payload = fetch(category, page_number)
+                payload = fetch(category, page_number, "page")
                 reported_total, records = _announcement_page_records(
                     payload, category=category, page_number=page_number, page_size=page_size,
                 )
@@ -573,12 +607,21 @@ class CninfoCorporateActionProvider:
                         f"category={category}, page={page_number}, "
                         f"expected_total={first_total}, reported_total={reported_total}"
                     )
+                category_records.extend(records)
                 evidence.append(_announcement_evidence(
                     category, page_number, reported_total, records, payload, "page",
                 ))
                 _merge_announcement_records(unique, records)
 
-            recheck_payload = fetch(category, 1)
+            category_ids = {item.announcement_id for item in category_records}
+            if len(category_ids) != first_total:
+                raise ObservationError(
+                    "CNInfo announcement pages do not contain the reported number "
+                    f"of unique IDs: category={category}, expected={first_total}, "
+                    f"unique={len(category_ids)}"
+                )
+
+            recheck_payload = fetch(category, 1, "recheck")
             recheck_total, recheck_records = _announcement_page_records(
                 recheck_payload, category=category, page_number=1, page_size=page_size,
             )
@@ -602,6 +645,8 @@ class CninfoCorporateActionProvider:
             unique.values(),
             key=lambda item: (item.announcement_time, item.announcement_id),
         ))
+        self._last_announcement_scan_audit["status"] = "complete"
+        self._last_announcement_scan_audit["record_count"] = len(records)
         return CninfoAnnouncementScan(
             policy_version=_ANNOUNCEMENT_POLICY_VERSION,
             start_date=start_date.isoformat(),

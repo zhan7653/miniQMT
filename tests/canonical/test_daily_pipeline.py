@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CoverageClaim,
@@ -28,7 +29,10 @@ from fundlab.marketdata import (
 )
 from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
 from fundlab.marketdata.schema import empty_table
-from fundlab.marketdata.sources.cninfo import CninfoAnnouncementScan
+from fundlab.marketdata.sources.cninfo import (
+    CninfoAnnouncementPageEvidence,
+    CninfoAnnouncementScan,
+)
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
 from fundlab.pipeline.daily import (
@@ -733,16 +737,31 @@ class _DailyFixtureProvider:
     def scan_announcements(self, start_date, end_date, **kwargs):
         if self.name != "cninfo-public":
             raise AssertionError(f"announcement scan routed to {self.name}")
+        categories = (
+            "category_qyfpxzcs_szsh",
+            "category_pg_szsh",
+            "category_bcgz_szsh",
+        )
+        payload = {"totalAnnouncement": 0, "announcements": None}
+        page_evidence = tuple(
+            CninfoAnnouncementPageEvidence(
+                category=category,
+                page_number=1,
+                reported_total=0,
+                record_count=0,
+                response_hash=stable_digest(payload),
+                response_json=canonical_json(payload),
+                check=check,
+            )
+            for category in categories
+            for check in ("initial", "recheck")
+        )
         return CninfoAnnouncementScan(
             policy_version="cninfo-corporate-actions-v1",
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
-            categories=(
-                "category_qyfpxzcs_szsh",
-                "category_pg_szsh",
-                "category_bcgz_szsh",
-            ),
-            page_evidence=(),
+            categories=categories,
+            page_evidence=page_evidence,
             records=(),
             affected_instrument_ids=(),
             complete=True,

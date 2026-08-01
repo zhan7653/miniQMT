@@ -6,6 +6,7 @@ import json
 import pandas as pd
 import pytest
 
+from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CoverageClaim,
@@ -23,6 +24,7 @@ from fundlab.marketdata import (
     SimulationStatusCollector,
     StatusCollectionSpec,
     SnapshotPlan,
+    SnapshotNotReadyError,
     SourceSlice,
     UniverseScope,
     build_dense_simulation_bars,
@@ -32,6 +34,7 @@ from fundlab.marketdata import (
 )
 from fundlab.marketdata.simulation_data import _collapse_same_lifecycle_cash_components
 from fundlab.marketdata.sources.cninfo import (
+    CninfoAnnouncementPageEvidence,
     CninfoAnnouncementRecord,
     CninfoAnnouncementScan,
 )
@@ -999,16 +1002,34 @@ def _stock_action_row(
 
 
 def _announcement_scan(*records: CninfoAnnouncementRecord) -> CninfoAnnouncementScan:
+    categories = (
+        "category_qyfpxzcs_szsh",
+        "category_pg_szsh",
+        "category_bcgz_szsh",
+    )
+    page_evidence = []
+    for category in categories:
+        category_records = tuple(item for item in records if item.category == category)
+        payload = {
+            "totalAnnouncement": len(category_records),
+            "announcements": [item.announcement_id for item in category_records],
+        }
+        for check in ("initial", "recheck"):
+            page_evidence.append(CninfoAnnouncementPageEvidence(
+                category=category,
+                page_number=1,
+                reported_total=len(category_records),
+                record_count=len(category_records),
+                response_hash=stable_digest(payload),
+                response_json=canonical_json(payload),
+                check=check,
+            ))
     return CninfoAnnouncementScan(
-        policy_version="fixture-v1",
+        policy_version="cninfo-corporate-actions-v1",
         start_date=DAYS[1].isoformat(),
         end_date=DAYS[-1].isoformat(),
-        categories=(
-            "category_qyfpxzcs_szsh",
-            "category_pg_szsh",
-            "category_bcgz_szsh",
-        ),
-        page_evidence=(),
+        categories=categories,
+        page_evidence=tuple(page_evidence),
         records=records,
         affected_instrument_ids=tuple(sorted({item.instrument_id for item in records})),
         complete=True,
@@ -1019,10 +1040,14 @@ class _AnnouncementTargetedCninfoProvider:
     name = "cninfo-public"
     capabilities = frozenset({ProviderCapability.CORPORATE_ACTIONS})
 
-    def __init__(self, observed_at, scan, actions_by_instrument):
+    def __init__(
+        self, observed_at, scan, actions_by_instrument,
+        known_pending_by_instrument=None,
+    ):
         self.observed_at = observed_at
         self.scan = scan
         self.actions_by_instrument = actions_by_instrument
+        self.known_pending_by_instrument = known_pending_by_instrument or {}
         self.scan_calls = 0
         self.observe_calls: list[tuple[str, ...]] = []
 
@@ -1064,7 +1089,11 @@ class _AnnouncementTargetedCninfoProvider:
                 },
                 "request_errors": {},
                 "invalid_lifecycle": {},
-                "known_pending_after_cutoff": {},
+                "known_pending_after_cutoff": {
+                    instrument_id: self.known_pending_by_instrument[instrument_id]
+                    for instrument_id in request.instrument_ids
+                    if instrument_id in self.known_pending_by_instrument
+                },
             },
         )
 
@@ -1097,6 +1126,50 @@ def test_stock_action_empty_announcement_scan_covers_all_stocks_without_detail_c
     manifest = warehouse.load_observation(result.observation_ids[0])
     assert manifest.provider == STOCK_ACTION_CANONICAL_PROVIDER
     assert manifest.request.instrument_ids == tuple(instruments["instrument_id"])
+    report = json.loads(result.report.read_text(encoding="utf-8"))
+    assert report["requested_instrument_ids"] == []
+    assert set(report["universe_instrument_ids"]) == set(instruments["instrument_id"])
+
+
+def test_stock_action_failed_scan_persists_raw_audit_before_blocking(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+
+    class FailingProvider:
+        name = "cninfo-public"
+        capabilities = frozenset({ProviderCapability.CORPORATE_ACTIONS})
+        last_announcement_scan_audit = {
+            "status": "running",
+            "responses": ({
+                "category": "category_qyfpxzcs_szsh",
+                "page_number": 1,
+                "response_hash": "raw-hash",
+                "response_json": '{"totalAnnouncement":2}',
+            },),
+        }
+
+        def scan_announcements(self, start_date, end_date):
+            raise RuntimeError("pagination drift fixture")
+
+        def observe(self, request):  # pragma: no cover - scan must fail first
+            raise AssertionError("detail collection must not start")
+
+    with pytest.raises(SnapshotNotReadyError, match="immutable audit"):
+        _stock_action_collector(
+            warehouse, tmp_path, FailingProvider(),
+        ).collect(EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ))
+
+    failures = tuple((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "failures"
+    ).glob("failure-*.json"))
+    assert len(failures) == 1
+    audit = json.loads(failures[0].read_text(encoding="utf-8"))
+    assert audit["error"] == "RuntimeError:pagination drift fixture"
+    assert audit["scan_audit"]["responses"][0]["response_json"] == (
+        '{"totalAnnouncement":2}'
+    )
 
 
 def test_stock_action_scan_targets_only_affected_stocks_and_keeps_current_actions(tmp_path):
@@ -1125,6 +1198,10 @@ def test_stock_action_scan_targets_only_affected_stocks_and_keeps_current_action
 
     assert result.status == "complete"
     assert provider.observe_calls == [targets]
+    report = json.loads(result.report.read_text(encoding="utf-8"))
+    assert tuple(report["requested_instrument_ids"]) == targets
+    assert tuple(report["completed_target_instrument_ids"]) == targets
+    assert report["reused_detail_instrument_ids"] == []
     canonical = warehouse.read_observation_table(
         result.observation_ids[0], MarketTable.CORPORATE_ACTIONS,
     )
@@ -1157,6 +1234,126 @@ def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending
     assert result.observation_ids
 
 
+def test_stock_action_relevant_correction_with_empty_detail_stays_pending(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-correction-pending", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "权益分派金额更正公告", "/correction.pdf",
+        )),
+        {target: ()},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    assert result.unresolved_instrument_ids == (target,)
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))
+    assert pending["instruments"][target]["announcements"][0]["announcement_id"] == (
+        "notice-correction-pending"
+    )
+
+
+def test_stock_action_irrelevant_correction_is_resolved_after_successful_detail(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-unrelated-correction", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "年度报告会计差错更正公告", "/correction.pdf",
+        )),
+        {target: ()},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))
+    assert pending["instruments"] == {}
+
+
+def test_stock_action_resolves_pending_per_announcement_not_per_stock(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(
+            CninfoAnnouncementRecord(
+                "notice-resolved", target, "2026-07-15T08:00:00Z",
+                "category_qyfpxzcs_szsh", "Dividend notice", "/resolved.pdf",
+            ),
+            CninfoAnnouncementRecord(
+                "notice-still-pending", target, "2026-07-16T08:00:00Z",
+                "category_qyfpxzcs_szsh", "Dividend notice", "/pending.pdf",
+            ),
+        ),
+        {target: (_stock_action_row(target),)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))["instruments"][target]["announcements"]
+    assert [item["announcement_id"] for item in pending] == ["notice-still-pending"]
+
+
+def test_stock_action_known_future_correction_remains_pending_without_degrading(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-future-correction", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "权益分派日期更正公告", "/correction.pdf",
+        )),
+        {target: ()},
+        {target: ({
+            "kind": "cash_dividend",
+            "known_date": "2026-07-15",
+            "ex_date": "2026-07-20",
+            "response_hash": "future-hash",
+        },)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    pending = json.loads((
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    ).read_text(encoding="utf-8"))["instruments"][target]
+    assert pending["state"] == "known_future_event"
+    assert pending["announcements"][0]["state"] == "known_future_event"
+
+
 def test_stock_action_persisted_pending_is_targeted_without_a_new_announcement(tmp_path):
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
     target = "600000.SH"
@@ -1174,7 +1371,7 @@ def test_stock_action_persisted_pending_is_targeted_without_a_new_announcement(t
                 "announcements": ({
                     "announcement_id": "notice-from-prior-run",
                     "instrument_id": target,
-                    "announcement_time": "2026-07-14T08:00:00Z",
+                    "announcement_time": "2026-07-15T08:00:00Z",
                     "category": "category_qyfpxzcs_szsh",
                     "title": "Dividend notice",
                     "document_url": "/notice.pdf",
@@ -1263,6 +1460,42 @@ def test_stock_action_historical_ex_date_move_reports_removed_and_added_keys(tmp
     assert result.observation_ids == ()
 
 
+def test_stock_action_historical_listing_and_quantity_changes_are_exact_blockers(tmp_path):
+    target = "600000.SH"
+    before = _stock_action_row(target, ex_date=DAYS[1])
+    before["listing_date"] = DAYS[1].isoformat()
+    before["quantity_multiplier"] = 1.1
+    after = dict(before)
+    after["listing_date"] = DAYS[2].isoformat()
+    after["quantity_multiplier"] = 1.2
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, predecessor_actions=pd.DataFrame([before]),
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-fields-correction", target, "2026-07-15T08:00:00Z",
+            "category_bcgz_szsh", "权益分派到账日更正公告", "/correction.pdf",
+        )),
+        {target: (after,)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    correction = next(
+        item for item in result.blockers
+        if item.startswith("HistoricalActionCorrectionError:")
+    )
+    assert '"listing_date"' in correction
+    assert '"quantity_multiplier"' in correction
+    assert result.observation_ids == ()
+
+
 def test_stock_action_same_scope_reuses_announcement_scan_and_canonical_observation(tmp_path):
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
     target = "600000.SH"
@@ -1287,3 +1520,9 @@ def test_stock_action_same_scope_reuses_announcement_scan_and_canonical_observat
     assert first.observation_ids == second.observation_ids
     assert provider.scan_calls == 1
     assert provider.observe_calls == [(target,)]
+    first_report = json.loads(first.report.read_text(encoding="utf-8"))
+    second_report = json.loads(second.report.read_text(encoding="utf-8"))
+    assert first_report["requested_instrument_ids"] == [target]
+    assert first_report["reused_detail_instrument_ids"] == []
+    assert second_report["requested_instrument_ids"] == []
+    assert second_report["reused_detail_instrument_ids"] == [target]
