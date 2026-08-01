@@ -526,6 +526,10 @@ class SimulationEvidenceCollector:
                 manifest.provider != "cninfo-public"
                 or manifest.request.capability is not ProviderCapability.CORPORATE_ACTIONS
                 or manifest.request.end_date != scope.history_end
+                or manifest.request.parameters.get("collection_mode")
+                != "announcement-targeted-v2"
+                or manifest.request.parameters.get("validation_start_date")
+                != scope.history_start.isoformat()
             ):
                 return
             hashes = manifest.source_metadata.get("response_sha256")
@@ -575,7 +579,19 @@ class SimulationEvidenceCollector:
                         "max_workers": min(4, len(batch)),
                         "retries": 2,
                         "retry_backoff_seconds": 0.5,
-                        "collection_mode": "announcement-targeted-v1",
+                        "collection_mode": "announcement-targeted-v2",
+                        "validation_start_date": scope.history_start.isoformat(),
+                        "announcement_dates_by_instrument": {
+                            instrument_id: tuple(sorted({
+                                str(item.get("announcement_time", ""))[:10]
+                                for item in pending.get(instrument_id, {}).get(
+                                    "announcements", ()
+                                )
+                                if isinstance(item, Mapping)
+                                and len(str(item.get("announcement_time", ""))) >= 10
+                            }))
+                            for instrument_id in batch
+                        },
                     },
                 )
                 try:
@@ -654,6 +670,7 @@ class SimulationEvidenceCollector:
             predecessor_actions=predecessor_actions,
             current_actions=detailed_actions,
             instrument_ids=tuple(sorted(selected_ids)),
+            history_start=predecessor_scope.history_start,
             history_end=predecessor_scope.history_end,
         )
 
@@ -789,7 +806,8 @@ class SimulationEvidenceCollector:
                 if item in invalid_details
             }
             errors = ";".join(
-                f"{item}:{request_errors[item]}" for item in sorted(unresolved)
+                f"{item}:{request_errors.get(item, 'InvalidLifecycle:see invalid details')}"
+                for item in sorted(unresolved)
             )
             blockers.append(
                 "SnapshotNotReadyError:stock-actions evidence remains unresolved: "
@@ -2974,6 +2992,7 @@ def _historical_action_corrections(
     predecessor_actions: pd.DataFrame,
     current_actions: pd.DataFrame,
     instrument_ids: tuple[str, ...],
+    history_start: date,
     history_end: date,
 ) -> Mapping[str, Any]:
     """Return exact historical business-field differences without mutating history."""
@@ -2986,13 +3005,14 @@ def _historical_action_corrections(
     def rows(frame: pd.DataFrame, instrument_id: str) -> dict[str, Mapping[str, Any]]:
         selected = frame.loc[
             frame["instrument_id"].astype(str).eq(instrument_id)
+            & frame["ex_date"].astype(str).ge(history_start.isoformat())
             & frame["ex_date"].astype(str).le(history_end.isoformat())
         ]
         result: dict[str, Mapping[str, Any]] = {}
         for item in selected.to_dict("records"):
             key = f"{item['action_type']}|{str(item['ex_date'])[:10]}"
             values = {
-                field: _action_comparison_value(item.get(field)) for field in fields
+                field: _source_native_action_value(item, field) for field in fields
             }
             if key in result and result[key] != values:
                 raise SnapshotNotReadyError(
@@ -3020,6 +3040,32 @@ def _historical_action_corrections(
                 "changed": changed,
             }
     return dict(sorted(differences.items()))
+
+
+def _source_native_action_value(item: Mapping[str, Any], field: str) -> Any:
+    if field not in {"listing_date", "quantity_multiplier"}:
+        return _action_comparison_value(item.get(field))
+    payload: Any = item.get("source_payload")
+    for _ in range(2):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                break
+        if not isinstance(payload, Mapping):
+            break
+        if isinstance(payload.get("raw"), Mapping):
+            raw = payload["raw"]
+            if field == "listing_date":
+                key = (
+                    "配股上市日"
+                    if str(item.get("action_type")) == "rights_issue"
+                    else "股份到账日"
+                )
+                return _action_comparison_value(raw.get(key))
+            return _action_comparison_value(raw.get("quantity_multiplier"))
+        payload = payload.get("upstream_action_payload")
+    return _action_comparison_value(item.get(field))
 
 
 def _action_comparison_value(value: Any) -> Any:

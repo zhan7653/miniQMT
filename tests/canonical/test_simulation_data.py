@@ -1042,12 +1042,13 @@ class _AnnouncementTargetedCninfoProvider:
 
     def __init__(
         self, observed_at, scan, actions_by_instrument,
-        known_pending_by_instrument=None,
+        known_pending_by_instrument=None, invalid_by_instrument=None,
     ):
         self.observed_at = observed_at
         self.scan = scan
         self.actions_by_instrument = actions_by_instrument
         self.known_pending_by_instrument = known_pending_by_instrument or {}
+        self.invalid_by_instrument = invalid_by_instrument or {}
         self.scan_calls = 0
         self.observe_calls: list[tuple[str, ...]] = []
 
@@ -1088,7 +1089,11 @@ class _AnnouncementTargetedCninfoProvider:
                     for instrument_id in request.instrument_ids
                 },
                 "request_errors": {},
-                "invalid_lifecycle": {},
+                "invalid_lifecycle": {
+                    instrument_id: self.invalid_by_instrument[instrument_id]
+                    for instrument_id in request.instrument_ids
+                    if instrument_id in self.invalid_by_instrument
+                },
                 "known_pending_after_cutoff": {
                     instrument_id: self.known_pending_by_instrument[instrument_id]
                     for instrument_id in request.instrument_ids
@@ -1232,6 +1237,32 @@ def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending
     assert any("PendingAnnouncement:structured lifecycle not available for notice-pending" in item
                for item in result.blockers)
     assert result.observation_ids
+
+
+def test_stock_action_invalid_lifecycle_is_reported_without_masking_key_error(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-invalid", target, "2026-07-15T08:00:00Z",
+            "category_qyfpxzcs_szsh", "Dividend notice", "/notice.pdf",
+        )),
+        {target: ()},
+        invalid_by_instrument={target: ("dividend_dates:0",)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    blocker = next(item for item in result.blockers if "evidence remains unresolved" in item)
+    assert 'invalid={"600000.SH":["dividend_dates:0"]}' in blocker
+    assert "600000.SH:InvalidLifecycle:see invalid details" in blocker
 
 
 def test_stock_action_relevant_correction_with_empty_detail_stays_pending(tmp_path):

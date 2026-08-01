@@ -884,7 +884,10 @@ def _dividend_actions(
         if ex_date is None or not _in_scope(ex_date, request):
             continue
         if known is None or record is None or known > record or record > ex_date:
-            issues.append(f"dividend_dates:{index}")
+            if _lifecycle_issue_relevant(
+                instrument_id, known_date=known, ex_date=ex_date, request=request,
+            ):
+                issues.append(f"dividend_dates:{index}")
             continue
         cash = _per_share(item.get("派息比例"))
         shares = sum(filter(None, (
@@ -907,7 +910,10 @@ def _dividend_actions(
         if cash is not None and cash > 0:
             pay = _date_text(item.get("派息日"))
             if pay is not None and pay < ex_date:
-                issues.append(f"cash_pay_date:{index}")
+                if _lifecycle_issue_relevant(
+                    instrument_id, known_date=known, ex_date=ex_date, request=request,
+                ):
+                    issues.append(f"cash_pay_date:{index}")
             else:
                 rows.append({
                     **base,
@@ -964,7 +970,10 @@ def _rights_actions(
             or (listing is not None and listing < ex_date)
             or ratio is None or ratio <= 0 or price is None or price <= 0
         ):
-            issues.append(f"rights_lifecycle:{index}")
+            if _lifecycle_issue_relevant(
+                instrument_id, known_date=known, ex_date=ex_date, request=request,
+            ):
+                issues.append(f"rights_lifecycle:{index}")
             continue
         rows.append({
             "action_id": _action_id(instrument_id, "rights", ex_date),
@@ -991,6 +1000,26 @@ def _rights_actions(
 
 def _in_scope(value: str, request: ProviderRequest) -> bool:
     return request.start_date.isoformat() <= value <= request.end_date.isoformat()
+
+
+def _lifecycle_issue_relevant(
+    instrument_id: str,
+    *,
+    known_date: str | None,
+    ex_date: str | None,
+    request: ProviderRequest,
+) -> bool:
+    validation_start = request.parameters.get("validation_start_date")
+    if not isinstance(validation_start, str):
+        return True
+    if ex_date is not None and ex_date >= validation_start:
+        return True
+    dates_by_instrument = request.parameters.get("announcement_dates_by_instrument", {})
+    dates = (
+        dates_by_instrument.get(instrument_id, ())
+        if isinstance(dates_by_instrument, Mapping) else ()
+    )
+    return known_date is not None and known_date in set(map(str, dates))
 
 
 def _action_id(instrument_id: str, kind: str, ex_date: str) -> str:

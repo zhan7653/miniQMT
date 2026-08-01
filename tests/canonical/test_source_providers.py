@@ -1005,6 +1005,36 @@ def test_cninfo_actions_reports_known_valid_lifecycles_after_cutoff():
     assert all(len(item["response_hash"]) == 64 for item in pending)
 
 
+def test_cninfo_targeted_actions_ignore_unrelated_pre_window_lifecycle_defects():
+    class Client:
+        def stock_dividend_cninfo(self, *, symbol):
+            return pd.DataFrame()
+
+        def stock_allotment_cninfo(self, **kwargs):
+            return pd.DataFrame([{
+                "公告日期": "2005-01-01", "股权登记日": "2005-01-10",
+                "除权基准日": "2005-01-11", "配股缴款截止日": "2005-01-20",
+                "配股上市日": "2005-01-21", "配股比例": 3, "配股价格": 8,
+            }])
+
+    observed = CninfoCorporateActionProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.CORPORATE_ACTIONS,
+        date(2000, 1, 1), END, ("600000.SH",),
+        {
+            "max_workers": 1,
+            "retries": 1,
+            "collection_mode": "announcement-targeted-v2",
+            "validation_start_date": START.isoformat(),
+            "announcement_dates_by_instrument": {
+                "600000.SH": (START.isoformat(),),
+            },
+        },
+    ))
+
+    assert observed.source_metadata["invalid_lifecycle"] == {}
+    assert observed.coverage[0].complete is True
+
+
 def test_xtquant_batch_download_normalizes_lots_and_local_dates():
     class XtClient:
         def __init__(self):
