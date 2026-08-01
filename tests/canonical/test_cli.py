@@ -62,6 +62,14 @@ def test_cli_exposes_only_the_componentized_simulation_publication_flow():
     assert extend.data_command == "extend-simulation"
     assert extend.publish is True
 
+    evidence = parser.parse_args([
+        "data", "collect-evidence",
+        "--source-snapshot-id", "research",
+        "--predecessor-snapshot-id", "predecessor",
+        "--kind", "stock-actions",
+    ])
+    assert evidence.predecessor_snapshot_id == "predecessor"
+
 
 def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
     settings = load_foundation_settings(

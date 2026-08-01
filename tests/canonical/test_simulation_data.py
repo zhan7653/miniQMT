@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import json
 
 import pandas as pd
 import pytest
@@ -17,6 +18,7 @@ from fundlab.marketdata import (
     ProviderRequest,
     ReadinessProfile,
     SIMULATION_STATUS_CANONICAL_PROVIDER,
+    STOCK_ACTION_CANONICAL_PROVIDER,
     SimulationEvidenceCollector,
     SimulationStatusCollector,
     StatusCollectionSpec,
@@ -29,6 +31,10 @@ from fundlab.marketdata import (
     reconcile_simulation_status,
 )
 from fundlab.marketdata.simulation_data import _collapse_same_lifecycle_cash_components
+from fundlab.marketdata.sources.cninfo import (
+    CninfoAnnouncementRecord,
+    CninfoAnnouncementScan,
+)
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from tests.canonical.fixtures import DAYS, market_frames
 
@@ -868,3 +874,416 @@ def test_etf_action_collection_accumulates_successes_and_retries_only_failures(t
     assert incomplete.unresolved_instrument_ids == ("510050.SH",)
     partial_manifest = warehouse.load_observation(incomplete.observation_ids[0])
     assert partial_manifest.request.instrument_ids == ("159919.SZ",)
+
+
+def _stock_action_increment_fixture(
+    tmp_path,
+    *,
+    instrument_ids: tuple[str, ...] = ("600000.SH", "600001.SH"),
+    predecessor_actions: pd.DataFrame | None = None,
+):
+    """Create contiguous research snapshots for the announcement-index path."""
+
+    frames = market_frames()
+    observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    instrument_rows = []
+    bar_rows = []
+    raw = frames[MarketTable.DAILY_BARS].loc[
+        frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+    ]
+    for index, instrument_id in enumerate(instrument_ids):
+        item = frames[MarketTable.INSTRUMENTS].iloc[0].copy()
+        item["instrument_id"] = instrument_id
+        item["local_code"] = instrument_id.split(".")[0]
+        item["name"] = f"Fixture Stock {index}"
+        instrument_rows.append(item)
+        bars = raw.copy()
+        bars["instrument_id"] = instrument_id
+        bar_rows.append(bars)
+    instruments = pd.DataFrame(instrument_rows).reset_index(drop=True)
+    bars = pd.concat(bar_rows, ignore_index=True)
+    actions = predecessor_actions if predecessor_actions is not None else pd.DataFrame(
+        columns=(
+            "action_id", "instrument_id", "action_type", "known_date",
+            "record_date", "ex_date", "pay_date", "listing_date",
+            "cash_per_share", "share_ratio", "rights_price",
+            "quantity_multiplier", "source_payload",
+        )
+    )
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    source = warehouse.record_observation(ObservationPayload(
+        "canonical-stock-action-fixture",
+        observed_at,
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            DAYS[0], DAYS[-1], instrument_ids,
+        ),
+        {
+            MarketTable.INSTRUMENTS: instruments,
+            MarketTable.DAILY_BARS: bars,
+            MarketTable.CORPORATE_ACTIONS: actions,
+        },
+        (
+            CoverageClaim(MarketTable.INSTRUMENTS, True, instrument_ids=instrument_ids),
+            CoverageClaim(
+                MarketTable.DAILY_BARS, True, DAYS[0], DAYS[-1], instrument_ids,
+            ),
+            CoverageClaim(
+                MarketTable.CORPORATE_ACTIONS, True, DAYS[0], DAYS[-1], instrument_ids,
+            ),
+        ),
+        {"kind": "field_level_reconciliation", "reconciliation_ready": True},
+    ))
+    predecessor_scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[1], DAYS[0], DAYS[1], survivorship_bias=True,
+        instrument_ids=instrument_ids,
+    )
+    predecessor = warehouse.build_snapshot(SnapshotPlan(
+        (
+            SourceSlice(source.observation_id, MarketTable.INSTRUMENTS, "fixture"),
+            SourceSlice(
+                source.observation_id, MarketTable.DAILY_BARS, "fixture",
+                start_date=DAYS[0], end_date=DAYS[1],
+            ),
+            SourceSlice(
+                source.observation_id, MarketTable.CORPORATE_ACTIONS, "fixture",
+                start_date=DAYS[0], end_date=DAYS[1],
+            ),
+        ),
+        "stock-action predecessor fixture",
+        readiness=ReadinessProfile.RESEARCH_PRICE,
+        universe_scope=predecessor_scope,
+    ))
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        DAYS[-1], DAYS[2], DAYS[-1], survivorship_bias=True,
+        instrument_ids=instrument_ids,
+    )
+    current = warehouse.build_snapshot(SnapshotPlan(
+        (
+            SourceSlice(source.observation_id, MarketTable.INSTRUMENTS, "fixture"),
+            SourceSlice(
+                source.observation_id, MarketTable.DAILY_BARS, "fixture",
+                start_date=DAYS[2], end_date=DAYS[-1],
+            ),
+        ),
+        "stock-action increment fixture",
+        readiness=ReadinessProfile.RESEARCH_PRICE,
+        universe_scope=scope,
+    ))
+    return warehouse, predecessor, current, instruments, observed_at
+
+
+def _stock_action_row(
+    instrument_id: str,
+    *,
+    ex_date: date = DAYS[-1],
+    cash_per_share: float = 0.1,
+) -> dict[str, object]:
+    return {
+        "action_id": f"action-{instrument_id}-{ex_date.isoformat()}",
+        "instrument_id": instrument_id,
+        "action_type": "cash_dividend",
+        "known_date": DAYS[2].isoformat(),
+        "record_date": (ex_date if ex_date <= DAYS[2] else DAYS[2]).isoformat(),
+        "ex_date": ex_date.isoformat(),
+        "pay_date": ex_date.isoformat(),
+        "listing_date": None,
+        "cash_per_share": cash_per_share,
+        "share_ratio": None,
+        "rights_price": None,
+        "quantity_multiplier": None,
+        "source_payload": f"payload-{instrument_id}-{cash_per_share}",
+    }
+
+
+def _announcement_scan(*records: CninfoAnnouncementRecord) -> CninfoAnnouncementScan:
+    return CninfoAnnouncementScan(
+        policy_version="fixture-v1",
+        start_date=DAYS[1].isoformat(),
+        end_date=DAYS[-1].isoformat(),
+        categories=(
+            "category_qyfpxzcs_szsh",
+            "category_pg_szsh",
+            "category_bcgz_szsh",
+        ),
+        page_evidence=(),
+        records=records,
+        affected_instrument_ids=tuple(sorted({item.instrument_id for item in records})),
+        complete=True,
+    )
+
+
+class _AnnouncementTargetedCninfoProvider:
+    name = "cninfo-public"
+    capabilities = frozenset({ProviderCapability.CORPORATE_ACTIONS})
+
+    def __init__(self, observed_at, scan, actions_by_instrument):
+        self.observed_at = observed_at
+        self.scan = scan
+        self.actions_by_instrument = actions_by_instrument
+        self.scan_calls = 0
+        self.observe_calls: list[tuple[str, ...]] = []
+
+    def scan_announcements(self, start_date, end_date):
+        self.scan_calls += 1
+        assert start_date.isoformat() == self.scan.start_date
+        assert end_date.isoformat() == self.scan.end_date
+        return self.scan
+
+    def observe(self, request):
+        self.observe_calls.append(request.instrument_ids)
+        rows = [
+            row
+            for instrument_id in request.instrument_ids
+            for row in self.actions_by_instrument.get(instrument_id, ())
+        ]
+        columns = (
+            "action_id", "instrument_id", "action_type", "known_date",
+            "record_date", "ex_date", "pay_date", "listing_date",
+            "cash_per_share", "share_ratio", "rights_price",
+            "quantity_multiplier", "source_payload",
+        )
+        return ObservationPayload(
+            self.name,
+            self.observed_at,
+            request,
+            {MarketTable.CORPORATE_ACTIONS: pd.DataFrame(rows, columns=columns)},
+            (CoverageClaim(
+                MarketTable.CORPORATE_ACTIONS,
+                True,
+                request.start_date,
+                request.end_date,
+                request.instrument_ids,
+            ),),
+            {
+                "response_sha256": {
+                    instrument_id: f"hash-{instrument_id}"
+                    for instrument_id in request.instrument_ids
+                },
+                "request_errors": {},
+                "invalid_lifecycle": {},
+                "known_pending_after_cutoff": {},
+            },
+        )
+
+
+def _stock_action_collector(warehouse, tmp_path, provider):
+    from fundlab.marketdata import ProviderRegistry
+
+    registry = ProviderRegistry()
+    registry.register(provider)
+    return SimulationEvidenceCollector(warehouse, tmp_path / "reports", registry=registry)
+
+
+def test_stock_action_empty_announcement_scan_covers_all_stocks_without_detail_calls(tmp_path):
+    warehouse, predecessor, current, instruments, observed_at = _stock_action_increment_fixture(
+        tmp_path,
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at, _announcement_scan(), {},
+    )
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert provider.scan_calls == 1
+    assert provider.observe_calls == []
+    manifest = warehouse.load_observation(result.observation_ids[0])
+    assert manifest.provider == STOCK_ACTION_CANONICAL_PROVIDER
+    assert manifest.request.instrument_ids == tuple(instruments["instrument_id"])
+
+
+def test_stock_action_scan_targets_only_affected_stocks_and_keeps_current_actions(tmp_path):
+    instrument_ids = ("600000.SH", "600001.SH", "600002.SH")
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, instrument_ids=instrument_ids,
+    )
+    targets = instrument_ids[:2]
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(*(
+            CninfoAnnouncementRecord(
+                f"notice-{instrument_id}", instrument_id, "2026-07-15T08:00:00+08:00",
+                "category_qyfpxzcs_szsh", "Dividend notice", "/notice.pdf",
+            )
+            for instrument_id in targets
+        )),
+        {instrument_id: (_stock_action_row(instrument_id),) for instrument_id in targets},
+    )
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert provider.observe_calls == [targets]
+    canonical = warehouse.read_observation_table(
+        result.observation_ids[0], MarketTable.CORPORATE_ACTIONS,
+    )
+    assert set(canonical["instrument_id"]) == set(targets)
+    assert set(canonical["ex_date"].astype(str)) == {DAYS[-1].isoformat()}
+
+
+def test_stock_action_actionable_announcement_with_empty_detail_is_exact_pending(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-pending", target, "2026-07-15T08:00:00+08:00",
+            "category_qyfpxzcs_szsh", "Dividend notice", "/notice.pdf",
+        )),
+        {target: ()},
+    )
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    assert result.unresolved_instrument_ids == (target,)
+    assert any("PendingAnnouncement:structured lifecycle not available for notice-pending" in item
+               for item in result.blockers)
+    assert result.observation_ids
+
+
+def test_stock_action_persisted_pending_is_targeted_without_a_new_announcement(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    pending_path = (
+        warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
+    )
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(json.dumps({
+        "schema_version": 1,
+        "instruments": {
+            target: {
+                "first_seen_date": DAYS[2].isoformat(),
+                "last_attempt_date": DAYS[2].isoformat(),
+                "state": "awaiting_structured_detail",
+                "announcements": ({
+                    "announcement_id": "notice-from-prior-run",
+                    "instrument_id": target,
+                    "announcement_time": "2026-07-14T08:00:00Z",
+                    "category": "category_qyfpxzcs_szsh",
+                    "title": "Dividend notice",
+                    "document_url": "/notice.pdf",
+                },),
+            },
+        },
+    }), encoding="utf-8")
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at, _announcement_scan(),
+        {target: (_stock_action_row(target),)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert provider.observe_calls == [(target,)]
+    assert json.loads(pending_path.read_text(encoding="utf-8"))["instruments"] == {}
+
+
+def test_stock_action_historical_difference_blocks_without_canonical_observation(tmp_path):
+    target = "600000.SH"
+    predecessor_actions = pd.DataFrame([
+        _stock_action_row(target, ex_date=DAYS[1], cash_per_share=0.1),
+    ])
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path, predecessor_actions=predecessor_actions,
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-correction", target, "2026-07-15T08:00:00+08:00",
+            "category_qyfpxzcs_szsh", "Correction notice", "/correction.pdf",
+        )),
+        {target: (_stock_action_row(target, ex_date=DAYS[1], cash_per_share=0.2),)},
+    )
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "incomplete"
+    assert result.observation_ids == ()
+    assert any(item.startswith("HistoricalActionCorrectionError:") for item in result.blockers)
+    assert warehouse.observations(provider=STOCK_ACTION_CANONICAL_PROVIDER) == ()
+
+
+def test_stock_action_historical_ex_date_move_reports_removed_and_added_keys(tmp_path):
+    target = "600000.SH"
+    old_ex_date = DAYS[0]
+    corrected_ex_date = DAYS[1]
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
+        tmp_path,
+        predecessor_actions=pd.DataFrame([
+            _stock_action_row(target, ex_date=old_ex_date),
+        ]),
+    )
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-ex-date-correction", target, "2026-07-15T08:00:00+08:00",
+            "category_bcgz_szsh", "Correction notice", "/correction.pdf",
+        )),
+        {target: (_stock_action_row(target, ex_date=corrected_ex_date),)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    correction = next(
+        item for item in result.blockers
+        if item.startswith("HistoricalActionCorrectionError:")
+    )
+    assert f"cash_dividend|{old_ex_date.isoformat()}" in correction
+    assert f"cash_dividend|{corrected_ex_date.isoformat()}" in correction
+    assert result.observation_ids == ()
+
+
+def test_stock_action_same_scope_reuses_announcement_scan_and_canonical_observation(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-reuse", target, "2026-07-15T08:00:00+08:00",
+            "category_qyfpxzcs_szsh", "Dividend notice", "/notice.pdf",
+        )),
+        {target: (_stock_action_row(target),)},
+    )
+    collector = _stock_action_collector(warehouse, tmp_path, provider)
+    spec = EvidenceCollectionSpec(
+        current.snapshot_id, "stock-actions",
+        predecessor_snapshot_id=predecessor.snapshot_id,
+    )
+
+    first = collector.collect(spec)
+    second = collector.collect(spec)
+
+    assert first.status == second.status == "complete"
+    assert first.observation_ids == second.observation_ids
+    assert provider.scan_calls == 1
+    assert provider.observe_calls == [(target,)]

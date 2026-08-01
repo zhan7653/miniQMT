@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 import json
 import os
@@ -106,12 +106,17 @@ class EvidenceCollectionSpec:
     kind: str
     batch_size: int = 100
     refresh: bool = False
+    predecessor_snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"stock-actions", "etf-actions", "factors"}:
             raise ValueError("Evidence kind must be stock-actions, etf-actions, or factors")
         if self.batch_size < 1 or self.batch_size > 100:
             raise ValueError("Evidence batch_size must be between 1 and 100")
+        if self.kind == "stock-actions" and not self.predecessor_snapshot_id:
+            raise ValueError(
+                "Incremental stock action evidence requires a predecessor snapshot"
+            )
 
 
 @dataclass(frozen=True)
@@ -182,6 +187,13 @@ class SimulationEvidenceCollector:
         ).sort_values("instrument_id", kind="stable").reset_index(drop=True)
         if set(map(str, instruments["instrument_id"])) != set(scope.instrument_ids):
             raise ValueError("Evidence source snapshot does not match its pinned universe")
+        if spec.kind == "stock-actions":
+            return self._collect_incremental_stock_actions(
+                spec=spec,
+                snapshot=snapshot,
+                scope=scope,
+                instruments=instruments,
+            )
 
         provider, capability, table, asset_type = {
             "stock-actions": (
@@ -371,6 +383,460 @@ class SimulationEvidenceCollector:
             tuple(sorted(set(observation_ids))),
             tuple(sorted(set(blockers))),
             tuple(sorted(missing)),
+            checkpoint,
+            report,
+        )
+
+    def _collect_incremental_stock_actions(
+        self,
+        *,
+        spec: EvidenceCollectionSpec,
+        snapshot: SnapshotManifest,
+        scope: UniverseScope,
+        instruments: pd.DataFrame,
+    ) -> EvidenceCollectionResult:
+        """Use the disclosure index as the daily completeness boundary.
+
+        The predecessor already owns every historical action.  A complete CNInfo
+        announcement-index scan proves which stocks can have new evidence in this
+        increment; only those stocks (plus durable pending disclosures) need the
+        expensive per-symbol lifecycle endpoints.
+        """
+
+        if spec.predecessor_snapshot_id is None:
+            raise ValueError("Stock action collection requires predecessor_snapshot_id")
+        predecessor = self.warehouse.load_snapshot(spec.predecessor_snapshot_id)
+        predecessor_scope = predecessor.plan.universe_scope
+        if predecessor_scope is None:
+            raise SnapshotNotReadyError("Predecessor snapshot has no universe scope")
+        if scope.history_start != predecessor_scope.history_end + timedelta(days=1):
+            raise SnapshotNotReadyError(
+                "Stock action increment is not contiguous with its predecessor"
+            )
+
+        stocks = instruments.loc[
+            instruments["asset_type"].astype(str).eq("stock")
+        ].sort_values("instrument_id", kind="stable").reset_index(drop=True)
+        stock_ids = tuple(map(str, stocks["instrument_id"]))
+        stock_set = set(stock_ids)
+        indexed = stocks.set_index("instrument_id", drop=False)
+
+        index_root = self.warehouse.root / "indexes" / "cninfo-stock-actions"
+        scan_start = scope.history_start - timedelta(days=1)
+        scan_identity = {
+            "policy": "cninfo-stock-action-announcement-index-v1",
+            "start_date": scan_start,
+            "end_date": scope.history_end,
+        }
+        scan_key = stable_digest(scan_identity)[:24]
+        scan_path = index_root / "scans" / f"scan-{scan_key}.json"
+        if scan_path.exists() and not spec.refresh:
+            scan_payload = _read_json_if_present(scan_path)
+            _require_complete_announcement_scan(
+                scan_payload, start_date=scan_start, end_date=scope.history_end,
+            )
+        else:
+            provider = self.registry.provider("cninfo-public")
+            scanner = getattr(provider, "scan_announcements", None)
+            if not callable(scanner):
+                raise SnapshotNotReadyError(
+                    "CNInfo provider does not expose the required announcement index"
+                )
+            scan = scanner(scan_start, scope.history_end)
+            scan_payload = to_primitive(scan)
+            if not isinstance(scan_payload, Mapping):
+                raise SnapshotNotReadyError("CNInfo announcement scan is not an object")
+            _require_complete_announcement_scan(
+                scan_payload, start_date=scan_start, end_date=scope.history_end,
+            )
+            _write_immutable_json(scan_path, scan_payload)
+
+        scan_id = "scan-" + stable_digest(scan_payload)[:24]
+        records = tuple(
+            item for item in scan_payload.get("records", ())
+            if isinstance(item, Mapping)
+            and str(item.get("instrument_id", "")) in stock_set
+        )
+        affected_ids = tuple(sorted({str(item["instrument_id"]) for item in records}))
+        by_instrument: dict[str, list[Mapping[str, Any]]] = {}
+        for item in records:
+            by_instrument.setdefault(str(item["instrument_id"]), []).append(item)
+
+        pending_path = index_root / "pending.json"
+        pending_payload = _read_json_if_present(pending_path)
+        pending: dict[str, Any] = {
+            str(key): value
+            for key, value in pending_payload.get("instruments", {}).items()
+        } if isinstance(pending_payload.get("instruments", {}), Mapping) else {}
+        actionable_categories = {
+            "category_qyfpxzcs_szsh",
+            "category_pg_szsh",
+        }
+        for instrument_id, items in by_instrument.items():
+            actionable = tuple(
+                item for item in items
+                if str(item.get("category", "")) in actionable_categories
+            )
+            if not actionable:
+                continue
+            existing = pending.get(instrument_id, {})
+            old_records = existing.get("announcements", ()) if isinstance(existing, Mapping) else ()
+            merged = {
+                str(item["announcement_id"]): dict(item)
+                for item in (*old_records, *actionable)
+                if isinstance(item, Mapping) and item.get("announcement_id")
+            }
+            pending[instrument_id] = {
+                "first_seen_date": (
+                    str(existing.get("first_seen_date"))
+                    if isinstance(existing, Mapping) and existing.get("first_seen_date")
+                    else scope.history_end.isoformat()
+                ),
+                "last_attempt_date": scope.history_end.isoformat(),
+                "state": "awaiting_structured_detail",
+                "announcements": tuple(
+                    merged[key] for key in sorted(merged)
+                ),
+            }
+
+        target_ids = tuple(sorted(
+            (set(affected_ids) | set(pending)) & stock_set
+        ))
+        raw_observations = list(self.warehouse.observations(provider="cninfo-public"))
+        selected: dict[str, ObservationManifest] = {}
+        request_errors: dict[str, str] = {}
+        invalid_details: dict[str, Any] = {}
+
+        def absorb(manifest: ObservationManifest) -> None:
+            if (
+                manifest.provider != "cninfo-public"
+                or manifest.request.capability is not ProviderCapability.CORPORATE_ACTIONS
+                or manifest.request.end_date != scope.history_end
+            ):
+                return
+            hashes = manifest.source_metadata.get("response_sha256")
+            errors = manifest.source_metadata.get("request_errors")
+            invalid = manifest.source_metadata.get("invalid_lifecycle")
+            if not isinstance(hashes, Mapping):
+                return
+            error_ids = set(errors) if isinstance(errors, Mapping) else set()
+            invalid_ids = set(invalid) if isinstance(invalid, Mapping) else set()
+            for instrument_id in manifest.request.instrument_ids:
+                if instrument_id not in target_ids:
+                    continue
+                listed = _instrument_listed_date(indexed, instrument_id)
+                if manifest.request.start_date is None or manifest.request.start_date > listed:
+                    continue
+                if instrument_id in invalid_ids:
+                    invalid_details[instrument_id] = invalid[instrument_id]
+                    continue
+                if instrument_id in error_ids:
+                    request_errors[instrument_id] = str(errors[instrument_id])
+                    continue
+                if instrument_id in hashes:
+                    current = selected.get(instrument_id)
+                    if current is None or manifest.observed_at > current.observed_at:
+                        selected[instrument_id] = manifest
+
+        if not spec.refresh:
+            for manifest in raw_observations:
+                absorb(manifest)
+
+        recovery_errors: dict[str, str] = {}
+        for _round in range(2):
+            unresolved = tuple(sorted(set(target_ids) - set(selected)))
+            if not unresolved:
+                break
+            for batch in _chunks(unresolved, 10):
+                start = min(_instrument_listed_date(indexed, item) for item in batch)
+                request = ProviderRequest(
+                    ProviderCapability.CORPORATE_ACTIONS,
+                    start,
+                    scope.history_end,
+                    batch,
+                    {
+                        "max_workers": min(4, len(batch)),
+                        "retries": 2,
+                        "retry_backoff_seconds": 0.5,
+                        "collection_mode": "announcement-targeted-v1",
+                    },
+                )
+                try:
+                    manifest = self.warehouse.record_observation(
+                        self.registry.observe("cninfo-public", request)
+                    )
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}:{str(exc)[:240]}"
+                    for instrument_id in batch:
+                        recovery_errors[instrument_id] = detail
+                    continue
+                raw_observations.append(manifest)
+                absorb(manifest)
+
+        selected_ids = set(selected)
+        detail_pieces: list[pd.DataFrame] = []
+        input_ids = tuple(sorted({item.observation_id for item in selected.values()}))
+        per_instrument_evidence: dict[str, Any] = {}
+        known_pending: dict[str, Any] = {}
+        for observation_id in input_ids:
+            frame = self.warehouse.read_observation_table(
+                observation_id, MarketTable.CORPORATE_ACTIONS,
+            )
+            owned = {
+                instrument_id for instrument_id, manifest in selected.items()
+                if manifest.observation_id == observation_id
+            }
+            frame = frame.loc[frame["instrument_id"].astype(str).isin(owned)].copy()
+            frame["source_observation_id"] = observation_id
+            detail_pieces.append(frame)
+            manifest = self.warehouse.load_observation(observation_id)
+            hashes = manifest.source_metadata.get("response_sha256", {})
+            future = manifest.source_metadata.get("known_pending_after_cutoff", {})
+            for instrument_id in owned:
+                per_instrument_evidence[instrument_id] = {
+                    "observation_id": observation_id,
+                    "response_sha256": hashes.get(instrument_id),
+                }
+                if isinstance(future, Mapping) and instrument_id in future:
+                    known_pending[instrument_id] = future[instrument_id]
+
+        detailed_actions = (
+            pd.concat(detail_pieces, ignore_index=True).reset_index(drop=True)
+            if detail_pieces else empty_table(
+                MarketTable.CORPORATE_ACTIONS, include_lineage=True,
+            )
+        )
+        detailed_actions, _ = _collapse_same_lifecycle_cash_components(
+            detailed_actions,
+        )
+        predecessor_actions = (
+            self.warehouse.query_loaded_snapshot_table(
+                predecessor,
+                MarketTable.CORPORATE_ACTIONS,
+                instrument_ids=tuple(sorted(selected_ids)),
+                start_date=predecessor_scope.history_start,
+                end_date=predecessor_scope.history_end,
+            )
+            if selected_ids else empty_table(
+                MarketTable.CORPORATE_ACTIONS, include_lineage=True,
+            )
+        )
+        historical_corrections = _historical_action_corrections(
+            predecessor_actions=predecessor_actions,
+            current_actions=detailed_actions,
+            instrument_ids=tuple(sorted(selected_ids)),
+            history_end=predecessor_scope.history_end,
+        )
+
+        current_actions = detailed_actions.loc[
+            detailed_actions["ex_date"].astype(str).between(
+                scope.history_start.isoformat(), scope.history_end.isoformat(),
+            )
+        ].copy().reset_index(drop=True)
+        current_ids = set(map(str, current_actions.get(
+            "instrument_id", pd.Series(dtype="string"),
+        )))
+        awaiting: set[str] = set()
+        for instrument_id in tuple(sorted(set(pending) & stock_set)):
+            if instrument_id not in selected_ids:
+                awaiting.add(instrument_id)
+                continue
+            if instrument_id in current_ids:
+                pending.pop(instrument_id, None)
+                continue
+            if instrument_id in known_pending:
+                item = pending.get(instrument_id, {})
+                if isinstance(item, Mapping):
+                    pending[instrument_id] = {
+                        **item,
+                        "last_attempt_date": scope.history_end.isoformat(),
+                        "state": "known_future_event",
+                        "known_pending_after_cutoff": known_pending[instrument_id],
+                    }
+                continue
+            awaiting.add(instrument_id)
+
+        unresolved = set(target_ids) - selected_ids
+        unresolved.update(awaiting)
+        for instrument_id in unresolved:
+            if instrument_id in invalid_details:
+                continue
+            if instrument_id in recovery_errors:
+                request_errors[instrument_id] = recovery_errors[instrument_id]
+            elif instrument_id in awaiting:
+                announcement_ids = tuple(
+                    str(item.get("announcement_id"))
+                    for item in pending.get(instrument_id, {}).get("announcements", ())
+                    if isinstance(item, Mapping)
+                ) if isinstance(pending.get(instrument_id), Mapping) else ()
+                request_errors[instrument_id] = (
+                    "PendingAnnouncement:structured lifecycle not available for "
+                    + ",".join(filter(None, announcement_ids))
+                )
+            else:
+                request_errors[instrument_id] = "ObservationError:Source request failed: no evidence"
+
+        _write_atomic_json(pending_path, {
+            "schema_version": 1,
+            "policy": "cninfo-stock-action-pending-v1",
+            "updated_for": scope.history_end,
+            "instruments": dict(sorted(pending.items())),
+        })
+        watermark_path = index_root / "watermark.json"
+        existing_watermark = _read_json_if_present(watermark_path)
+        existing_end = str(existing_watermark.get("last_successful_end_date", ""))
+        if not existing_end or existing_end <= scope.history_end.isoformat():
+            _write_atomic_json(watermark_path, {
+                "schema_version": 1,
+                "policy": "cninfo-stock-action-announcement-index-v1",
+                "last_successful_end_date": scope.history_end,
+                "scan_id": scan_id,
+                "scan_path": scan_path,
+            })
+
+        blockers: list[str] = []
+        if historical_corrections:
+            blockers.append(
+                "HistoricalActionCorrectionError:exact historical action differences detected: "
+                + canonical_json(historical_corrections)[:4000]
+            )
+        if unresolved:
+            invalid = {
+                item: invalid_details[item] for item in sorted(unresolved)
+                if item in invalid_details
+            }
+            errors = ";".join(
+                f"{item}:{request_errors[item]}" for item in sorted(unresolved)
+            )
+            blockers.append(
+                "SnapshotNotReadyError:stock-actions evidence remains unresolved: "
+                f"count={len(unresolved)} ids={','.join(sorted(unresolved))} "
+                f"invalid={canonical_json(invalid)} request_errors={errors}"
+            )
+            blockers.append(f"missing_stock-actions_instruments:{len(unresolved)}")
+
+        complete_ids = tuple(sorted(stock_set - unresolved))
+        observation_ids: tuple[str, ...] = ()
+        if complete_ids and not historical_corrections:
+            current_actions = current_actions.loc[
+                current_actions["instrument_id"].astype(str).isin(complete_ids)
+            ].reset_index(drop=True)
+            current_actions, component_aggregations = _collapse_same_lifecycle_cash_components(
+                current_actions,
+            )
+            canonical_request = ProviderRequest(
+                ProviderCapability.CANONICAL_RECONCILIATION,
+                scope.history_start,
+                scope.history_end,
+                complete_ids,
+                {
+                    "kind": "stock-actions-announcement-index-r3",
+                    "scan_id": scan_id,
+                    "predecessor_snapshot_id": predecessor.snapshot_id,
+                },
+            )
+            matches = self.warehouse.matching_observations(
+                provider=STOCK_ACTION_CANONICAL_PROVIDER,
+                request=canonical_request,
+            )
+            manifest = matches[-1] if matches else self.warehouse.record_observation(
+                ObservationPayload(
+                    STOCK_ACTION_CANONICAL_PROVIDER,
+                    max(
+                        (item.observed_at for item in selected.values()),
+                        default=snapshot.created_at,
+                    ),
+                    canonical_request,
+                    {MarketTable.CORPORATE_ACTIONS: current_actions},
+                    (CoverageClaim(
+                        MarketTable.CORPORATE_ACTIONS,
+                        True,
+                        scope.history_start,
+                        scope.history_end,
+                        complete_ids,
+                        "Complete announcement index plus targeted CNInfo lifecycle evidence",
+                    ),),
+                    {
+                        "kind": "field_level_reconciliation",
+                        "reconciliation_ready": True,
+                        "policy": "stock-actions-announcement-index-r3-v1",
+                        "source_snapshot_id": spec.source_snapshot_id,
+                        "predecessor_snapshot_id": predecessor.snapshot_id,
+                        "announcement_scan_id": scan_id,
+                        "announcement_scan_path": str(scan_path),
+                        "announcement_scan_hash": stable_digest(scan_payload),
+                        "affected_instrument_ids": affected_ids,
+                        "targeted_instrument_ids": target_ids,
+                        "input_observation_ids": input_ids,
+                        "per_instrument_evidence": per_instrument_evidence,
+                        "known_pending_after_cutoff": known_pending,
+                        "component_aggregation_policy": "same-lifecycle-cash-sum-r2-v1",
+                        "component_aggregations": component_aggregations,
+                        "instrument_count": len(complete_ids),
+                        "action_count": len(current_actions),
+                    },
+                )
+            )
+            observation_ids = (manifest.observation_id,)
+
+        build_id = "evidence-" + stable_digest({
+            "collector_version": 3,
+            "source_snapshot_id": spec.source_snapshot_id,
+            "predecessor_snapshot_id": predecessor.snapshot_id,
+            "kind": spec.kind,
+            "scan_id": scan_id,
+        })[:24]
+        checkpoint = self.warehouse.root / "builds" / build_id / "checkpoint.json"
+        _write_atomic_json(checkpoint, {
+            "schema_version": 3,
+            "build_id": build_id,
+            "spec": spec,
+            "universe_scope": scope,
+            "scan_id": scan_id,
+            "scan_path": scan_path,
+            "pending_path": pending_path,
+            "affected_instrument_ids": affected_ids,
+            "targeted_instrument_ids": target_ids,
+            "unresolved_instrument_ids": tuple(sorted(unresolved)),
+            "observation_ids": observation_ids,
+        })
+        status = "complete" if not blockers else "incomplete"
+        report_payload = {
+            "decision_source": "direct-user-decision-2026-08-01",
+            "kind": "simulation_stock-actions_incremental_collection",
+            "status": status,
+            "build_id": build_id,
+            "spec": spec,
+            "universe_scope": scope,
+            "scan_id": scan_id,
+            "scan_path": scan_path,
+            "scan_window": {"start": scan_start, "end": scope.history_end},
+            "announcement_count": len(records),
+            "affected_instrument_ids": affected_ids,
+            "targeted_instrument_ids": target_ids,
+            "pending_instrument_ids": tuple(sorted(set(pending) & stock_set)),
+            "requested_instrument_ids": stock_ids,
+            "completed_instrument_ids": complete_ids,
+            "unresolved_instrument_ids": tuple(sorted(unresolved)),
+            "historical_corrections": historical_corrections,
+            "observation_ids": observation_ids,
+            "blockers": tuple(blockers),
+            "checkpoint": checkpoint,
+        }
+        self.report_root.mkdir(parents=True, exist_ok=True)
+        report = self.report_root / (
+            f"evidence-collection-{build_id}-{stable_digest(report_payload)[:16]}.json"
+        )
+        _write_immutable_json(report, report_payload)
+        return EvidenceCollectionResult(
+            status,
+            build_id,
+            spec.kind,
+            len(stock_ids),
+            len(complete_ids),
+            observation_ids,
+            tuple(blockers),
+            tuple(sorted(unresolved)),
             checkpoint,
             report,
         )
@@ -2264,6 +2730,136 @@ def _json_for_unique_rows(
 def _optional_json_text(value: Any) -> str | None:
     text = str(value)
     return None if text == _JSON_MISSING else text
+
+
+def _require_complete_announcement_scan(
+    payload: Mapping[str, Any], *, start_date: date, end_date: date,
+) -> None:
+    required_categories = {
+        "category_qyfpxzcs_szsh",
+        "category_pg_szsh",
+        "category_bcgz_szsh",
+    }
+    if payload.get("complete") is not True:
+        raise SnapshotNotReadyError("CNInfo announcement scan is not complete")
+    if (
+        str(payload.get("start_date")) != start_date.isoformat()
+        or str(payload.get("end_date")) != end_date.isoformat()
+    ):
+        raise SnapshotNotReadyError("CNInfo announcement scan window mismatch")
+    categories = payload.get("categories")
+    if not isinstance(categories, (list, tuple)) or not required_categories <= set(map(str, categories)):
+        raise SnapshotNotReadyError("CNInfo announcement scan categories are incomplete")
+    if not isinstance(payload.get("page_evidence"), (list, tuple)):
+        raise SnapshotNotReadyError("CNInfo announcement scan has no page evidence")
+    records = payload.get("records")
+    affected = payload.get("affected_instrument_ids")
+    if not isinstance(records, (list, tuple)) or not isinstance(affected, (list, tuple)):
+        raise SnapshotNotReadyError("CNInfo announcement scan record structure is invalid")
+    record_ids: set[str] = set()
+    record_instruments: set[str] = set()
+    for item in records:
+        if not isinstance(item, Mapping):
+            raise SnapshotNotReadyError("CNInfo announcement scan record is not an object")
+        required = {
+            "announcement_id", "instrument_id", "announcement_time",
+            "category", "title", "document_url",
+        }
+        if not required <= set(item) or any(not str(item[key]).strip() for key in required):
+            raise SnapshotNotReadyError("CNInfo announcement scan record is incomplete")
+        announcement_id = str(item["announcement_id"])
+        if announcement_id in record_ids:
+            raise SnapshotNotReadyError("CNInfo announcement scan contains duplicate IDs")
+        record_ids.add(announcement_id)
+        record_instruments.add(str(item["instrument_id"]))
+    if record_instruments != set(map(str, affected)):
+        raise SnapshotNotReadyError("CNInfo announcement affected-instrument set mismatch")
+
+
+def _instrument_listed_date(instruments: pd.DataFrame, instrument_id: str) -> date:
+    value = instruments.loc[instrument_id, "listed_date"]
+    if pd.isna(value):
+        raise SnapshotNotReadyError(f"Instrument has no listed_date: {instrument_id}")
+    return date.fromisoformat(str(value)[:10])
+
+
+def _historical_action_corrections(
+    *,
+    predecessor_actions: pd.DataFrame,
+    current_actions: pd.DataFrame,
+    instrument_ids: tuple[str, ...],
+    history_end: date,
+) -> Mapping[str, Any]:
+    """Return exact historical business-field differences without mutating history."""
+
+    fields = (
+        "known_date", "record_date", "pay_date",
+        "cash_per_share", "share_ratio", "rights_price",
+    )
+
+    def rows(frame: pd.DataFrame, instrument_id: str) -> dict[str, Mapping[str, Any]]:
+        selected = frame.loc[
+            frame["instrument_id"].astype(str).eq(instrument_id)
+            & frame["ex_date"].astype(str).le(history_end.isoformat())
+        ]
+        result: dict[str, Mapping[str, Any]] = {}
+        for item in selected.to_dict("records"):
+            key = f"{item['action_type']}|{str(item['ex_date'])[:10]}"
+            values = {
+                field: _action_comparison_value(item.get(field)) for field in fields
+            }
+            if key in result and result[key] != values:
+                raise SnapshotNotReadyError(
+                    f"Historical action comparison has duplicate semantic key: "
+                    f"{instrument_id}/{key}"
+                )
+            result[key] = values
+        return result
+
+    differences: dict[str, Any] = {}
+    for instrument_id in instrument_ids:
+        before = rows(predecessor_actions, instrument_id)
+        after = rows(current_actions, instrument_id)
+        added = tuple(sorted(set(after) - set(before)))
+        removed = tuple(sorted(set(before) - set(after)))
+        changed = {
+            key: {"before": before[key], "after": after[key]}
+            for key in sorted(set(before) & set(after))
+            if before[key] != after[key]
+        }
+        if added or removed or changed:
+            differences[instrument_id] = {
+                "added_keys": added,
+                "removed_keys": removed,
+                "changed": changed,
+            }
+    return dict(sorted(differences.items()))
+
+
+def _action_comparison_value(value: Any) -> Any:
+    if value is None or value is pd.NA:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (date, pd.Timestamp)):
+        return str(value)[:10]
+    if isinstance(value, float):
+        return round(value, 12)
+    if hasattr(value, "item"):
+        return _action_comparison_value(value.item())
+    return str(value)[:10] if "-" in str(value) and len(str(value)) >= 10 else value
+
+
+def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
+    primitive = to_primitive(payload)
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != primitive:
+            raise ValueError(f"Immutable JSON collision: {path}")
+        return
+    _write_atomic_json(path, payload)
 
 
 def _read_json_if_present(path: Path) -> Mapping[str, Any]:

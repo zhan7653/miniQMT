@@ -104,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence.add_argument("--source-snapshot-id", required=True)
     evidence.add_argument(
+        "--predecessor-snapshot-id",
+        help="Required for incremental stock-actions collection",
+    )
+    evidence.add_argument(
         "--kind", choices=("stock-actions", "etf-actions", "factors"), required=True,
     )
     evidence.add_argument("--batch-size", type=int, default=100)
@@ -397,6 +401,7 @@ def _data(args, settings: FoundationSettings) -> int:
             kind=args.kind,
             batch_size=args.batch_size,
             refresh=args.refresh,
+            predecessor_snapshot_id=args.predecessor_snapshot_id,
         ))
         print(canonical_json({"status": result.status, **to_primitive(result)}))
         return 0 if result.status == "complete" else 2

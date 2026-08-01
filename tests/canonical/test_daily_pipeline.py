@@ -28,6 +28,7 @@ from fundlab.marketdata import (
 )
 from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
 from fundlab.marketdata.schema import empty_table
+from fundlab.marketdata.sources.cninfo import CninfoAnnouncementScan
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
 from fundlab.pipeline.daily import (
@@ -77,6 +78,20 @@ def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive
     assert DailyPipeline._quarantinable_action_collection(
         transient_action_gap, ("510050.SH",),
     )
+    pending_stock_action = (
+        "batch:SnapshotNotReadyError:stock-actions evidence remains unresolved: "
+        "count=1 ids=600000.SH invalid={} "
+        "request_errors=600000.SH:PendingAnnouncement:structured lifecycle not available",
+        "missing_stock-actions_instruments:1",
+    )
+    assert DailyPipeline._quarantinable_action_collection(
+        pending_stock_action, ("600000.SH",),
+    )
+    assert not DailyPipeline._quarantinable_action_collection((
+        "batch:HistoricalActionCorrectionError:stock-actions historical correction "
+        "detected: 600000.SH/2026-06-01/cash_dividend_per_share",
+        "missing_stock-actions_instruments:1",
+    ), ("600000.SH",))
     assert not DailyPipeline._quarantinable_action_collection((
         transient_action_gap[0].replace(
             "invalid={}", 'invalid={"510050.SH":{"reason":"bad lifecycle"}}',
@@ -714,6 +729,24 @@ class _DailyFixtureProvider:
         self.name = name
         self.capabilities = capabilities
         self.calls: list[ProviderRequest] = []
+
+    def scan_announcements(self, start_date, end_date, **kwargs):
+        if self.name != "cninfo-public":
+            raise AssertionError(f"announcement scan routed to {self.name}")
+        return CninfoAnnouncementScan(
+            policy_version="cninfo-corporate-actions-v1",
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+            categories=(
+                "category_qyfpxzcs_szsh",
+                "category_pg_szsh",
+                "category_bcgz_szsh",
+            ),
+            page_evidence=(),
+            records=(),
+            affected_instrument_ids=(),
+            complete=True,
+        )
 
     def observe(self, request: ProviderRequest) -> ObservationPayload:
         self.calls.append(request)

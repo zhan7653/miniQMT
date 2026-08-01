@@ -713,12 +713,32 @@ class DailyPipeline:
 
         evidence_results = {}
         for kind in ("stock-actions", "etf-actions", "factors"):
-            result = SimulationEvidenceCollector(
-                self.warehouse, self.report_root, registry=self.registry,
-            ).collect(EvidenceCollectionSpec(
-                source_snapshot_id=research.snapshot_id,
-                kind=kind,
-            ))
+            try:
+                result = SimulationEvidenceCollector(
+                    self.warehouse, self.report_root, registry=self.registry,
+                ).collect(EvidenceCollectionSpec(
+                    source_snapshot_id=research.snapshot_id,
+                    kind=kind,
+                    predecessor_snapshot_id=(
+                        predecessor.snapshot_id if kind == "stock-actions" else None
+                    ),
+                ))
+            except Exception as exc:
+                if kind != "stock-actions":
+                    raise
+                error = f"{type(exc).__name__}:{str(exc)[:500]}"
+                retryable = self._retryable_failure_text(error)
+                raise DailyPipelineBlocked(
+                    "evidence",
+                    "stock action announcement scan failed",
+                    {
+                        "error": error,
+                        "retryable": retryable,
+                        "retry_class": (
+                            "transient_provider_or_commit" if retryable else None
+                        ),
+                    },
+                ) from exc
             evidence_results[kind] = result
             if result.status != "complete":
                 retryable = self._only_retryable_collection_blockers(
@@ -757,9 +777,12 @@ class DailyPipeline:
             {
             kind: {
                 "observations": len(result.observation_ids),
+                "requested_instruments": getattr(result, "requested_instruments", None),
+                "completed_instruments": getattr(result, "completed_instruments", None),
                 "unresolved_instrument_ids": tuple(getattr(
                     result, "unresolved_instrument_ids", (),
                 )),
+                "report": str(getattr(result, "report", "")) or None,
             }
             for kind, result in evidence_results.items()
         }))
@@ -1131,7 +1154,7 @@ class DailyPipeline:
             for error in request_errors:
                 error_match = re.match(
                     r"([^:]+):(?:TimeoutError|ConnectionError|PermissionError|"
-                    r"ObservationError|HTTP Error|Source HTTP)",
+                    r"ObservationError|PendingAnnouncement|HTTP Error|Source HTTP)",
                     error,
                 )
                 if error_match is None:
@@ -1187,6 +1210,7 @@ class DailyPipeline:
             "PermissionError:[WinError 5]",
             "ObservationError:Source request failed:",
             "ObservationError: Source request failed:",
+            "PendingAnnouncement:",
         )):
             return True
         match = re.search(r"Source HTTP (\d{3}):", text)

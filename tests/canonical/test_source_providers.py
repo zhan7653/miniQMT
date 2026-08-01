@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from fundlab.common.canonical import to_primitive
 from fundlab.marketdata import (
     BaoStockProvider,
     CninfoCorporateActionProvider,
@@ -784,6 +785,8 @@ def test_cninfo_direct_client_generates_token_and_normalizes_public_api_records(
                     "F007V": "10派3.3元",
                     "F001V": "2024年报",
                 }]}
+            if url.endswith("hisAnnouncement/query"):
+                return {"totalAnnouncement": 0, "announcements": []}
             return {"records": [{
                 "DECLAREDATE": "2023-11-27",
                 "F011D": "2023-11-29",
@@ -801,14 +804,176 @@ def test_cninfo_direct_client_generates_token_and_normalizes_public_api_records(
     rights = client.stock_allotment_cninfo(
         symbol="000049", start_date="20100101", end_date="20260717",
     )
+    announcement_page = client.announcement_page_cninfo(
+        category="category_qyfpxzcs_szsh",
+        start_date="20260713",
+        end_date="20260714",
+        page_number=1,
+        page_size=30,
+    )
 
     assert _cninfo_token(epoch_seconds=1_700_000_000) == "WltfJaS1dRCcbgz+YSPgFg=="
     assert dividend.iloc[0]["派息比例"] == 3.3
     assert rights.iloc[0]["配股缴款截止日"] == "2023-12-06"
     assert transport.calls[1][1]["sdate"] == "2010-01-01"
     assert transport.calls[1][1]["edate"] == "2026-07-17"
-    assert all(call[2]["Accept-Enckey"] for call in transport.calls)
+    assert transport.calls[2][1]["seDate"] == "2026-07-13~2026-07-14"
+    assert transport.calls[2][1]["category"] == "category_qyfpxzcs_szsh"
+    assert announcement_page == {"totalAnnouncement": 0, "announcements": []}
+    assert all(call[2]["Accept-Enckey"] for call in transport.calls[:2])
     assert all(call[3] == 7 for call in transport.calls)
+
+
+def _announcement(announcement_id, code, title="公司行动公告"):
+    return {
+        "announcementId": announcement_id,
+        "secCode": code,
+        "announcementTime": 1783900800000,
+        "announcementTitle": title,
+        "adjunctUrl": f"finalpage/2026-07-13/{announcement_id}.PDF",
+    }
+
+
+class _AnnouncementClient:
+    __version__ = "test"
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def announcement_page_cninfo(self, **kwargs):
+        self.calls.append(kwargs)
+        response = self.pages.get((kwargs["category"], kwargs["page_number"]))
+        if callable(response):
+            return response()
+        if isinstance(response, Exception):
+            raise response
+        return response or {"totalAnnouncement": 0, "announcements": []}
+
+
+def test_cninfo_announcement_scan_pages_categories_and_deduplicates_records():
+    qyfpx = "category_qyfpxzcs_szsh"
+    pg = "category_pg_szsh"
+    correction = "category_bcgz_szsh"
+    client = _AnnouncementClient({
+        (qyfpx, 1): {"totalAnnouncement": 3, "announcements": [
+            _announcement("a", "600000"), _announcement("b", "000001"),
+        ]},
+        (qyfpx, 2): {"totalAnnouncement": 3, "announcements": [_announcement("c", "300001")]},
+        (pg, 1): {"totalAnnouncement": 1, "announcements": [_announcement("b", "000001")]},
+        (correction, 1): {
+            "totalAnnouncement": 1,
+            "announcements": [_announcement("b", "000001")],
+        },
+    })
+
+    scan = CninfoCorporateActionProvider(client=client).scan_announcements(
+        date(2026, 7, 13), date(2026, 7, 14), page_size=2, retries=1,
+    )
+
+    assert scan.complete
+    assert [record.announcement_id for record in scan.records] == ["a", "b", "c"]
+    assert next(record for record in scan.records if record.announcement_id == "b").category == qyfpx
+    assert [record.instrument_id for record in scan.records] == ["600000.SH", "000001.SZ", "300001.SZ"]
+    assert scan.affected_instrument_ids == ("000001.SZ", "300001.SZ", "600000.SH")
+    assert len(scan.page_evidence) == 7
+    assert to_primitive(scan)["records"][0]["announcement_time"].endswith("Z")
+    assert all(call["start_date"] == "20260713" and call["end_date"] == "20260714" for call in client.calls)
+
+
+def test_cninfo_announcement_scan_accepts_complete_empty_window():
+    client = _AnnouncementClient({})
+    scan = CninfoCorporateActionProvider(client=client).scan_announcements(
+        date(2026, 7, 13), date(2026, 7, 14), retries=1,
+    )
+
+    assert scan.complete
+    assert scan.records == ()
+    assert scan.affected_instrument_ids == ()
+    assert len(scan.page_evidence) == 6
+
+
+def test_cninfo_announcement_scan_rejects_missing_required_fields():
+    client = _AnnouncementClient({
+        ("category_qyfpxzcs_szsh", 1): {
+            "totalAnnouncement": 1,
+            "announcements": [{key: value for key, value in _announcement("a", "600000").items()
+                               if key != "adjunctUrl"}],
+        },
+    })
+
+    with pytest.raises(ObservationError, match="missing required fields"):
+        CninfoCorporateActionProvider(client=client).scan_announcements(
+            START, END, retries=1,
+        )
+
+
+def test_cninfo_announcement_scan_rejects_reported_total_pagination_drift():
+    category = "category_qyfpxzcs_szsh"
+    client = _AnnouncementClient({
+        (category, 1): {"totalAnnouncement": 2, "announcements": [_announcement("a", "600000")]},
+        (category, 2): {"totalAnnouncement": 3, "announcements": [_announcement("b", "000001")]},
+    })
+
+    with pytest.raises(ObservationError, match="pagination drift"):
+        CninfoCorporateActionProvider(client=client).scan_announcements(
+            START, END, page_size=1, retries=1,
+        )
+
+
+def test_cninfo_announcement_scan_rejects_first_page_drift():
+    category = "category_qyfpxzcs_szsh"
+    responses = iter((
+        {"totalAnnouncement": 1, "announcements": [_announcement("a", "600000")]},
+        {"totalAnnouncement": 1, "announcements": [_announcement("a", "600000", "修订公告")]},
+    ))
+    client = _AnnouncementClient({(category, 1): lambda: next(responses)})
+
+    with pytest.raises(ObservationError, match="first-page drift"):
+        CninfoCorporateActionProvider(client=client).scan_announcements(START, END, retries=1)
+
+
+def test_cninfo_announcement_scan_retries_then_fails_a_middle_page():
+    category = "category_qyfpxzcs_szsh"
+    client = _AnnouncementClient({
+        (category, 1): {"totalAnnouncement": 2, "announcements": [_announcement("a", "600000")]},
+        (category, 2): RuntimeError("connection interrupted"),
+    })
+
+    with pytest.raises(ObservationError, match="category_qyfpxzcs_szsh, page=2"):
+        CninfoCorporateActionProvider(client=client).scan_announcements(
+            START, END, page_size=1, retries=2, retry_backoff_seconds=0,
+        )
+    assert len([call for call in client.calls if call["page_number"] == 2]) == 2
+
+
+def test_cninfo_actions_reports_known_valid_lifecycles_after_cutoff():
+    class Client:
+        def stock_dividend_cninfo(self, *, symbol):
+            return pd.DataFrame([{
+                "实施方案公告日期": "2026-07-10", "送股比例": 0, "转增比例": 0,
+                "派息比例": 3, "股权登记日": "2026-07-18", "除权日": "2026-07-20",
+                "派息日": "2026-07-21", "股份到账日": None,
+            }])
+
+        def stock_allotment_cninfo(self, **kwargs):
+            return pd.DataFrame([{
+                "公告日期": "2026-07-10", "股权登记日": "2026-07-18",
+                "除权基准日": "2026-07-22", "配股缴款截止日": "2026-07-20",
+                "配股上市日": "2026-07-23", "配股比例": 3, "配股价格": 8,
+            }])
+
+    observed = CninfoCorporateActionProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.CORPORATE_ACTIONS, START, END, ("600000.SH",),
+        {"max_workers": 1, "retries": 1},
+    ))
+
+    pending = observed.source_metadata["known_pending_after_cutoff"]["600000.SH"]
+    assert [(item["kind"], item["known_date"], item["ex_date"]) for item in pending] == [
+        ("cash_dividend", "2026-07-10", "2026-07-20"),
+        ("rights_issue", "2026-07-10", "2026-07-22"),
+    ]
+    assert all(len(item["response_hash"]) == 64 for item in pending)
 
 
 def test_xtquant_batch_download_normalizes_lots_and_local_dates():
