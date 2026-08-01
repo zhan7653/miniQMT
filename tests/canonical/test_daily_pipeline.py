@@ -67,6 +67,33 @@ def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive
             universe_size=10_000,
             stage="fixture",
         )
+
+    transient_action_gap = (
+        "batch:SnapshotNotReadyError:etf-actions evidence remains unresolved: "
+        "count=1 ids=510050.SH invalid={} "
+        "request_errors=510050.SH:TimeoutError:timed out",
+        "missing_etf-actions_instruments:1",
+    )
+    assert DailyPipeline._quarantinable_action_collection(transient_action_gap)
+    assert not DailyPipeline._quarantinable_action_collection((
+        transient_action_gap[0].replace(
+            "invalid={}", 'invalid={"510050.SH":{"reason":"bad lifecycle"}}',
+        ),
+        transient_action_gap[1],
+    ))
+    assert not DailyPipeline._quarantinable_action_collection((
+        transient_action_gap[0].replace(
+            "TimeoutError:timed out", "ValueError:unexpected schema",
+        ),
+        transient_action_gap[1],
+    ))
+
+    assert DailyPipeline._action_gap_instrument_ids({
+        "reasons_by_instrument": {
+            "600000.SH": ("status:xtquant:timeout",),
+            "510050.SH": ("evidence:etf-actions:timeout",),
+        },
+    }) == {"510050.SH"}
     with pytest.raises(DailyPipelineBlocked, match="degraded-run boundary"):
         DailyPipeline._require_quarantine_within_daily_limit(
             {str(index): () for index in range(4)},
@@ -1164,7 +1191,9 @@ def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
             return SimpleNamespace(
                 status="incomplete",
                 blockers=(
-                    "batch:SnapshotNotReadyError:stock-actions evidence remains unresolved",
+                    "batch:SnapshotNotReadyError:stock-actions evidence remains unresolved: "
+                    "count=1 ids=600000.SH invalid={} "
+                    "request_errors=600000.SH:TimeoutError:timed out",
                     "missing_stock-actions_instruments:1",
                 ),
                 observation_ids=result.observation_ids,
@@ -1201,6 +1230,19 @@ def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
     assert rows.iloc[0]["trade_rule_id"] == DATA_GAP_QUARANTINE_RULE_ID
     assert bool(rows.iloc[0]["suspended"])
     assert pd.isna(rows.iloc[0]["close"])
+
+    repeated = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+    assert repeated.status == "degraded"
+    assert any(
+        stage.name == "data" and stage.status == "up_to_date"
+        for stage in repeated.stages
+    )
+    persistent = next(
+        stage for stage in repeated.stages if stage.name == "quarantine"
+    )
+    assert persistent.status == "degraded"
+    assert persistent.detail["persistent"] is True
+    assert persistent.detail["instrument_ids"] == ("600000.SH",)
 
 def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monkeypatch):
     import fundlab.pipeline.daily as daily_module

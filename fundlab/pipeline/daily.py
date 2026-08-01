@@ -231,6 +231,18 @@ class DailyPipeline:
                             target=resolved_target,
                         )
 
+                if snapshot_id is not None:
+                    persistent_quarantine = self._snapshot_degraded_quarantine(
+                        self.warehouse.load_snapshot(snapshot_id)
+                    )
+                    if (
+                        persistent_quarantine is not None
+                        and not any(item.name == "quarantine" for item in stages)
+                    ):
+                        stages.append(DailyStage(
+                            "quarantine", "degraded", persistent_quarantine,
+                        ))
+
                 if skip_accounts:
                     stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
                 else:
@@ -716,9 +728,9 @@ class DailyPipeline:
                 unresolved_ids = tuple(getattr(
                     result, "unresolved_instrument_ids", (),
                 ))
-                quarantinable = (
-                    bool(unresolved_ids)
-                    and (kind.endswith("-actions") or retryable)
+                quarantinable = bool(unresolved_ids) and (
+                    self._quarantinable_action_collection(result.blockers)
+                    if kind.endswith("-actions") else retryable
                 )
                 if not quarantinable:
                     raise DailyPipelineBlocked("evidence", f"{kind} evidence collection incomplete", {
@@ -1074,6 +1086,53 @@ class DailyPipeline:
         )
 
     @staticmethod
+    def _quarantinable_action_collection(blockers: Any) -> bool:
+        """Only availability gaps qualify; parser/schema/lifecycle errors stay hard."""
+
+        if not isinstance(blockers, (list, tuple)) or not blockers:
+            return False
+        primary = tuple(
+            str(blocker) for blocker in blockers
+            if "missing_stock-actions_instruments:" not in str(blocker)
+            and "missing_etf-actions_instruments:" not in str(blocker)
+        )
+        if not primary:
+            return False
+        for blocker in primary:
+            if "evidence remains unresolved:" not in blocker:
+                return False
+            match = re.search(r"invalid=(.*?)\s+request_errors=(.*)$", blocker)
+            if match is None or match.group(1).strip() != "{}":
+                return False
+            request_errors = tuple(
+                item.strip() for item in match.group(2).split(";") if item.strip()
+            )
+            if request_errors and not all(
+                DailyPipeline._retryable_atomic_failure(item)
+                for item in request_errors
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _action_gap_instrument_ids(
+        quarantine_detail: Mapping[str, Any] | None,
+    ) -> set[str]:
+        reasons_by_instrument = (quarantine_detail or {}).get(
+            "reasons_by_instrument", {}
+        )
+        if not isinstance(reasons_by_instrument, Mapping):
+            return set()
+        return {
+            str(instrument_id)
+            for instrument_id, reasons in reasons_by_instrument.items()
+            if any(
+                str(reason).startswith("evidence:") and "-actions:" in str(reason)
+                for reason in reasons
+            )
+        }
+
+    @staticmethod
     def _retryable_failure_text(error: Any) -> bool:
         text = str(error)
         if "request_errors=" in text:
@@ -1141,6 +1200,58 @@ class DailyPipeline:
             if not DailyPipeline._only_retryable_capture_errors(errors):
                 return False
         return True
+
+    def _snapshot_degraded_quarantine(
+        self,
+        snapshot,
+    ) -> Mapping[str, Any] | None:
+        records: list[Mapping[str, Any]] = []
+        seen: set[str] = set()
+        for selection in snapshot.plan.selections:
+            observation_id = str(selection.observation_id)
+            if observation_id in seen:
+                continue
+            seen.add(observation_id)
+            manifest = self.warehouse.load_observation(observation_id)
+            detail = manifest.source_metadata.get("degraded_quarantine")
+            if isinstance(detail, Mapping) and detail.get("instrument_ids"):
+                records.append(detail)
+        if not records:
+            return None
+        instrument_ids = tuple(sorted({
+            str(instrument_id)
+            for record in records
+            for instrument_id in record.get("instrument_ids", ())
+        }))
+        reasons: dict[str, set[str]] = {item: set() for item in instrument_ids}
+        consecutive: dict[str, int] = {item: 0 for item in instrument_ids}
+        for record in records:
+            record_reasons = record.get("reasons_by_instrument", {})
+            if isinstance(record_reasons, Mapping):
+                for instrument_id, values in record_reasons.items():
+                    if str(instrument_id) not in reasons:
+                        continue
+                    reasons[str(instrument_id)].update(map(str, values))
+            record_counts = record.get("consecutive_sessions", {})
+            if isinstance(record_counts, Mapping):
+                for instrument_id, value in record_counts.items():
+                    if str(instrument_id) in consecutive:
+                        consecutive[str(instrument_id)] = max(
+                            consecutive[str(instrument_id)], int(value),
+                        )
+        return {
+            "policy": "daily-instrument-data-gap-quarantine-v1",
+            "persistent": True,
+            "instrument_ids": instrument_ids,
+            "instrument_count": len(instrument_ids),
+            "consecutive_sessions": dict(sorted(consecutive.items())),
+            "reasons_by_instrument": {
+                item: tuple(sorted(reasons[item])) for item in instrument_ids
+            },
+            "source_partition_count": len(records),
+            "valuation_policy": "last_trusted_price_stale",
+            "execution_policy": "prohibit_and_defer_pending_orders",
+        }
 
     def _build_new_instrument_supplement(
         self,
@@ -2024,6 +2135,24 @@ class DailyPipeline:
             bars = bars.sort_values(
                 ["instrument_id", "session_date", "price_mode"], kind="stable",
             ).reset_index(drop=True)
+        action_gap_ids = self._action_gap_instrument_ids(quarantine_detail)
+        event_ids = tuple(sorted(
+            set(increment_scope.instrument_ids) - action_gap_ids
+        ))
+        event_scope = UniverseScope(
+            increment_scope.definition,
+            increment_scope.as_of_date,
+            increment_scope.history_start,
+            increment_scope.history_end,
+            survivorship_bias=increment_scope.survivorship_bias,
+            instrument_ids=event_ids,
+        )
+        event_instruments = instruments.loc[
+            instruments["instrument_id"].astype(str).isin(event_ids)
+        ].reset_index(drop=True)
+        event_bars = bars.loc[
+            bars["instrument_id"].astype(str).isin(event_ids)
+        ].reset_index(drop=True)
         actions = self._scoped_events(
             self._concat_observation_tables(
                 (
@@ -2033,7 +2162,7 @@ class DailyPipeline:
                 MarketTable.CORPORATE_ACTIONS,
             ),
             date_column="ex_date",
-            scope=healthy_scope,
+            scope=event_scope,
         )
         factors = self._scoped_events(
             self._concat_observation_tables(
@@ -2041,17 +2170,17 @@ class DailyPipeline:
                 MarketTable.ADJUSTMENT_FACTORS,
             ),
             date_column="effective_date",
-            scope=healthy_scope,
+            scope=event_scope,
         )
         try:
             reconciled, factor_audit_observation_ids, factor_detail = (
                 self._reconcile_action_factor_evidence(
-                    instruments=healthy_instruments,
+                    instruments=event_instruments,
                     actions=actions,
                     primary_factors=factors,
-                    bars=bars,
+                    bars=event_bars,
                     calendar_frame=calendar_frame,
-                    increment_scope=healthy_scope,
+                    increment_scope=event_scope,
                 )
             )
         except DailyPipelineBlocked:
