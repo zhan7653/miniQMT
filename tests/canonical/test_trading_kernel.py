@@ -8,6 +8,10 @@ import sqlite3
 import pytest
 
 from fundlab.marketdata import CorporateAction, CorporateActionType, MarketSession
+from fundlab.marketdata.contracts import (
+    DATA_GAP_QUARANTINE_RULE_ID,
+    PriceLimitState,
+)
 from fundlab.trading import (
     ExecutionPolicy,
     FeeRule,
@@ -137,6 +141,63 @@ def test_next_open_fill_uses_close_sized_order_real_fees_and_partial_expiry(tmp_
     assert fill.fees.stamp_duty == Decimal("0.00")
     types = [event.event_type for event in second.events]
     assert "fill_created" in types and "order_expired" in types
+
+
+def test_data_gap_quarantine_uses_stale_value_and_defers_due_order(tmp_path):
+    market = ready_market(tmp_path / "market")
+    execution, risk = policies()
+    instrument = market.instrument("600000.SH")
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=market.all_trading_days(),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    lot = PositionLot(
+        "held", instrument.instrument_id, 100, DAYS[0], DAYS[0], Decimal("1000"),
+    )
+    order = Order(
+        "defer-me", "intent", instrument.instrument_id, Side.SELL,
+        DAYS[0], DAYS[1], DAYS[1], 100, 100,
+    )
+    state = PortfolioState(
+        Decimal("2000"),
+        Decimal("1000"),
+        (lot,),
+        (order,),
+        last_prices={instrument.instrument_id: Decimal("10")},
+    )
+    ordinary = market.session(DAYS[1])
+    quarantine = replace(
+        ordinary.bars[instrument.instrument_id],
+        open=None,
+        high=None,
+        low=None,
+        close=None,
+        volume=0,
+        amount=None,
+        suspended=True,
+        is_st=None,
+        trade_rule_id=DATA_GAP_QUARANTINE_RULE_ID,
+        price_limit_state=PriceLimitState.UNKNOWN,
+        previous_close=None,
+        price_limit_ratio=None,
+        limit_up=None,
+        limit_down=None,
+    )
+    result = kernel.process_session(
+        state,
+        replace(ordinary, bars={instrument.instrument_id: quarantine}),
+    )
+
+    assert result.fills == ()
+    assert result.valuation.stale_instruments == (instrument.instrument_id,)
+    assert result.valuation.market_value == Decimal("1000.00")
+    assert len(result.state.pending_orders) == 1
+    assert result.state.pending_orders[0].execution_date == DAYS[2]
+    deferred = [event for event in result.events if event.event_type == "order_deferred"]
+    assert deferred and deferred[0].payload["reason"] == "instrument_data_gap_quarantine"
 
 
 def test_star_orders_use_200_minimum_one_share_step_and_full_odd_residual(tmp_path):

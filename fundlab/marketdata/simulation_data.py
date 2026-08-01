@@ -15,6 +15,7 @@ from fundlab.marketdata.contracts import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CorporateActionType,
     CoverageClaim,
+    DATA_GAP_QUARANTINE_RULE_ID,
     MarketTable,
     ObservationManifest,
     ObservationPayload,
@@ -94,6 +95,7 @@ class StatusCollectionResult:
     completed_instruments: int
     observation_ids: tuple[str, ...]
     blockers: tuple[str, ...]
+    unresolved_instrument_ids: tuple[str, ...]
     checkpoint: Path
     report: Path
 
@@ -121,8 +123,16 @@ class EvidenceCollectionResult:
     completed_instruments: int
     observation_ids: tuple[str, ...]
     blockers: tuple[str, ...]
+    unresolved_instrument_ids: tuple[str, ...]
     checkpoint: Path
     report: Path
+
+
+@dataclass(frozen=True)
+class _ActionBatchCollectionResult:
+    manifest: ObservationManifest | None
+    unresolved_instrument_ids: tuple[str, ...]
+    blocker: str | None = None
 
 
 class SimulationEvidenceCollector:
@@ -269,7 +279,7 @@ class SimulationEvidenceCollector:
             if manifest is None:
                 try:
                     if spec.kind.endswith("-actions"):
-                        candidate = _collect_action_batch(
+                        action_batch = _collect_action_batch(
                             warehouse=self.warehouse,
                             registry=self.registry,
                             spec=spec,
@@ -279,7 +289,18 @@ class SimulationEvidenceCollector:
                             raw_observations=action_raw_observations,
                             reuse_existing=not spec.refresh,
                         )
-                        action_canonical_observations.append(candidate)
+                        candidate = action_batch.manifest
+                        if candidate is not None:
+                            action_canonical_observations.append(candidate)
+                            observation_ids.append(candidate.observation_id)
+                        if action_batch.blocker is not None:
+                            blockers.append(f"{batch_id}:{action_batch.blocker}")
+                        if action_batch.unresolved_instrument_ids:
+                            continue
+                        if candidate is None:
+                            raise SnapshotNotReadyError(
+                                f"{spec.kind} batch returned no canonical evidence"
+                            )
                     else:
                         candidate = self.warehouse.record_observation(
                             self.registry.observe(provider, request)
@@ -326,6 +347,7 @@ class SimulationEvidenceCollector:
             "universe_scope": scope,
             "requested_instrument_ids": instrument_ids,
             "completed_instrument_ids": tuple(sorted(completed_ids)),
+            "unresolved_instrument_ids": tuple(sorted(missing)),
             "observation_ids": tuple(sorted(set(observation_ids))),
             "blockers": tuple(sorted(set(blockers))),
             "checkpoint": checkpoint,
@@ -348,6 +370,7 @@ class SimulationEvidenceCollector:
             len(completed_ids & set(instrument_ids)),
             tuple(sorted(set(observation_ids))),
             tuple(sorted(set(blockers))),
+            tuple(sorted(missing)),
             checkpoint,
             report,
         )
@@ -660,6 +683,7 @@ class SimulationStatusCollector:
             "universe_scope": scope,
             "requested_instrument_ids": selected_ids,
             "completed_instrument_ids": tuple(sorted(completed_ids)),
+            "unresolved_instrument_ids": tuple(sorted(missing)),
             "observation_ids": tuple(sorted(set(observation_ids))),
             "blockers": tuple(sorted(set(blockers))),
             "checkpoint": checkpoint,
@@ -681,6 +705,7 @@ class SimulationStatusCollector:
             len(completed_ids & set(selected_ids)),
             tuple(sorted(set(observation_ids))),
             tuple(sorted(set(blockers))),
+            tuple(sorted(missing)),
             checkpoint,
             report,
         )
@@ -1258,6 +1283,16 @@ class SimulationIncrementValidator:
         bars = materialize_daily_trade_rules(
             bars, instruments, rule_calendar, etf_rules=etf_rules,
         )
+        quarantine_mask = bars["field_lineage"].astype(str).str.contains(
+            "daily_instrument_data_gap_quarantine_v1",
+            regex=False,
+            na=False,
+        )
+        if quarantine_mask.any():
+            bars.loc[quarantine_mask, "trade_rule_id"] = DATA_GAP_QUARANTINE_RULE_ID
+            bars.loc[quarantine_mask, "trade_rule_known_date"] = bars.loc[
+                quarantine_mask, "session_date"
+            ]
 
         provider_bars, upstream_manifests = self._provider_audit_bars(
             candidate,
@@ -1331,6 +1366,9 @@ class SimulationIncrementValidator:
             "source_observation_ids": source_observation_ids,
             "price_limit_audit": price_limit_audit,
             "historical_limit_exception_audit": exception_audit,
+            "degraded_quarantine": candidate.source_metadata.get(
+                "degraded_quarantine"
+            ),
         }
         observed_at = max(
             candidate.observed_at,
@@ -1391,7 +1429,13 @@ class SimulationIncrementValidator:
                     "source_observation_ids": source_observation_ids,
                     "price_limit_audit": to_primitive(price_limit_audit),
                     "historical_limit_exception_audit": to_primitive(exception_audit),
+                    "degraded_quarantine": candidate.source_metadata.get(
+                        "degraded_quarantine"
+                    ),
                 },
+                "degraded_quarantine": candidate.source_metadata.get(
+                    "degraded_quarantine"
+                ),
             },
         )
         validated = self.warehouse.record_observation(payload)
@@ -1900,7 +1944,7 @@ def _collect_action_batch(
     instruments: pd.DataFrame,
     raw_observations: list[ObservationManifest],
     reuse_existing: bool,
-) -> ObservationManifest:
+) -> _ActionBatchCollectionResult:
     """Accumulate per-instrument action successes and retry only failures."""
 
     source_provider = {
@@ -1992,8 +2036,8 @@ def _collect_action_batch(
             absorb(manifest)
 
     unresolved = tuple(sorted(set(batch) - set(selected)))
+    invalid_details: dict[str, Any] = {}
     if unresolved:
-        invalid_details: dict[str, Any] = {}
         for manifest in reversed(raw_observations):
             invalid = manifest.source_metadata.get("invalid_lifecycle")
             if not isinstance(invalid, Mapping):
@@ -2001,11 +2045,17 @@ def _collect_action_batch(
             for instrument_id in unresolved:
                 if instrument_id in invalid and instrument_id not in invalid_details:
                     invalid_details[instrument_id] = invalid[instrument_id]
-        raise SnapshotNotReadyError(
-            f"{spec.kind} evidence remains unresolved: "
-            f"count={len(unresolved)} ids={','.join(unresolved[:10])} "
-            f"invalid={canonical_json(invalid_details)[:500]} "
-            f"request_errors={';'.join(recovery_errors[-3:])[:500]}"
+
+    if not selected:
+        return _ActionBatchCollectionResult(
+            None,
+            unresolved,
+            (
+                f"SnapshotNotReadyError:{spec.kind} evidence remains unresolved: "
+                f"count={len(unresolved)} ids={','.join(unresolved)} "
+                f"invalid={canonical_json(invalid_details)[:500]} "
+                f"request_errors={';'.join(recovery_errors[-3:])[:500]}"
+            ),
         )
 
     pieces: list[pd.DataFrame] = []
@@ -2046,9 +2096,10 @@ def _collect_action_batch(
         if isinstance(manifest.source_metadata.get("known_pending_after_cutoff"), Mapping)
         and instrument_id in manifest.source_metadata["known_pending_after_cutoff"]
     }
-    request = _action_canonical_request(spec, scope, batch)
+    completed_batch = tuple(sorted(selected))
+    request = _action_canonical_request(spec, scope, completed_batch)
     observed_at = max(item.observed_at for item in selected.values())
-    return warehouse.record_observation(ObservationPayload(
+    manifest = warehouse.record_observation(ObservationPayload(
         canonical_provider,
         observed_at,
         request,
@@ -2058,7 +2109,7 @@ def _collect_action_batch(
             True,
             scope.history_start,
             scope.history_end,
-            batch,
+            completed_batch,
             (
                 "Per-instrument CNInfo implementation lifecycle evidence"
                 if spec.kind == "stock-actions" else
@@ -2075,7 +2126,7 @@ def _collect_action_batch(
             "known_pending_after_cutoff": pending,
             "component_aggregation_policy": "same-lifecycle-cash-sum-r2-v1",
             "component_aggregations": component_aggregations,
-            "instrument_count": len(batch),
+            "instrument_count": len(completed_batch),
             "action_count": len(actions),
             "evidence_hash": stable_digest({
                 "per_instrument_evidence": per_instrument,
@@ -2084,6 +2135,15 @@ def _collect_action_batch(
             }),
         },
     ))
+    blocker = None
+    if unresolved:
+        blocker = (
+            f"SnapshotNotReadyError:{spec.kind} evidence remains unresolved: "
+            f"count={len(unresolved)} ids={','.join(unresolved)} "
+            f"invalid={canonical_json(invalid_details)[:500]} "
+            f"request_errors={';'.join(recovery_errors[-3:])[:500]}"
+        )
+    return _ActionBatchCollectionResult(manifest, unresolved, blocker)
 
 
 def _require_complete_status_claim(

@@ -30,7 +30,11 @@ from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
 from fundlab.marketdata.schema import empty_table
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
-from fundlab.pipeline.daily import DIRECT_LIMIT_PROVIDERS, DailyPipelineBlocked
+from fundlab.pipeline.daily import (
+    DIRECT_LIMIT_PROVIDERS,
+    DailyPipelineBlocked,
+    DailyRunResult,
+)
 from fundlab.settings import (
     DailyAccountSettings,
     DailySettings,
@@ -46,6 +50,85 @@ from tests.canonical.fixtures import (
     ready_market,
 )
 from tests.canonical.test_trading_kernel import fees, policies
+
+
+def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive():
+    result = DailyRunResult("degraded", None, None, [], [], None)
+    assert result.exit_code == 0
+
+    DailyPipeline._require_quarantine_within_daily_limit(
+        {str(index): () for index in range(200)},
+        universe_size=10_000,
+        stage="fixture",
+    )
+    with pytest.raises(DailyPipelineBlocked, match="degraded-run boundary"):
+        DailyPipeline._require_quarantine_within_daily_limit(
+            {str(index): () for index in range(201)},
+            universe_size=10_000,
+            stage="fixture",
+        )
+    with pytest.raises(DailyPipelineBlocked, match="degraded-run boundary"):
+        DailyPipeline._require_quarantine_within_daily_limit(
+            {str(index): () for index in range(4)},
+            universe_size=100,
+            stage="fixture",
+        )
+
+
+def test_quarantine_allows_five_consecutive_sessions_and_blocks_the_sixth():
+    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+
+    instrument_id = "600000.SH"
+    target = date(2026, 7, 30)
+    previous_end = target - timedelta(days=1)
+    prior_rows = pd.DataFrame({
+        "instrument_id": [instrument_id] * 4,
+        "session_date": [
+            "2026-07-24", "2026-07-25", "2026-07-28", "2026-07-29",
+        ],
+        "trade_rule_id": [DATA_GAP_QUARANTINE_RULE_ID] * 4,
+    })
+    pipeline = object.__new__(DailyPipeline)
+    pipeline.warehouse = SimpleNamespace(
+        query_loaded_snapshot_table=lambda *args, **kwargs: prior_rows,
+    )
+    predecessor = SimpleNamespace(plan=SimpleNamespace(universe_scope=UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        previous_end,
+        date(2026, 1, 1),
+        previous_end,
+        survivorship_bias=True,
+        instrument_ids=(instrument_id,),
+    )))
+    instruments = pd.DataFrame([{
+        "instrument_id": instrument_id,
+        "exchange": "SH",
+        "listed_date": "2000-01-01",
+        "delisted_date": None,
+    }])
+    calendar = pd.DataFrame([{
+        "exchange": "SH", "session_date": target.isoformat(), "is_open": True,
+    }])
+    kwargs = {
+        "predecessor": predecessor,
+        "official_frame": instruments,
+        "calendar_frame": calendar,
+        "increment_start": target,
+        "target": target,
+        "reasons": {instrument_id: ["fixture-gap"]},
+        "universe_size": 100,
+    }
+
+    detail = pipeline._finalize_quarantine(**kwargs)
+    assert detail["consecutive_sessions"][instrument_id] == 5
+
+    prior_rows.loc[len(prior_rows)] = {
+        "instrument_id": instrument_id,
+        "session_date": "2026-07-23",
+        "trade_rule_id": DATA_GAP_QUARANTINE_RULE_ID,
+    }
+    with pytest.raises(DailyPipelineBlocked, match="consecutive-session boundary"):
+        pipeline._finalize_quarantine(**kwargs)
 
 
 class CalendarProvider:
@@ -1018,7 +1101,6 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
         request.capability is ProviderCapability.INSTRUMENTS
         for request in baostock.calls
     ) == 2
-
     warehouse = MarketDataWarehouse(tmp_path / "market")
     assert warehouse.current_snapshot_id() == second.snapshot_id
     published = warehouse.load_snapshot(second.snapshot_id)
@@ -1036,6 +1118,89 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
     )
     assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)
 
+
+def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    monkeypatch.setattr(daily_module, "MAX_DEGRADED_FRACTION", 1.0)
+    real_collector = daily_module.SimulationEvidenceCollector
+
+    class OneInstrumentGapCollector:
+        def __init__(self, *args, **kwargs):
+            self.delegate = real_collector(*args, **kwargs)
+
+        def collect(self, spec):
+            result = self.delegate.collect(spec)
+            if spec.kind != "stock-actions":
+                return result
+            return SimpleNamespace(
+                status="incomplete",
+                blockers=(
+                    "batch:SnapshotNotReadyError:stock-actions evidence remains unresolved",
+                    "missing_stock-actions_instruments:1",
+                ),
+                observation_ids=result.observation_ids,
+                unresolved_instrument_ids=("600000.SH",),
+            )
+
+    monkeypatch.setattr(
+        daily_module, "SimulationEvidenceCollector", OneInstrumentGapCollector,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded"
+    assert result.exit_code == 0
+    quarantine_stage = next(stage for stage in result.stages if stage.name == "quarantine")
+    assert quarantine_stage.detail["instrument_ids"] == ("600000.SH",)
+    assert quarantine_stage.detail["consecutive_sessions"]["600000.SH"] == 1
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        instrument_ids=("600000.SH",),
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert len(rows) == 1
+    assert rows.iloc[0]["trade_rule_id"] == DATA_GAP_QUARANTINE_RULE_ID
+    assert bool(rows.iloc[0]["suspended"])
+    assert pd.isna(rows.iloc[0]["close"])
 
 def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monkeypatch):
     import fundlab.pipeline.daily as daily_module

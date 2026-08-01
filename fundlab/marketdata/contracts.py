@@ -64,6 +64,7 @@ class ReadinessProfile(StrEnum):
 
 CURRENT_SH_SZ_STOCK_ETF_UNIVERSE = "current_sh_sz_stock_etf"
 SIMULATION_PARTITION_VALIDATOR_VERSION = "simulation-partition-r2-v3"
+DATA_GAP_QUARANTINE_RULE_ID = "cn-data-gap-quarantine-no-execution-v1"
 
 
 @dataclass(frozen=True)

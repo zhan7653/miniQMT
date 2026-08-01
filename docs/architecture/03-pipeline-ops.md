@@ -4,13 +4,14 @@
 
 本部分覆盖仓库的"编排层与操作面":`fundlab/pipeline/daily.py`(每日自动化编排)、`fundlab/cli.py`(唯一命令行入口,pyproject 中注册为 `fundlab = "fundlab.cli:main"`)、`fundlab/settings.py` + `config/fundlab.yaml`(配置装载)、`scripts/` 下两个 PowerShell 运维脚本,以及它们读写的数据目录。
 
-边界纪律:这一层**只编排、不裁决**。所有信任决策(双源字段级对账、无成交共识、增量校验、原子发布)都留在 `fundlab/marketdata` 的既有组件里;所有交易语义(风控、成交、账本)都留在 `fundlab/trading` 的交易内核里。`daily.py` 的模块 docstring 明确写着 "This module only orchestrates"——任何门槛失败都以结构化原因阻断整轮运行,而不是发布半成品。
+边界纪律:这一层**只编排、不裁决**。所有信任决策(双源字段级对账、无成交共识、增量校验、原子发布)都留在 `fundlab/marketdata` 的既有组件里;所有交易语义(风控、成交、账本)都留在 `fundlab/trading` 的交易内核里。系统性门槛失败仍结构化阻断;小范围、可精确归属到标的的数据可用性缺口进入显式隔离,不伪造价格或成交。
 
 ## 核心概念
 
 - **一轮 daily run**:一次幂等的每日循环 = "把已发布快照向前延伸到最近一个已完成交易日" + "把所有配置的模拟账户推进到数据头"。两半可分别用 `--skip-data` / `--skip-accounts` 跳过。
-- **失败即阻断(fail-closed)**:`DailyPipelineBlocked(stage, reason, detail)` 是唯一的失败通道;抛出后整轮状态为 `blocked`,退出码 2,但报告照常写盘。
-- **退出码语义**:`DailyRunResult.exit_code` —— 状态 `ok` 或 `up_to_date` 返回 0,其余(`blocked`)返回 2。CLI 顶层捕获任何异常也返回 2 并向 stderr 打印结构化 JSON。
+- **系统性失败即阻断(fail-closed)**:`DailyPipelineBlocked(stage, reason, detail)` 用于日历、schema、对账、账本/数据库、发布冲突及超出隔离边界的缺口;整轮状态为 `blocked`,退出码 2,报告照常写盘。
+- **有界降级**:同时满足“最多 200 只”和“不超过全市场 3%”的标的级缺数可隔离,连续最多 5 个交易日;第 6 日硬阻断。隔离行无 OHLC、禁止交易,持仓只使用最后可信价估值,到期订单顺延。
+- **退出码语义**:`DailyRunResult.exit_code` —— 状态 `ok`、`up_to_date` 或 `degraded` 返回 0,`blocked` 返回 2。CLI 顶层捕获任何异常也返回 2 并向 stderr 打印结构化 JSON。
 - **进程级互斥**:`_exclusive_daily_lock` 用 OS 级文件锁(Windows `msvcrt.locking` / POSIX `fcntl.flock`)锁定 `builds/.locks/daily-run.lock`,防止 Web 触发与计划任务并发;锁随进程消亡,崩溃后不会残留。并发时抛 `DailyRunInProgress`,记为 `lock` 阶段阻断。
 - **会话截止(session_cutoff)**:本地时间 19:00 前运行,目标日回退到上一个开市日——避免把未收盘的当日当作已完成会话。
 - **日历前瞻(calendar_horizon_days=60)**:日历观测窗口刻意伸到今天之后 60 天,携带交易所已公告的未来会话,使得在数据头做出的组合意图能在快照日历内排定 T+1 订单。
@@ -49,7 +50,7 @@ flowchart TD
     CV --> EX["extend: SimulationSnapshotBuilder.extend<br/>原子发布新快照 (publish=True)"]
     EX --> AC["accounts: 每个账户从各自 head+1<br/>逐会话跑交易内核到数据头"]
     UTD --> AC
-    AC --> RP["写报告 data/reports/daily/daily-日期-摘要.json/.md<br/>ok/up_to_date → 0, blocked → 2"]
+    AC --> RP["写报告 data/reports/daily/daily-日期-摘要.json/.md<br/>ok/up_to_date/degraded → 0, blocked → 2"]
 ```
 
 账户推进细节(`_advance_accounts`):打开当前已发布快照(`CanonicalMarketData.open`)与 `TradingRepository`,以配置中的执行/风控/费率策略构造 `SimulationService`;账户时钟边界是**数据头**(`scope.history_end`)而非日历末端。每个账户:不存在则按配置初始现金创建;从已选状态的父 run 末日 +1 起,对每个交易日调用 `service.run_daily(account_id, session, 组合意图源)`——`static` 策略用 `StaticAllocationSource(weights)`,`agent-file` 策略用 `FileIntentSource(data/agent/decisions, account_id, session)`(无决策文件即持有)。单账户异常记为该账户 `blocked`,不影响其他账户,但整轮状态转 `blocked`。最后一个 run 会附带 `build_simulation_feedback` 的权益/收益/质量摘要进报告。
@@ -58,7 +59,7 @@ flowchart TD
 
 - 全程幂等:源观测捕获走 `capture_resumable`(同范围已完整则复用);已验证的日历观测按输入观测 ID 精确匹配复用(`_matching_validated_calendar`);同一前序/universe/日历/日期/标的集合的 canonical no-trade 分区只在已通过三独立后端校验后复用;目标日双源直接涨跌停观测按单标的成功累积,重试只重抓未解决标的;公司行动先与 xtquant 因子核对,未解决事件只补采 BaoStock 因子,仍缺失时才用 TickFlow 原始/前复权价格比率做目标事件审计,所有审计输入都按精确请求复用;目标日不超过已发布数据头时直接 `up_to_date`;账户按 run 链头推进,重复运行不会重放会话。
 - 新上市标的不会触发全历史重建：daily 对每个目标日刷新一次缺省历史主表；同一目标日的失败重试固定复用观测日期不早于目标日的最新完整主表，使 history/research 身份和下游检查点保持稳定（行情观测仍按原范围可续传复用）。`exchange-public` 的 ETF 完整列表可能提前公布未来代码，因此先按 `listingDate <= as_of_date` 形成目标日截面，并保留原始响应计数/哈希及未来代码排除清单。仅当代码来自该目标日完整主表（完整 SH/SZ stock/ETF 请求、七个端点均成功、端点行数与表/唯一 complete claim 一致、request/source 两处 `as_of_date` 都等于目标日）、`listed_date` 落在本次增量窗口、关键元数据齐全时，`HistoryDatabaseBuilder` 才以该不可变官方观测作为显式 master override，对新代码单独采集双源行情并建立互不重叠的补充分区。若后续交易日历史主表仍未收录该代码，只能用“当前已发布、组件化、范围连续且标的身份完全一致”的模拟前序快照继续补充；该前序快照 ID 会进入构建身份和 canonical 审计记录。源行情、状态或后续证据不足仍针对该精确代码失败关闭；没有可信前序证明的更早上市代码视为历史修正，不能伪装成新股自动接入。
-- 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。最常见的阻断原因是 MiniQMT 客户端(xtquant 数据源)不在线——这是每次计划运行的**前置条件**。`run-daily.ps1` 失败时会在 `logs/daily/LAST-RUN-BLOCKED` 落一个标记文件(内容为时间戳),下次成功自动删除;人工排查从 `data/reports/daily/` 里对应 `daily-*.md` 的阶段明细入手。
+- 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。最终失败维护 `logs/daily/LAST-RUN-BLOCKED`;降级完成维护包含报告路径、完整隔离标的/原因/连续天数的 `logs/daily/LAST-RUN-DEGRADED`,并在日志打印 `[DEGRADED]`;干净成功会清除两个标记。
 
 ## 对外接口
 
@@ -99,7 +100,7 @@ flowchart TD
 ### 运维脚本与数据目录
 
 - `scripts/register-daily-task.ps1`:注册计划任务 "FundLab Daily"——周二至周六 06:00(`-Time` 可改),在上游数据稳定后处理前一交易日;`StartWhenAvailable` 错过补跑,失败 30 分钟间隔重试 3 次(幂等所以安全),4 小时执行上限,`IgnoreNew` 拒绝并发实例;卸载用 `Unregister-ScheduledTask -TaskName "FundLab Daily" -Confirm:$false`。
-- `scripts/run-daily.ps1`:切到仓库根,在 daily 前尝试 `uv run fundlab agent decide --all`,daily 成功发布后再幂等补一次(用新账本头和新日历为下个交易日预置决策);任一最终决策失败仅记 `LAST-AGENT-HOLD` 标记,契约上等于持有,详见[05-决策 Agent](05-agent.md)。全部输出追加到 `logs/daily/run-<时间戳>.log`;若报告把阻断明确分类为瞬时 provider transport/观测提交故障,脚本最多执行 3 轮 daily(等待 30/60 秒),并复用已落库的不可变观测;观测目录原子提交本身也会有限重试 Windows 短暂文件锁。结构、schema、对账或数据冲突仍立即阻断。最终失败维护 `LAST-RUN-BLOCKED`,退出码透传给计划任务;计划任务的 30 分钟重启仅作为进程级后备。
+- `scripts/run-daily.ps1`:切到仓库根,在 daily 前尝试 `uv run fundlab agent decide --all`,daily 成功发布后再幂等补一次(用新账本头和新日历为下个交易日预置决策);任一最终决策失败仅记 `LAST-AGENT-HOLD` 标记,契约上等于持有,详见[05-决策 Agent](05-agent.md)。全部输出追加到 `logs/daily/run-<时间戳>.log`;瞬时 provider transport/观测提交故障最多重试 3 轮(等待 30/60 秒)。`degraded` 不重试且退出 0,但写 `LAST-RUN-DEGRADED` 并打印醒目标记;结构、schema、对账或数据冲突仍立即阻断。
 - 数据目录布局:
   - `data/warehouse/v2/canonical/{observations,components,snapshots,builds,current.json}` — 观测仓库、组件、快照与当前发布指针;
   - `data/warehouse/v2/trading.sqlite3` — 账户与哈希链账本;
@@ -112,7 +113,7 @@ flowchart TD
 
 ## 不变量与约束
 
-- **失败即阻断,绝不发布半成品**:任何阶段门槛(日历分歧、标的被移除、非无成交缺失、研究增量不完整、状态/证据采集不完整、增量校验失败、发布未成功)都终止整轮并留下结构化原因。
+- **系统性错误仍阻断**:日历分歧、标的集合异常、schema/对账/账本/数据库错误、增量校验冲突或发布失败都终止整轮。只有完整记录原因且在 200 只/3%/连续 5 日三重边界内的标的级可用性缺口可以降级发布。
 - **幂等重入**:重跑不重复采数(可续传捕获 + 观测复用)、不重复发布(up_to_date 短路)、不重放账户会话(按 run 链头推进);OS 级文件锁保证任意时刻至多一轮。
 - **哈希与不可变绑定**:报告文件名嵌入 `stable_digest` 内容摘要;CLI 的 `_write_immutable_report` 拒绝以不同内容覆盖已存在报告;每轮报告完整记录各阶段的 observation_id / snapshot_id,可追溯到具体源观测。
 - **双源一致性**:日历要求 `baostock` 与 `sina-calendar` 在含未来 60 天的整个窗口上开市日集合完全一致;行情增量要求 `tickflow`+`xtquant` 双源对账、`baostock` 仲裁;整段缺失必须由三源无成交共识解释。

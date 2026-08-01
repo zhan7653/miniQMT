@@ -208,9 +208,10 @@ Afterwards every account configured under `daily:` in `config/fundlab.yaml` is a
 session to the published head with its intent source (`static` weights or `agent-file` decisions).
 
 The manual commands below remain the underlying, individually auditable machinery; the pipeline only
-orchestrates them and inherits every fail-closed gate. A blocked stage exits 2 with a structured
-reason and writes an ops report under `data/reports/daily/`; re-running resumes from the durable
-observation warehouse.
+orchestrates them and inherits every systemic fail-closed gate. A bounded instrument-level data gap
+can complete as `degraded` (exit 0) with non-tradable rows, stale valuation, deferred orders, and a
+full structured report. A blocked stage exits 2; re-running resumes from the durable observation
+warehouse.
 
 ## Commands
 

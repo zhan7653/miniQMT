@@ -7,7 +7,11 @@ from typing import Iterable, Mapping
 
 from fundlab.common.canonical import stable_digest
 from fundlab.marketdata.portal import CorporateAction, DailyBar, Instrument, MarketSession
-from fundlab.marketdata.contracts import CorporateActionType, PriceLimitState
+from fundlab.marketdata.contracts import (
+    CorporateActionType,
+    DATA_GAP_QUARANTINE_RULE_ID,
+    PriceLimitState,
+)
 from fundlab.trading.fees import FeeBreakdown, FeeSchedule, money
 from fundlab.trading.intent import PortfolioIntent, RiskPolicy, assess_intent, decimal_value
 from fundlab.trading.state import (
@@ -82,7 +86,27 @@ class TradingKernel:
         current = replace(current, pending_orders=tuple(retained))
 
         for order in sorted(due, key=lambda item: (item.side is Side.BUY, item.instrument_id, item.order_id)):
-            current, fill, order_events = self._execute_order(current, order, market.bars.get(order.instrument_id))
+            bar = market.bars.get(order.instrument_id)
+            if bar is not None and bar.trade_rule_id == DATA_GAP_QUARANTINE_RULE_ID:
+                next_session = self._advance_session(day, 1)
+                if next_session != date.max:
+                    deferred = replace(
+                        order,
+                        execution_date=next_session,
+                        expiry_date=next_session,
+                    )
+                    current = replace(
+                        current,
+                        pending_orders=tuple((*current.pending_orders, deferred)),
+                    )
+                    events.append(_order_event(day, "order_deferred", order, {
+                        "reason": "instrument_data_gap_quarantine",
+                        "previous_execution_date": day,
+                        "next_execution_date": next_session,
+                        "remaining_quantity": order.remaining_quantity,
+                    }))
+                    continue
+            current, fill, order_events = self._execute_order(current, order, bar)
             if fill is not None:
                 fills.append(fill)
             events.extend(order_events)

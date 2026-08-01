@@ -39,10 +39,12 @@ uv run fundlab daily status
 ```
 
 Accounts, the session cutoff, and the agent decision directory live in the `daily:` section of
-`config/fundlab.yaml`. Exit code 0 means ok or already up to date; exit code 2 means a fail-closed
-gate blocked the run — the reason is in the console JSON and in the ops report under
-`data/reports/daily/`. Re-running after a block resumes from the durable observation warehouse;
-nothing partial is ever published. The scheduled wrapper retries only failures explicitly
+`config/fundlab.yaml`. Exit code 0 means ok, already up to date, or explicitly `degraded`; exit
+code 2 means a fail-closed gate blocked the run. A degraded run isolates at most 200 instruments
+and at most 3% of the universe for no more than five consecutive sessions: valuation uses the
+last trusted price, trading is prohibited, and due orders are deferred. The reason is in the
+console JSON and in the ops report under `data/reports/daily/`. Re-running after a block resumes
+from the durable observation warehouse. The scheduled wrapper retries only failures explicitly
 classified as transient provider transport errors (up to three daily attempts, waiting 30 then
 60 seconds); schema, reconciliation, and data-conflict failures still stop immediately.
 

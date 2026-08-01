@@ -1,6 +1,6 @@
 # Runs one fundlab daily cycle and appends the outcome to logs/daily/.
 # Safe to re-run: the pipeline is idempotent and resumes from the observation
-# warehouse. Exit code 0 = ok/up-to-date, 2 = a fail-closed gate blocked the run.
+# warehouse. Exit code 0 = ok/up-to-date/degraded, 2 = a fail-closed gate blocked the run.
 #
 # Operational requirement: the local MiniQMT client must be running for the
 # xtquant provider; if it is offline the data stage blocks and the next run
@@ -8,7 +8,7 @@
 
 param([switch]$FunctionsOnly)
 
-function Test-DailyFailureRetryable {
+function Get-DailyAttemptReport {
     param(
         [Parameter(Mandatory = $true)][string]$DailyReportDir,
         [Parameter(Mandatory = $true)][datetime]$AttemptStarted
@@ -20,16 +20,34 @@ function Test-DailyFailureRetryable {
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($null -eq $latestReport) {
-        return $false
+        return $null
     }
     try {
         $report = Get-Content -Raw -LiteralPath $latestReport.FullName |
             ConvertFrom-Json
     } catch {
+        return $null
+    }
+    return [pscustomobject]@{
+        Path = $latestReport.FullName
+        Report = $report
+    }
+}
+
+function Test-DailyFailureRetryable {
+    param(
+        [Parameter(Mandatory = $true)][string]$DailyReportDir,
+        [Parameter(Mandatory = $true)][datetime]$AttemptStarted
+    )
+
+    $attemptReport = Get-DailyAttemptReport `
+        -DailyReportDir $DailyReportDir `
+        -AttemptStarted $AttemptStarted
+    if ($null -eq $attemptReport) {
         return $false
     }
     return @(
-        $report.stages |
+        $attemptReport.Report.stages |
             Where-Object {
                 $_.status -eq "blocked" -and $_.detail.retryable -eq $true
             }
@@ -104,8 +122,31 @@ for ($attempt = 1; $attempt -le $maxDailyAttempts; $attempt++) {
 }
 
 if ($code -eq 0) {
-    "[$stamp] daily run ok" | Tee-Object -FilePath $logFile -Append
     Remove-Item -Force (Join-Path $logDir "LAST-RUN-BLOCKED") -ErrorAction SilentlyContinue
+    $attemptReport = Get-DailyAttemptReport `
+        -DailyReportDir $dailyReportDir `
+        -AttemptStarted $attemptStarted
+    if ($null -ne $attemptReport -and $attemptReport.Report.status -eq "degraded") {
+        $quarantine = $attemptReport.Report.stages |
+            Where-Object { $_.name -eq "quarantine" } |
+            Select-Object -Last 1
+        $marker = [ordered]@{
+            status = "degraded"
+            detected_at = (Get-Date).ToString("o")
+            report = $attemptReport.Path
+            target_date = $attemptReport.Report.target_date
+            snapshot_id = $attemptReport.Report.snapshot_id
+            quarantine = $quarantine.detail
+        } | ConvertTo-Json -Depth 12
+        Set-Content -LiteralPath (Join-Path $logDir "LAST-RUN-DEGRADED") `
+            -Value $marker
+        $count = $quarantine.detail.instrument_count
+        "[$stamp] [DEGRADED] daily run completed with $count quarantined instruments; see $($attemptReport.Path)" |
+            Tee-Object -FilePath $logFile -Append
+    } else {
+        Remove-Item -Force (Join-Path $logDir "LAST-RUN-DEGRADED") -ErrorAction SilentlyContinue
+        "[$stamp] daily run ok" | Tee-Object -FilePath $logFile -Append
+    }
 
     # The successful daily run may have advanced both the account and the
     # published calendar. Prepare the following session now; idempotence makes
@@ -125,5 +166,6 @@ if ($code -eq 0) {
     "[$stamp] daily run blocked or failed (exit $code); see data/reports/daily/" |
         Tee-Object -FilePath $logFile -Append
     Set-Content -Path (Join-Path $logDir "LAST-RUN-BLOCKED") -Value $stamp
+    Remove-Item -Force (Join-Path $logDir "LAST-RUN-DEGRADED") -ErrorAction SilentlyContinue
 }
 exit $code

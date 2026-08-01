@@ -814,3 +814,57 @@ def test_etf_action_collection_accumulates_successes_and_retries_only_failures(t
     assert set(manifest.source_metadata["per_instrument_evidence"]) == {
         "159919.SZ", "510050.SH",
     }
+
+    class PersistentlyPartialEtfProvider(PartialEtfProvider):
+        def observe(self, request):
+            self.calls.append(request.instrument_ids)
+            completed = tuple(
+                item for item in request.instrument_ids if item != "510050.SH"
+            )
+            failed = tuple(
+                item for item in request.instrument_ids if item == "510050.SH"
+            )
+            actions = pd.DataFrame(columns=(
+                "action_id", "instrument_id", "action_type", "known_date",
+                "record_date", "ex_date", "pay_date", "listing_date",
+                "cash_per_share", "share_ratio", "rights_price",
+                "quantity_multiplier", "source_payload",
+            ))
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.CORPORATE_ACTIONS: actions},
+                (CoverageClaim(
+                    MarketTable.CORPORATE_ACTIONS,
+                    not failed,
+                    DAYS[0], DAYS[-1], request.instrument_ids,
+                ),),
+                {
+                    "parser_policy": EASTMONEY_ETF_ACTION_POLICY,
+                    "response_sha256": {
+                        instrument_id: {"fund_archive_page": f"hash-{instrument_id}"}
+                        for instrument_id in completed
+                    },
+                    "request_errors": {
+                        instrument_id: "temporary disconnect" for instrument_id in failed
+                    },
+                    "invalid_lifecycle": {},
+                    "known_pending_after_cutoff": {},
+                },
+            )
+
+    partial_provider = PersistentlyPartialEtfProvider()
+    partial_registry = ProviderRegistry()
+    partial_registry.register(partial_provider)
+    incomplete = SimulationEvidenceCollector(
+        warehouse, tmp_path / "partial-reports", registry=partial_registry,
+    ).collect(EvidenceCollectionSpec(
+        research.snapshot_id, "etf-actions", batch_size=2, refresh=True,
+    ))
+
+    assert incomplete.status == "incomplete"
+    assert incomplete.completed_instruments == 1
+    assert incomplete.unresolved_instrument_ids == ("510050.SH",)
+    partial_manifest = warehouse.load_observation(incomplete.observation_ids[0])
+    assert partial_manifest.request.instrument_ids == ("159919.SZ",)
