@@ -1504,6 +1504,9 @@ def test_stock_action_resolves_pending_per_announcement_not_per_stock(tmp_path):
         warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
     ).read_text(encoding="utf-8"))["instruments"][target]["announcements"]
     assert [item["announcement_id"] for item in pending] == ["notice-still-pending"]
+    blocker = next(item for item in result.blockers if "evidence remains unresolved" in item)
+    assert "structured lifecycle not available for notice-still-pending" in blocker
+    assert "notice-resolved" not in blocker
 
 
 def test_stock_action_known_future_correction_remains_pending_without_degrading(tmp_path):

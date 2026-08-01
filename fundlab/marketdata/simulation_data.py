@@ -794,6 +794,7 @@ class SimulationEvidenceCollector:
                     str(item.get("announcement_id"))
                     for item in pending.get(instrument_id, {}).get("announcements", ())
                     if isinstance(item, Mapping)
+                    and str(item.get("state")) == "awaiting_structured_detail"
                 ) if isinstance(pending.get(instrument_id), Mapping) else ()
                 request_errors[instrument_id] = (
                     "PendingAnnouncement:structured lifecycle not available for "
