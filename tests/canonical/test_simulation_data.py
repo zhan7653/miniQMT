@@ -1051,6 +1051,7 @@ class _AnnouncementTargetedCninfoProvider:
         self.invalid_by_instrument = invalid_by_instrument or {}
         self.scan_calls = 0
         self.observe_calls: list[tuple[str, ...]] = []
+        self.observe_requests: list[ProviderRequest] = []
 
     def scan_announcements(self, start_date, end_date):
         self.scan_calls += 1
@@ -1060,6 +1061,7 @@ class _AnnouncementTargetedCninfoProvider:
 
     def observe(self, request):
         self.observe_calls.append(request.instrument_ids)
+        self.observe_requests.append(request)
         rows = [
             row
             for instrument_id in request.instrument_ids
@@ -1267,7 +1269,7 @@ def test_stock_action_execution_signal_overrides_generic_tips_wording(tmp_path):
 
 
 def test_stock_action_proposals_and_h_only_notices_are_audited_without_detail_calls(tmp_path):
-    instrument_ids = ("600000.SH", "600001.SH", "600002.SH")
+    instrument_ids = ("600000.SH", "600001.SH", "600002.SH", "600003.SH")
     warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(
         tmp_path, instrument_ids=instrument_ids,
     )
@@ -1290,6 +1292,12 @@ def test_stock_action_proposals_and_h_only_notices_are_audited_without_detail_ca
                 "关于董事长提议实施2026年中期利润分配方案的提示性公告",
                 "/suggestion.pdf",
             ),
+            CninfoAnnouncementRecord(
+                "notice-preferred-only", instrument_ids[3],
+                "2026-07-15T11:00:00+08:00", "category_qyfpxzcs_szsh",
+                "第二期优先股2026年股息发放实施公告",
+                "/preferred-share.pdf",
+            ),
         ),
         {},
     )
@@ -1306,12 +1314,13 @@ def test_stock_action_proposals_and_h_only_notices_are_audited_without_detail_ca
     report = json.loads(result.report.read_text(encoding="utf-8"))
     assert set(report["affected_instrument_ids"]) == set(instrument_ids)
     assert report["actionable_affected_instrument_ids"] == []
-    assert report["ignored_announcement_count"] == 3
+    assert report["ignored_announcement_count"] == 4
     assert {
         item["announcement_id"]: item["reason"]
         for item in report["ignored_announcements"]
     } == {
         "notice-h-only": "non_a_share_h_only",
+        "notice-preferred-only": "non_a_share_preferred_only",
         "notice-proposal": "non_executable_proposal",
         "notice-suggest-implement": "non_executable_proposal",
     }
@@ -1368,6 +1377,9 @@ def test_stock_action_relevant_correction_uses_exact_no_change_confirmation(tmp_
 
     assert result.status == "complete"
     assert result.unresolved_instrument_ids == ()
+    assert provider.observe_requests[0].parameters[
+        "announcement_dates_by_instrument"
+    ][target] == ("2026-07-15",)
     pending = json.loads((
         warehouse.root / "indexes" / "cninfo-stock-actions" / "pending.json"
     ).read_text(encoding="utf-8"))
@@ -1582,6 +1594,55 @@ def test_stock_action_persisted_pending_is_targeted_without_a_new_announcement(t
     assert result.status == "complete"
     assert provider.observe_calls == [(target,)]
     assert json.loads(pending_path.read_text(encoding="utf-8"))["instruments"] == {}
+
+
+def test_stock_action_retries_cached_empty_detail_until_pending_is_resolved(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-late-detail", target, "2026-07-15T08:00:00+08:00",
+            "category_qyfpxzcs_szsh", "2025年度权益分派实施公告", "/notice.pdf",
+        )),
+        {target: ()},
+    )
+    collector = _stock_action_collector(warehouse, tmp_path, provider)
+    spec = EvidenceCollectionSpec(
+        current.snapshot_id, "stock-actions",
+        predecessor_snapshot_id=predecessor.snapshot_id,
+    )
+
+    first = collector.collect(spec)
+    provider.actions_by_instrument[target] = (_stock_action_row(target),)
+    second = collector.collect(spec)
+
+    assert first.status == "incomplete"
+    assert second.status == "complete"
+    assert provider.observe_calls == [(target,), (target,)]
+
+
+def test_stock_action_matches_utc_announcement_by_shanghai_disclosure_date(tmp_path):
+    warehouse, predecessor, current, _, observed_at = _stock_action_increment_fixture(tmp_path)
+    target = "600000.SH"
+    provider = _AnnouncementTargetedCninfoProvider(
+        observed_at,
+        _announcement_scan(CninfoAnnouncementRecord(
+            "notice-utc-midnight", target, "2026-07-14T16:00:00Z",
+            "category_qyfpxzcs_szsh", "2025年度权益分派实施公告", "/notice.pdf",
+        )),
+        {target: (_stock_action_row(target),)},
+    )
+
+    result = _stock_action_collector(warehouse, tmp_path, provider).collect(
+        EvidenceCollectionSpec(
+            current.snapshot_id, "stock-actions",
+            predecessor_snapshot_id=predecessor.snapshot_id,
+        ),
+    )
+
+    assert result.status == "complete"
+    assert result.unresolved_instrument_ids == ()
 
 
 def test_stock_action_historical_difference_blocks_without_canonical_observation(tmp_path):

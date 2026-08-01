@@ -1005,6 +1005,43 @@ def test_cninfo_actions_reports_known_valid_lifecycles_after_cutoff():
     assert all(len(item["response_hash"]) == 64 for item in pending)
 
 
+def test_cninfo_targeted_dividend_does_not_fail_on_irrelevant_rights_channel():
+    class Client:
+        def __init__(self):
+            self.rights_calls = 0
+
+        def stock_dividend_cninfo(self, *, symbol):
+            return pd.DataFrame([{
+                "实施方案公告日期": "2026-07-14", "送股比例": 0,
+                "转增比例": 0, "派息比例": 3, "股权登记日": "2026-07-17",
+                "除权日": "2026-07-20", "派息日": "2026-07-20",
+                "股份到账日": None,
+            }])
+
+        def stock_allotment_cninfo(self, **kwargs):
+            self.rights_calls += 1
+            raise RuntimeError("rights endpoint must not be requested")
+
+    client = Client()
+    observed = CninfoCorporateActionProvider(client=client).observe(ProviderRequest(
+        ProviderCapability.CORPORATE_ACTIONS, START, END, ("600000.SH",),
+        {
+            "max_workers": 1,
+            "retries": 1,
+            "collection_mode": "announcement-targeted-v2",
+            "announcement_categories_by_instrument": {
+                "600000.SH": ("category_qyfpxzcs_szsh",),
+            },
+        },
+    ))
+
+    assert client.rights_calls == 0
+    assert observed.source_metadata["request_errors"] == {}
+    assert observed.source_metadata["known_pending_after_cutoff"]["600000.SH"][0][
+        "kind"
+    ] == "cash_dividend"
+
+
 def test_cninfo_targeted_actions_ignore_unrelated_pre_window_lifecycle_defects():
     class Client:
         def stock_dividend_cninfo(self, *, symbol):

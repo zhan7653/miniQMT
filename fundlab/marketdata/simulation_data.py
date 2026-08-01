@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -588,6 +589,36 @@ class SimulationEvidenceCollector:
         if not spec.refresh:
             for manifest in raw_observations:
                 absorb(manifest)
+
+            # A successful HTTP observation can still be a stale negative result.
+            # Reuse it only when it actually resolves every pending announcement;
+            # otherwise the affected instrument must be queried again.
+            for instrument_id, manifest in tuple(selected.items()):
+                announcements = tuple(
+                    item for item in pending.get(instrument_id, {}).get(
+                        "announcements", (),
+                    )
+                    if isinstance(item, Mapping)
+                )
+                frame = self.warehouse.read_observation_table(
+                    manifest.observation_id, MarketTable.CORPORATE_ACTIONS,
+                )
+                frame = frame.loc[
+                    frame["instrument_id"].astype(str).eq(instrument_id)
+                ]
+                future_by_instrument = manifest.source_metadata.get(
+                    "known_pending_after_cutoff", {},
+                )
+                future = (
+                    future_by_instrument.get(instrument_id, ())
+                    if isinstance(future_by_instrument, Mapping) else ()
+                )
+                if not all(
+                    _announcement_matches_action_evidence(item, frame)
+                    or _announcement_matches_action_evidence(item, future)
+                    for item in announcements
+                ):
+                    selected.pop(instrument_id, None)
         reused_detail_ids = set(selected)
 
         recovery_errors: dict[str, str] = {}
@@ -612,12 +643,23 @@ class SimulationEvidenceCollector:
                         "validation_start_date": scope.history_start.isoformat(),
                         "announcement_dates_by_instrument": {
                             instrument_id: tuple(sorted({
-                                str(item.get("announcement_time", ""))[:10]
+                                local_date
                                 for item in pending.get(instrument_id, {}).get(
                                     "announcements", ()
                                 )
                                 if isinstance(item, Mapping)
-                                and len(str(item.get("announcement_time", ""))) >= 10
+                                and (local_date := _announcement_local_date(item))
+                            }))
+                            for instrument_id in batch
+                        },
+                        "announcement_categories_by_instrument": {
+                            instrument_id: tuple(sorted({
+                                str(item.get("category", ""))
+                                for item in pending.get(instrument_id, {}).get(
+                                    "announcements", ()
+                                )
+                                if isinstance(item, Mapping)
+                                and str(item.get("category", ""))
                             }))
                             for instrument_id in batch
                         },
@@ -3006,6 +3048,10 @@ def _ignored_stock_action_announcement_reason(
     compact = "".join(title.split())
     if "H股" in compact and "A股" not in compact:
         return "non_a_share_h_only"
+    if "优先股" in compact and not any(
+        token in compact for token in ("普通股", "A股")
+    ):
+        return "non_a_share_preferred_only"
     if str(announcement.get("category", "")) != "category_qyfpxzcs_szsh":
         return None
     if _is_correction_announcement(announcement):
@@ -3043,8 +3089,8 @@ def _announcement_matches_action_evidence(
             "cash_dividend", "stock_dividend", "rights_issue",
         },
     }.get(category, set())
-    announcement_date = str(announcement.get("announcement_time", ""))[:10]
-    if not expected_types or len(announcement_date) != 10:
+    announcement_date = _announcement_local_date(announcement)
+    if not expected_types or announcement_date is None:
         return False
     records = (
         evidence.to_dict("records")
@@ -3059,6 +3105,23 @@ def _announcement_matches_action_evidence(
         if action_type in expected_types and known_date == announcement_date:
             return True
     return False
+
+
+def _announcement_local_date(announcement: Mapping[str, Any]) -> str | None:
+    """Return the CNInfo disclosure date in the exchange's civil timezone."""
+
+    value = announcement.get("announcement_time")
+    try:
+        parsed = pd.Timestamp(value)
+        if pd.isna(parsed):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.tz_localize(ZoneInfo("Asia/Shanghai"))
+        else:
+            parsed = parsed.tz_convert(ZoneInfo("Asia/Shanghai"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed.date().isoformat()
 
 
 def _historical_action_corrections(

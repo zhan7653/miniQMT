@@ -669,24 +669,53 @@ class CninfoCorporateActionProvider:
         if workers < 1 or workers > 8 or retries < 1 or backoff < 0:
             raise ValueError("Invalid CNInfo worker/retry parameters")
 
-        def fetch(instrument_id: str):
-            local, _ = split_instrument_id(instrument_id)
+        def fetch_with_retry(call):
             last: Exception | None = None
             for attempt in range(retries):
                 try:
-                    dividends = pd.DataFrame(client.stock_dividend_cninfo(symbol=local)).copy()
-                    rights = pd.DataFrame(client.stock_allotment_cninfo(
-                        symbol=local,
-                        start_date=request.start_date.strftime("%Y%m%d"),
-                        end_date=request.end_date.strftime("%Y%m%d"),
-                    )).copy()
-                    return instrument_id, dividends, rights
+                    return pd.DataFrame(call()).copy()
                 except Exception as exc:
                     last = exc
                     if attempt + 1 < retries and backoff:
                         sleep(backoff * (2 ** attempt))
             assert last is not None
             raise last
+
+        def required_channels(instrument_id: str) -> tuple[bool, bool]:
+            categories_by_instrument = request.parameters.get(
+                "announcement_categories_by_instrument",
+            )
+            if (
+                request.parameters.get("collection_mode") != "announcement-targeted-v2"
+                or not isinstance(categories_by_instrument, Mapping)
+            ):
+                return True, True
+            raw_categories = categories_by_instrument.get(instrument_id)
+            if not isinstance(raw_categories, (list, tuple, set, frozenset)):
+                return True, True
+            categories = set(map(str, raw_categories))
+            dividend = bool(categories & {
+                "category_qyfpxzcs_szsh", "category_bcgz_szsh",
+            })
+            rights = bool(categories & {"category_pg_szsh", "category_bcgz_szsh"})
+            return (dividend, rights) if dividend or rights else (True, True)
+
+        def fetch(instrument_id: str):
+            local, _ = split_instrument_id(instrument_id)
+            fetch_dividend, fetch_rights = required_channels(instrument_id)
+            dividends = (
+                fetch_with_retry(lambda: client.stock_dividend_cninfo(symbol=local))
+                if fetch_dividend else pd.DataFrame()
+            )
+            rights = (
+                fetch_with_retry(lambda: client.stock_allotment_cninfo(
+                    symbol=local,
+                    start_date=request.start_date.strftime("%Y%m%d"),
+                    end_date=request.end_date.strftime("%Y%m%d"),
+                ))
+                if fetch_rights else pd.DataFrame()
+            )
+            return instrument_id, dividends, rights
 
         responses: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
         errors: dict[str, str] = {}
