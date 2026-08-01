@@ -22,6 +22,7 @@ fees, slippage, realized P&L, dividends, and data/model incompleteness.
 ```powershell
 uv sync --dev --frozen --inexact
 uv run fundlab --help
+uv run ruff check .
 uv run pytest tests/canonical
 ```
 

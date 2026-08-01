@@ -132,6 +132,7 @@ uv run fundlab daily run              # 一条命令:校验日历→扩展快照
 uv run fundlab daily status           # 快照头、账户头寸日、配置概览
 uv run fundlab web                    # localhost:8610 控制台
 pwsh -File scripts/register-daily-task.ps1   # 注册周二至周六 06:00 计划任务(先决策后运行)
+uv run ruff check .                 # Python 3.11 兼容性与高信号静态检查
 uv run pytest tests/canonical         # 全量测试
 ```
 

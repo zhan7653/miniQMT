@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, timezone
 from math import isclose
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping

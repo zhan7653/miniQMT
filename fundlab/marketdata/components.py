@@ -7,7 +7,7 @@ components a second public query API or another mutable warehouse.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from enum import StrEnum
 from hashlib import sha256
 import os

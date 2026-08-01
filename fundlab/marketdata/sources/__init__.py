@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fundlab.marketdata.contracts import ProviderCapability
 from fundlab.marketdata.providers import ProviderRegistry
 from fundlab.marketdata.sources.baostock import BaoStockProvider
 from fundlab.marketdata.sources.cninfo import CninfoCorporateActionProvider

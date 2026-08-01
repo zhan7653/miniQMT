@@ -6,6 +6,7 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 import json
+from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -29,7 +30,7 @@ def to_primitive(value: Any) -> Any:
         return sorted((to_primitive(item) for item in value), key=_sort_key)
     if isinstance(value, (tuple, list)):
         return [to_primitive(item) for item in value]
-    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+    if isinstance(value, float) and not isfinite(value):
         raise ValueError("Non-finite floats cannot be canonically serialized")
     if value is None or isinstance(value, (str, int, float, bool)):
         return value

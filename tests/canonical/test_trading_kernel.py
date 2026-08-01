@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from fundlab.marketdata import CorporateAction, CorporateActionType, MarketSession
+from fundlab.marketdata import CorporateAction, CorporateActionType
 from fundlab.marketdata.contracts import (
     DATA_GAP_QUARANTINE_RULE_ID,
     PriceLimitState,

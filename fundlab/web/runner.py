@@ -11,8 +11,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
-from datetime import datetime
 from pathlib import Path
+
+from fundlab.common.dates import audit_now
 
 
 class DailyRunLauncher:
@@ -54,13 +55,13 @@ class DailyRunLauncher:
             self._collect_finished_locked()
             command = self._command(skip_data=skip_data, skip_accounts=skip_accounts)
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            stamp = audit_now().strftime("%Y-%m-%d_%H%M%S")
             self._log_path = self.log_dir / f"web-run-{stamp}.log"
             self._log_handle = self._log_path.open("w", encoding="utf-8")
             try:
                 self._log_handle.write(f"$ {' '.join(command)}\n")
                 self._log_handle.flush()
-                self._started_at = datetime.now().isoformat(timespec="seconds")
+                self._started_at = audit_now().isoformat(timespec="seconds")
                 self._process = subprocess.Popen(
                     command,
                     cwd=self.repo_root,
@@ -91,7 +92,7 @@ class DailyRunLauncher:
             self._last = {
                 "exit_code": self._process.returncode,
                 "started_at": self._started_at,
-                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": audit_now().isoformat(timespec="seconds"),
                 "log_path": None if self._log_path is None else str(self._log_path),
             }
             self._process = None

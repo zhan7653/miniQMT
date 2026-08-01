@@ -14,7 +14,6 @@ import pytest
 import fundlab.agent.policy as policy_module
 from fundlab.agent import (
     AgentDecisionService,
-    AgentPolicyError,
     Charter,
     DividendCandidate,
     DividendPolicyRuntime,

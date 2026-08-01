@@ -8,10 +8,8 @@ import pytest
 
 from fundlab.strategies import AgentDecisionError, FileIntentSource, load_agent_decision
 from fundlab.trading import (
-    ExecutionPolicy,
     IntentSource,
     PortfolioState,
-    RiskPolicy,
     SimulationService,
     TradingRepository,
 )

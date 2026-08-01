@@ -2317,7 +2317,6 @@ def _validate_status_scope(
         raise SnapshotNotReadyError("Status observation has duplicate daily keys")
     if status["suspended"].isna().any():
         raise SnapshotNotReadyError("Status observation has unknown suspension fields")
-    active_rows = status.loc[~status["suspended"].astype(bool)]
     if mode == "baostock" and status[["is_st", "previous_close"]].isna().any().any():
         raise SnapshotNotReadyError(
             "BaoStock status observation has unknown ST/previous-close fields"

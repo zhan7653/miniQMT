@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from itertools import combinations
 import json
@@ -1276,7 +1276,6 @@ class HistoryDatabaseBuilder:
             name: manifest.observation_id
             for name, manifest in source_manifests.items()
         }
-        consensus_providers = tuple(source_manifests)
         consensus_backends = tuple(
             str(manifest.source_metadata.get("backend_group", name))
             for name, manifest in source_manifests.items()

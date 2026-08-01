@@ -214,13 +214,13 @@ class TradingKernel:
                 )
             if quantity <= 0:
                 continue
-            order_id = f"order-{stable_digest({
+            order_id = "order-" + stable_digest({
                 'intent_id': intent.intent_id,
                 'instrument_id': symbol,
                 'side': side,
                 'execution_date': next_session,
                 'quantity': quantity,
-            })[:24]}"
+            })[:24]
             order = Order(
                 order_id,
                 intent.intent_id,
@@ -353,9 +353,9 @@ class TradingKernel:
             current, cost = self._apply_sell(state, order, approved, amount, fees)
             realized = money(amount - fees.total - cost)
             current = replace(current, realized_pnl=money(current.realized_pnl + realized))
-        fill_id = f"fill-{stable_digest({
+        fill_id = "fill-" + stable_digest({
             'order_id': order.order_id, 'date': day, 'quantity': approved, 'price': price,
-        })[:24]}"
+        })[:24]
         reference_price = decimal_value(bar.open)
         slippage_amount = money(abs(price - reference_price) * approved)
         fill = Fill(fill_id, order.order_id, order.instrument_id, order.side, day,
@@ -465,9 +465,9 @@ class TradingKernel:
         if total > state.cash:
             raise ValueError("Buy fill exceeds available cash")
         sellable_on = self._advance_session(order.execution_date, sell_delay_sessions)
-        lot_id = f"lot-{stable_digest({
+        lot_id = "lot-" + stable_digest({
             'order_id': order.order_id, 'date': order.execution_date, 'quantity': quantity, 'price': price,
-        })[:24]}"
+        })[:24]
         lot = PositionLot(lot_id, order.instrument_id, quantity, order.execution_date, sellable_on, total)
         return replace(
             state,

@@ -25,7 +25,6 @@ from fundlab.marketdata.sources.base import (
     payload_hash,
     require_daily_scope,
     source_payload,
-    split_instrument_id,
 )
 
 

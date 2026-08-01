@@ -1,4 +1,3 @@
-from datetime import timedelta
 import json
 import multiprocessing
 
@@ -22,8 +21,6 @@ from fundlab.marketdata import (
     SnapshotPlan,
     SourceConflictError,
     SourceSlice,
-    UniverseScope,
-    CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
 )
 from tests.canonical.fixtures import DAYS, FUTURE_DAYS, fixture_universe_scope, observation
 

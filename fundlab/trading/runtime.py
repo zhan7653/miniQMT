@@ -15,7 +15,7 @@ from fundlab.trading.repository import (
     RunStatus,
     TradingRepository,
 )
-from fundlab.trading.state import ExecutionPolicy, LedgerEvent, PortfolioState
+from fundlab.trading.state import ExecutionPolicy, PortfolioState
 
 
 @runtime_checkable

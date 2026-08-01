@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Mapping, Protocol, Sequence
+from typing import Mapping, Protocol
 
 from fundlab.agent.charter import Charter, CharterError, load_charter
 from fundlab.agent.dividend import DividendCandidate, build_dividend_candidates
