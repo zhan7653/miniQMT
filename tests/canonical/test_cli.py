@@ -71,6 +71,26 @@ def test_cli_exposes_only_the_componentized_simulation_publication_flow():
     assert evidence.predecessor_snapshot_id == "predecessor"
 
 
+def test_cli_loads_only_repository_local_environment_for_custom_config(
+    tmp_path, monkeypatch,
+):
+    loaded = []
+    settings = object()
+    monkeypatch.setattr(cli_module, "load_local_environment", loaded.append)
+    monkeypatch.setattr(cli_module, "load_foundation_settings", lambda path: settings)
+    monkeypatch.setattr(
+        cli_module, "_data", lambda args, received: int(received is not settings),
+    )
+
+    result = main([
+        "--config", str(tmp_path / "external" / "fundlab.yaml"),
+        "data", "sources",
+    ])
+
+    assert result == 0
+    assert loaded == [Path(cli_module.__file__).resolve().parents[1] / ".env.local"]
+
+
 def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
     settings = load_foundation_settings(
         Path(__file__).resolve().parents[2] / "config" / "fundlab.yaml"

@@ -48,6 +48,9 @@ from fundlab.trading import (
 )
 
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _add_universe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--universe-as-of", type=date.fromisoformat)
     parser.add_argument("--history-start", type=date.fromisoformat)
@@ -261,11 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config_path = Path(args.config).resolve()
-        config_root = (
-            config_path.parent.parent
-            if config_path.parent.name == "config" else config_path.parent
-        )
-        load_local_environment(config_root / ".env.local")
+        load_local_environment(_REPOSITORY_ROOT / ".env.local")
         settings = load_foundation_settings(config_path)
         if args.command == "data":
             return _data(args, settings)
