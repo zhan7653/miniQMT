@@ -672,11 +672,20 @@ def test_same_session_factor_confirmed_split_applies_atomically(tmp_path):
 
     result = kernel.process_session(
         PortfolioState(Decimal("20000"), Decimal("10000"), (lot,)),
-        replace(market.session(DAYS[1]), ex_actions=(split,), listing_actions=(split,)),
+        replace(
+            market.session(DAYS[1]),
+            record_actions=(split,),
+            ex_actions=(split,),
+            listing_actions=(split,),
+        ),
     )
 
     assert result.state.quantity(instrument.instrument_id) == 625
     assert sum(item.cost_amount for item in result.state.lots) == Decimal("10000.00")
+    assert result.state.entitlements == ()
+    assert not any(
+        item.event_type == "corporate_action_entitlement" for item in result.events
+    )
     applied = next(item for item in result.events if item.event_type == "split_applied")
     assert applied.payload["entitlement_mode"] == "same_session_atomic"
 

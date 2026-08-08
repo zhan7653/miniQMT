@@ -1358,10 +1358,9 @@ $("#schedule-toggle").addEventListener("click", async () => {
 
 $("#schedule-delete").addEventListener("click", async () => {
   if (!window.confirm("确定删除 FundLab Daily 计划任务？")) return;
-  await scheduleAction(async () => {
-    await api("/api/schedule", { method: "DELETE" });
-    return api("/api/schedule");
-  }, "已删除");
+  await scheduleAction(() => api("/api/schedule", {
+    method: "DELETE",
+  }), "已删除");
 });
 
 async function scheduleAction(action, okMessage) {

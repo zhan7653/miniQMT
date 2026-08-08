@@ -234,6 +234,8 @@ def test_dashboard_name_cache_has_no_hardcoded_or_sticky_fallback(dashboard):
     assert 'value = "正在读取"' in script
     assert "scheduleIsRefreshing(error)" in script
     assert "scheduleIsRefreshing(error) &&" not in script
+    assert 'return api("/api/schedule");' not in script
+    assert 'method: "DELETE"' in script
     assert "data.instrument_names_pending" in script
     assert "nameRetryAttempt: nameRetryAttempt + 1" in script
 
@@ -368,7 +370,9 @@ def test_schedule_lifecycle(dashboard):
     assert disabled["enabled"] is False
 
     assert client.put("/api/schedule", json={"time": "9:99"}).status_code == 422
-    assert client.delete("/api/schedule").json()["deleted"]
+    deleted = client.delete("/api/schedule").json()
+    assert deleted["deleted"] and deleted["exists"] is False
+    assert deleted["enabled"] is None and deleted["days"] == []
     assert client.get("/api/schedule").json()["exists"] is False
 
     missing = client.put("/api/schedule", json={"enabled": True})

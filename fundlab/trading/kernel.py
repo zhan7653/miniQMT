@@ -824,10 +824,17 @@ class TradingKernel:
         self, state: PortfolioState, market: MarketSession,
     ) -> tuple[PortfolioState, tuple[LedgerEvent, ...]]:
         existing = {item.action_id for item in state.entitlements}
+        atomic_split_ids = {
+            action.action_id
+            for action in market.ex_actions
+            if action.action_type is CorporateActionType.SPLIT
+            and action.record_date == market.session_date
+            and action.ex_date == market.session_date
+        }
         entitlements = list(state.entitlements)
         events: list[LedgerEvent] = []
         for action in market.record_actions:
-            if action.action_id in existing:
+            if action.action_id in existing or action.action_id in atomic_split_ids:
                 continue
             quantity = state.quantity(action.instrument_id)
             if quantity <= 0:

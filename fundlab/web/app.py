@@ -19,7 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from fundlab.settings import FoundationSettings
 from fundlab.web.read_cache import SingleFlightReadCache
 from fundlab.web.runner import DailyRunLauncher
-from fundlab.web.schedule import TaskScheduler, TaskSchedulerError, WindowsTaskScheduler
+from fundlab.web.schedule import (
+    ScheduledTaskState,
+    TaskScheduler,
+    TaskSchedulerError,
+    WindowsTaskScheduler,
+)
 from fundlab.web.schedule_cache import CachedTaskScheduler
 from fundlab.web.service import DashboardError, DashboardService
 from fundlab.web.snapshot_cache import InstrumentNameResolver
@@ -173,7 +178,7 @@ def create_app(
             task_scheduler.delete()
         except TaskSchedulerError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"deleted": True}
+        return {"deleted": True, **ScheduledTaskState(exists=False).to_dict()}
 
     # -------------------------------------------------------------- agent
 
