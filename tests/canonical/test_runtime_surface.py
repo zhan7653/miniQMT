@@ -27,6 +27,7 @@ def test_strategies_package_exposes_only_intent_sources():
         "AgentDecision",
         "AgentDecisionError",
         "FileIntentSource",
+        "MovingAverageGridSource",
         "StaticAllocationSource",
         "load_agent_decision",
         "write_agent_decision",

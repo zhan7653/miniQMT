@@ -33,6 +33,11 @@ from fundlab.agent.price_signals import (
 from fundlab.agent.tools import AgentMemory, ReadingLibrary
 from fundlab.common.canonical import stable_digest
 from fundlab.marketdata.portal import CanonicalMarketData
+from fundlab.strategies.moving_average_grid import (
+    MovingAverageGridConfig,
+    evaluate_moving_average_grid,
+    moving_average_grid_config,
+)
 from fundlab.trading import PortfolioState
 
 
@@ -617,6 +622,71 @@ class SectorMomentumPolicy:
             f"target {allocation}"
         )
         return PolicyDecision(target_weights=weights, reason=reason, audit=audit)
+
+
+@dataclass(frozen=True)
+class MovingAverageGridPolicy:
+    """Daily wrapper around the state machine shared with historical simulation."""
+
+    config: MovingAverageGridConfig
+    runtime: PortfolioPolicyRuntime | None = field(default=None, repr=False, compare=False)
+    policy_id: str = "moving-average-grid"
+    version: str = "1"
+
+    @property
+    def config_hash(self) -> str:
+        return self.config.config_hash
+
+    def decide(self, market: CanonicalMarketData, as_of: date) -> PolicyDecision:
+        if self.runtime is None:
+            raise AgentPolicyError("moving-average-grid requires portfolio runtime state")
+        if any(
+            order.instrument_id == self.config.instrument
+            for order in self.runtime.state.pending_orders
+        ):
+            return PolicyDecision(
+                target_weights={},
+                reason="moving-average-grid holds while its prior order is pending",
+                hold=True,
+                audit={"skipped": "pending_order"},
+            )
+        evaluation = evaluate_moving_average_grid(market, as_of, self.config)
+        if evaluation is None:
+            return PolicyDecision(
+                target_weights={},
+                reason="moving-average-grid is waiting for complete indicator history",
+                hold=True,
+                audit={"skipped": "insufficient_history"},
+            )
+        last_decision = self.runtime.last_decision_date
+        if evaluation.target_weight == 0 and evaluation.last_change_date is None:
+            return PolicyDecision(
+                target_weights={},
+                reason=evaluation.reason,
+                hold=True,
+                audit={**evaluation.audit(), "skipped": "unchanged_cash"},
+            )
+        if (
+            last_decision is not None
+            and evaluation.last_change_date is not None
+            and evaluation.last_change_date < last_decision
+        ):
+            return PolicyDecision(
+                target_weights={},
+                reason=evaluation.reason,
+                hold=True,
+                audit={**evaluation.audit(), "skipped": "unchanged_grid_target"},
+            )
+        reason = (
+            f"moving-average-grid v{self.version} {self.config.instrument}: "
+            f"{evaluation.status}/{evaluation.regime}, tier {evaluation.tier}, "
+            f"target {evaluation.target_weight}; {evaluation.reason}"
+        )
+        return PolicyDecision(
+            target_weights={self.config.instrument: evaluation.target_weight},
+            reason=reason,
+            audit=evaluation.audit(),
+        )
 
 
 @dataclass(frozen=True)
@@ -2695,6 +2765,31 @@ _PARAM_WHITELIST: Mapping[str, frozenset[str]] = {
         "risk_budget",
         "max_sector_weight",
     }),
+    "moving-average-grid": frozenset({
+        "instrument",
+        "activation_date",
+        "max_weight",
+        "minimum_grid_step",
+        "moving_average_days",
+        "trend_average_days",
+        "trend_slope_days",
+        "residual_window_days",
+        "grid_step_multiplier",
+        "neutral_weight_fraction",
+        "linear_weight_step",
+        "convex_weight_step",
+        "cautious_weight_fraction",
+        "defensive_confirm_days",
+        "defensive_brake_days",
+        "reset_confirm_days",
+        "reset_band_fraction",
+        "maximum_cycle_days",
+        "pause_tier",
+        "brake_tier",
+        "startup_ramp_days",
+        "ratchet_anchor_upward",
+        "rolling_anchor",
+    }),
     "inverse-volatility": frozenset({
         "instruments",
         "volatility_days",
@@ -2873,6 +2968,13 @@ def build_policy(
                     params.get("max_sector_weight", "0.40"),
                     "max_sector_weight",
                 ),
+            )
+        if kind == "moving-average-grid":
+            if runtime is not None and not isinstance(runtime, PortfolioPolicyRuntime):
+                raise AgentPolicyError("moving-average-grid received the wrong runtime type")
+            return MovingAverageGridPolicy(
+                config=moving_average_grid_config(params),
+                runtime=runtime,
             )
         if kind == "inverse-volatility":
             return InverseVolatilityPolicy(

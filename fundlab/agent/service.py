@@ -177,7 +177,11 @@ class AgentDecisionService:
                 ),
                 force_review=force_review,
             )
-        elif policy_settings.kind in {"dividend-rules", "crisis-drawdown"}:
+        elif policy_settings.kind in {
+            "dividend-rules",
+            "crisis-drawdown",
+            "moving-average-grid",
+        }:
             last_risk_exit_date = None
             if policy_settings.kind == "crisis-drawdown":
                 raw_risks = policy_settings.params.get("risk_instruments", ())

@@ -108,7 +108,8 @@ of degrading to a hold, and the decision content is bound into the run's strateg
 replay cannot silently execute a different decision.
 
 A local producer for that contract ships in `fundlab.agent`. Its deterministic policies are
-`momentum-rotation`, month-end `dual-momentum`, `sector-momentum`, `inverse-volatility`, correlation-aware risk parity,
+`momentum-rotation`, month-end `dual-momentum`, `sector-momentum`, `moving-average-grid`,
+`inverse-volatility`, correlation-aware risk parity,
 trend/volatility targeting and liquid low-beta stocks, plus weekly `dividend-rules`, ST-removal
 momentum, tightly capped active-ST momentum, and stateful `crisis-drawdown` ETF variants; only the
 charter-bound `dividend-value` paper Agent
@@ -132,6 +133,19 @@ at most three sectors. Selected sectors share a 90% risk budget by inverse 60-se
 subject to a 40% single-sector cap; the remainder goes to `511010.SH`, including 100% defensive
 allocation when no sector qualifies. The whitelist stores explicit sector labels and instrument IDs;
 the runtime never infers a sector from an ETF name.
+
+The four `paper-ma-grid-*` accounts run one ETF each (`510050.SH`, `510300.SH`, `510500.SH`, or
+`511380.SH`) through the same daily long-only state machine. A 60-session adjusted-price average
+starts each grid cycle, then its anchor and volatility-scaled spacing are frozen until a confirmed
+neutral reset. Target weights follow a convex nine-level ladder; a falling 120-session trend limits
+new buying, persistent weakness stops it, and an extreme fifth-tier move reduces inventory toward
+the neutral allocation. Each account keeps an explicit cash reserve through its instrument-specific
+maximum weight. Historical research uses the same state machine through `PortfolioIntent`; daily
+operation remains prospective through the decision-file boundary. The long research matrix is not
+published performance: `511380.SH` runs are complete, while stock-ETF runs that held through cash
+distributions remain explicitly incomplete until an investor-tax identity is modeled; one
+`510500.SH` interval also reports an unmodeled fractional split. The kernel retains those quality
+flags instead of silently treating gross distributions as final after-tax cash.
 
 The rules-only
 dividend account is a direct comparison baseline: it requires a current trailing cash payment and
@@ -289,6 +303,10 @@ Create an isolated account after a ready canonical snapshot exists:
 uv run fundlab account create --account-id research-1 --name "Research 1" --initial-cash 1000000
 uv run fundlab simulate --account-id research-1 --start-date 2026-01-05 --end-date 2026-03-31 `
   --weight 600000.SH=0.5 --weight 510300.SH=0.5
+
+# Reuse a historically supported configured policy with an isolated research start date.
+uv run fundlab simulate --account-id research-grid-50 --start-date 2015-08-03 --end-date 2026-08-07 `
+  --policy-account-id paper-ma-grid-510050 --policy-activation-date 2015-08-03
 ```
 
 The checked-in fee schedule is a versioned simulation assumption: public taxes plus a 0.03% broker

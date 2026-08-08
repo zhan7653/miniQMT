@@ -39,7 +39,8 @@ from fundlab.marketdata import (
 )
 from fundlab.pipeline import DailyPipeline
 from fundlab.settings import FoundationSettings, load_foundation_settings
-from fundlab.strategies import StaticAllocationSource
+from fundlab.strategies import MovingAverageGridSource, StaticAllocationSource
+from fundlab.strategies.moving_average_grid import moving_average_grid_config
 from fundlab.trading import (
     PortfolioState,
     SimulationService,
@@ -227,10 +228,24 @@ def build_parser() -> argparse.ArgumentParser:
     daily_run.add_argument("--skip-accounts", action="store_true")
     daily_commands.add_parser("status", help="Show snapshot head, account heads, and configuration")
 
-    simulate = commands.add_parser("simulate", help="Run the shared kernel with a static PortfolioIntent source")
+    simulate = commands.add_parser(
+        "simulate", help="Run the shared kernel with a static or configured intent source"
+    )
     simulate.add_argument("--account-id", required=True)
     simulate.add_argument("--snapshot-id")
-    simulate.add_argument("--weight", action="append", required=True, metavar="INSTRUMENT=WEIGHT")
+    simulation_strategy = simulate.add_mutually_exclusive_group(required=True)
+    simulation_strategy.add_argument(
+        "--weight", action="append", metavar="INSTRUMENT=WEIGHT"
+    )
+    simulation_strategy.add_argument(
+        "--policy-account-id",
+        help="Use a historically supported configured deterministic Agent policy",
+    )
+    simulate.add_argument(
+        "--policy-activation-date",
+        type=date.fromisoformat,
+        help="Override the configured policy activation date for an isolated research run",
+    )
     simulate.add_argument("--seed", type=int, default=0)
     simulate.add_argument("--allow-untrusted-fees", action="store_true")
     clock = simulate.add_mutually_exclusive_group(required=True)
@@ -690,10 +705,36 @@ def _simulate(args, settings: FoundationSettings) -> int:
             "Fee schedule is not trusted for simulation; update config or pass --allow-untrusted-fees "
             "to produce an explicitly incomplete run"
         )
-    weights = _weights(args.weight)
     market = CanonicalMarketData.open(settings.paths.market_data, args.snapshot_id)
     repository = TradingRepository(settings.paths.trading_database)
-    source = StaticAllocationSource(weights)
+    if args.policy_account_id is None:
+        if args.policy_activation_date is not None:
+            raise ValueError("--policy-activation-date requires --policy-account-id")
+        source = StaticAllocationSource(_weights(args.weight))
+        decision_source: object = "static-cli-weights"
+    else:
+        declared = settings.agent.policies.get(args.policy_account_id)
+        if declared is None:
+            raise ValueError(f"Unknown configured Agent policy: {args.policy_account_id}")
+        if declared.kind != "moving-average-grid":
+            raise ValueError(
+                "Historical configured-policy simulation currently supports only "
+                "moving-average-grid"
+            )
+        grid_config = moving_average_grid_config(
+            declared.params,
+            activation_date=args.policy_activation_date,
+        )
+        source = MovingAverageGridSource(
+            grid_config,
+            preload_end_date=(args.end_date if args.start_date is not None else None),
+        )
+        decision_source = {
+            "kind": declared.kind,
+            "policy_account_id": args.policy_account_id,
+            "policy_config_hash": grid_config.config_hash,
+            "activation_date": grid_config.activation_date,
+        }
     service = SimulationService(
         market_data=market,
         repository=repository,
@@ -715,7 +756,7 @@ def _simulate(args, settings: FoundationSettings) -> int:
         )
     feedback = build_simulation_feedback(repository, outcome.run.run_id)
     report = {
-        "decision_source": "https://github.com/zhan7653/miniQMT/issues/6",
+        "decision_source": decision_source,
         "binding": outcome.run.binding,
         "feedback": feedback,
         "feedback_hash": feedback.feedback_hash,

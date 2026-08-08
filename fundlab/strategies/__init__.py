@@ -12,12 +12,14 @@ from fundlab.strategies.agent_file import (
     load_agent_decision,
     write_agent_decision,
 )
+from fundlab.strategies.moving_average_grid import MovingAverageGridSource
 from fundlab.strategies.static import StaticAllocationSource
 
 __all__ = [
     "AgentDecision",
     "AgentDecisionError",
     "FileIntentSource",
+    "MovingAverageGridSource",
     "StaticAllocationSource",
     "load_agent_decision",
     "write_agent_decision",

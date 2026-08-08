@@ -315,8 +315,20 @@ class CanonicalMarketData:
             ["ex_date", "instrument_id"], kind="stable",
         ).reset_index(drop=True)
 
-    def session(self, session_date: date) -> MarketSession:
-        symbols = tuple(self._instrument_records)
+    def session(
+        self,
+        session_date: date,
+        *,
+        instrument_ids: Iterable[str] | None = None,
+    ) -> MarketSession:
+        symbols = (
+            tuple(self._instrument_records)
+            if instrument_ids is None
+            else tuple(sorted(set(map(str, instrument_ids))))
+        )
+        unknown = set(symbols) - set(self._instrument_records)
+        if unknown:
+            raise KeyError(f"Unknown instruments in session scope: {sorted(unknown)}")
         frame = self.bars(
             symbols,
             session_date,
@@ -330,8 +342,11 @@ class CanonicalMarketData:
             )
             for row in frame.itertuples(index=False)
         }
+        symbol_set = set(symbols)
         visible_actions = tuple(
-            item for item in self._action_records if item.known_date <= session_date
+            item
+            for item in self._action_records
+            if item.known_date <= session_date and item.instrument_id in symbol_set
         )
         return MarketSession(
             session_date,
@@ -341,6 +356,56 @@ class CanonicalMarketData:
             tuple(item for item in visible_actions if item.pay_date == session_date),
             tuple(item for item in visible_actions if item.listing_date == session_date),
         )
+
+    def session_range(
+        self,
+        session_dates: Iterable[date],
+        *,
+        instrument_ids: Iterable[str],
+    ) -> Mapping[date, MarketSession]:
+        """Materialize an exact fixed-universe clock without repeated partition reads."""
+
+        days = tuple(sorted(set(session_dates)))
+        if not days:
+            return {}
+        symbols = tuple(sorted(set(map(str, instrument_ids))))
+        unknown = set(symbols) - set(self._instrument_records)
+        if unknown:
+            raise KeyError(f"Unknown instruments in session scope: {sorted(unknown)}")
+        frame = self.bars(
+            symbols,
+            days[0],
+            days[-1],
+            price_mode=PriceMode.RAW,
+            as_of=days[-1],
+        )
+        rows_by_day: dict[date, list[object]] = {day: [] for day in days}
+        for row in frame.itertuples(index=False):
+            row_day = date.fromisoformat(str(row.session_date))
+            if row_day in rows_by_day:
+                rows_by_day[row_day].append(row)
+        symbol_set = set(symbols)
+        actions = tuple(
+            item for item in self._action_records if item.instrument_id in symbol_set
+        )
+        found: dict[date, MarketSession] = {}
+        for day in days:
+            bars = {
+                row.instrument_id: _bar(
+                    row._asdict(), self._instrument_records[row.instrument_id]
+                )
+                for row in rows_by_day[day]
+            }
+            visible = tuple(item for item in actions if item.known_date <= day)
+            found[day] = MarketSession(
+                day,
+                bars,
+                tuple(item for item in visible if item.record_date == day),
+                tuple(item for item in visible if item.ex_date == day),
+                tuple(item for item in visible if item.pay_date == day),
+                tuple(item for item in visible if item.listing_date == day),
+            )
+        return found
 
 
 @dataclass(frozen=True)

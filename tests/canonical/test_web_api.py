@@ -268,6 +268,44 @@ def test_sector_momentum_profile_exposes_confirmed_sector_roles(dashboard):
     ]
 
 
+def test_moving_average_grid_profile_exposes_single_grid_instrument(dashboard):
+    _, _, settings = dashboard
+    account = DailyAccountSettings(
+        "paper-ma-grid-511380",
+        "Paper MA Grid 511380",
+        Decimal("100000"),
+        "agent-file",
+    )
+    policy = AgentPolicySettings(
+        account.account_id,
+        "moving-average-grid",
+        {
+            "instrument": "511380.SH",
+            "activation_date": "2026-08-07",
+            "max_weight": "0.85",
+            "minimum_grid_step": "0.01",
+        },
+    )
+    service = DashboardService(replace(
+        settings,
+        agent=replace(
+            settings.agent,
+            policies={**settings.agent.policies, account.account_id: policy},
+        ),
+    ))
+
+    profile = service._strategy_profile(account, {"511380.SH": "可转债ETF博时"})
+
+    assert profile["strategy_kind"] == "moving-average-grid"
+    assert profile["strategy_name"] == "自适应均线网格"
+    assert profile["strategy_universe"] == "单只 ETF＋现金"
+    assert profile["strategy_instruments"] == [{
+        "instrument_id": "511380.SH",
+        "instrument_name": "可转债ETF博时",
+        "role": "网格标的",
+    }]
+
+
 def test_dashboard_index_bypasses_stale_asset_cache(dashboard):
     client, _, _ = dashboard
 

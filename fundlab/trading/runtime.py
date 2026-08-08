@@ -201,9 +201,24 @@ class SimulationService:
         )
         current = initial_state
         run_id = begun.record.run_id
+        declared_scope = getattr(intent_source, "market_scope", None)
+        scoped_sessions = None
+        if declared_scope is not None:
+            state_scope = {
+                *(lot.instrument_id for lot in current.lots),
+                *(order.instrument_id for order in current.pending_orders),
+                *(item.instrument_id for item in current.entitlements),
+            }
+            scoped_sessions = self.market_data.session_range(
+                sessions,
+                instrument_ids=(*tuple(declared_scope), *sorted(state_scope)),
+            )
         try:
             for day in sessions:
-                market = self.market_data.session(day)
+                if scoped_sessions is None:
+                    market = self.market_data.session(day)
+                else:
+                    market = scoped_sessions[day]
                 processed = kernel.process_session(current, market)
                 current = processed.state
                 events = list(processed.events)
@@ -272,5 +287,6 @@ class SimulationService:
             or intent.strategy_config_hash != source.config_hash
         ):
             raise ValueError("Intent strategy binding does not match the run binding")
-
-
+        declared_scope = getattr(source, "market_scope", None)
+        if declared_scope is not None and not set(intent.target_weights) <= set(declared_scope):
+            raise ValueError("Intent target falls outside its declared fixed market scope")

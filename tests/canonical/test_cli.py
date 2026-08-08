@@ -120,6 +120,10 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
         "paper-sector-momentum",
         "paper-inverse-vol",
         "paper-low-beta",
+        "paper-ma-grid-510050",
+        "paper-ma-grid-510300",
+        "paper-ma-grid-510500",
+        "paper-ma-grid-511380",
         "paper-risk-parity",
         "paper-st-momentum",
         "paper-st-removal",
@@ -140,6 +144,13 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
     assert sector_policy.policy_id == "sector-momentum"
     assert sector_policy.whitelist_version == "cn-core-sector-etf-2026-08-08-v1"
     assert sector_policy.sector_mapping["通信设备"] == "515880.SH"
+    grid_policy = build_policy(
+        settings.agent.policies["paper-ma-grid-511380"].kind,
+        settings.agent.policies["paper-ma-grid-511380"].params,
+    )
+    assert grid_policy.policy_id == "moving-average-grid"
+    assert grid_policy.config.instrument == "511380.SH"
+    assert grid_policy.config.max_weight == Decimal("0.85")
     assert build_policy(
         settings.agent.policies["paper-inverse-vol"].kind,
         settings.agent.policies["paper-inverse-vol"].params,
@@ -209,6 +220,24 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
             "base_slippage_bps": "0", "impact_bps_at_max_participation": "0",
         },
         "risk": {"policy_id": "test", "version": "1"},
+        "agent": {"policies": {"paper-grid": {
+            "type": "moving-average-grid",
+            "instrument": "600000.SH",
+            "activation_date": DAYS[0].isoformat(),
+            "max_weight": "0.8",
+            "minimum_grid_step": "0.01",
+            "moving_average_days": 2,
+            "trend_average_days": 3,
+            "trend_slope_days": 1,
+            "residual_window_days": 2,
+            "defensive_confirm_days": 2,
+            "defensive_brake_days": 3,
+            "reset_confirm_days": 1,
+            "maximum_cycle_days": 5,
+            "pause_tier": 2,
+            "brake_tier": 3,
+            "startup_ramp_days": 1,
+        }}},
         "fees": {
             "schedule_id": "test", "version": "1", "trusted_for_simulation": True,
             "verification_note": "test fixture", "rules": [{
@@ -248,6 +277,24 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
     assert main(simulate_args) == 0
     repeated = json.loads(capsys.readouterr().out)
     assert repeated["reused"] is True and repeated["report"] == payload["report"]
+
+    assert main([
+        "--config", str(config), "account", "create", "--account-id", "grid-cli",
+        "--name", "Grid CLI", "--initial-cash", "100000",
+    ]) == 0
+    capsys.readouterr()
+    assert main([
+        "--config", str(config), "simulate", "--account-id", "grid-cli",
+        "--snapshot-id", market.snapshot_id,
+        "--policy-account-id", "paper-grid",
+        "--policy-activation-date", DAYS[0].isoformat(),
+        "--start-date", DAYS[0].isoformat(), "--end-date", DAYS[-1].isoformat(),
+    ]) == 0
+    grid_payload = json.loads(capsys.readouterr().out)
+    grid_report = json.loads(Path(grid_payload["report"]).read_text(encoding="utf-8"))
+    assert grid_report["decision_source"]["kind"] == "moving-average-grid"
+    assert grid_report["decision_source"]["policy_account_id"] == "paper-grid"
+    assert grid_report["feedback"]["orders"] == 1
 
 
 def test_agent_cli_runs_the_configured_policy_in_dry_run(

@@ -74,6 +74,12 @@ _STRATEGY_PRESENTATION: dict[str, tuple[str, str, str, bool]] = {
         "人工确认的 A 股行业 ETF 池",
         False,
     ),
+    "moving-average-grid": (
+        "自适应均线网格",
+        "围绕冻结的 60 日均线锚点分档交易，以波动率调整格距，并用长期趋势限制下跌中的新增仓位。",
+        "单只 ETF＋现金",
+        False,
+    ),
     "inverse-volatility": (
         "逆波动率配置",
         "月末按历史波动率的倒数分配权重，让低波动 ETF 获得更高权重。",
@@ -1173,6 +1179,7 @@ def _configured_instruments(
     for instrument_id in params.get("instruments") or ():
         add(instrument_id, "配置池")
     add(params.get("risk_instrument"), "风险资产")
+    add(params.get("instrument"), "网格标的")
     add(params.get("defensive_instrument"), "防守资产")
     add(params.get("benchmark_instrument"), "业绩基准")
 

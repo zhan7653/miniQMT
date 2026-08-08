@@ -82,6 +82,11 @@ def test_observation_snapshot_and_point_in_time_portal_are_immutable(tmp_path):
     )
     assert list(bars["source_provider"].unique()) == ["fixture"]
     assert list(bars["source_observation_id"].unique()) == [observed.observation_id]
+    batched = portal.session_range(DAYS[:2], instrument_ids=("600000.SH",))
+    assert batched == {
+        day: portal.session(day, instrument_ids=("600000.SH",))
+        for day in DAYS[:2]
+    }
     with pytest.raises(ValueError, match="point-in-time"):
         portal.adjusted_history(["600000.SH"], DAYS[0], DAYS[2], as_of=DAYS[1])
 

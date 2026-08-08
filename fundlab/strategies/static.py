@@ -31,6 +31,10 @@ class StaticAllocationSource:
             "target_weights": self.target_weights,
         })
 
+    @property
+    def market_scope(self) -> tuple[str, ...]:
+        return tuple(self.target_weights)
+
     def decide(
         self,
         *,

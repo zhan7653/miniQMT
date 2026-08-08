@@ -44,6 +44,22 @@ daily:
       name: "Paper China Sector Momentum"
       initial_cash: "1000000"
       strategy: agent-file
+    - account_id: paper-ma-grid-510050
+      name: "Paper MA Grid 510050"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-ma-grid-510300
+      name: "Paper MA Grid 510300"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-ma-grid-510500
+      name: "Paper MA Grid 510500"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-ma-grid-511380
+      name: "Paper MA Grid 511380"
+      initial_cash: "1000000"
+      strategy: agent-file
     - account_id: paper-inverse-vol
       name: "Paper Inverse Volatility"
       initial_cash: "1000000"
@@ -211,6 +227,106 @@ agent:
       select_count: 3
       risk_budget: "0.90"
       max_sector_weight: "0.40"
+    paper-ma-grid-510050:
+      type: moving-average-grid
+      instrument: 510050.SH
+      activation_date: "2026-08-07"
+      max_weight: "0.80"
+      minimum_grid_step: "0.015"
+      moving_average_days: 60
+      trend_average_days: 120
+      trend_slope_days: 20
+      residual_window_days: 120
+      grid_step_multiplier: "0.50"
+      neutral_weight_fraction: "0.50"
+      linear_weight_step: "0.08"
+      convex_weight_step: "0.0125"
+      cautious_weight_fraction: "0.70"
+      defensive_confirm_days: 5
+      defensive_brake_days: 20
+      reset_confirm_days: 5
+      reset_band_fraction: "0.25"
+      maximum_cycle_days: 120
+      pause_tier: 4
+      brake_tier: 5
+      startup_ramp_days: 3
+      ratchet_anchor_upward: false
+      rolling_anchor: false
+    paper-ma-grid-510300:
+      type: moving-average-grid
+      instrument: 510300.SH
+      activation_date: "2026-08-07"
+      max_weight: "0.75"
+      minimum_grid_step: "0.015"
+      moving_average_days: 60
+      trend_average_days: 120
+      trend_slope_days: 20
+      residual_window_days: 120
+      grid_step_multiplier: "0.50"
+      neutral_weight_fraction: "0.50"
+      linear_weight_step: "0.08"
+      convex_weight_step: "0.0125"
+      cautious_weight_fraction: "0.70"
+      defensive_confirm_days: 5
+      defensive_brake_days: 20
+      reset_confirm_days: 5
+      reset_band_fraction: "0.25"
+      maximum_cycle_days: 120
+      pause_tier: 4
+      brake_tier: 5
+      startup_ramp_days: 3
+      ratchet_anchor_upward: false
+      rolling_anchor: false
+    paper-ma-grid-510500:
+      type: moving-average-grid
+      instrument: 510500.SH
+      activation_date: "2026-08-07"
+      max_weight: "0.55"
+      minimum_grid_step: "0.020"
+      moving_average_days: 60
+      trend_average_days: 120
+      trend_slope_days: 20
+      residual_window_days: 120
+      grid_step_multiplier: "0.50"
+      neutral_weight_fraction: "0.50"
+      linear_weight_step: "0.08"
+      convex_weight_step: "0.0125"
+      cautious_weight_fraction: "0.70"
+      defensive_confirm_days: 5
+      defensive_brake_days: 20
+      reset_confirm_days: 5
+      reset_band_fraction: "0.25"
+      maximum_cycle_days: 120
+      pause_tier: 4
+      brake_tier: 5
+      startup_ramp_days: 3
+      ratchet_anchor_upward: false
+      rolling_anchor: false
+    paper-ma-grid-511380:
+      type: moving-average-grid
+      instrument: 511380.SH
+      activation_date: "2026-08-07"
+      max_weight: "0.85"
+      minimum_grid_step: "0.010"
+      moving_average_days: 60
+      trend_average_days: 120
+      trend_slope_days: 20
+      residual_window_days: 120
+      grid_step_multiplier: "0.50"
+      neutral_weight_fraction: "0.50"
+      linear_weight_step: "0.08"
+      convex_weight_step: "0.0125"
+      cautious_weight_fraction: "0.70"
+      defensive_confirm_days: 5
+      defensive_brake_days: 20
+      reset_confirm_days: 5
+      reset_band_fraction: "0.25"
+      maximum_cycle_days: 120
+      pause_tier: 4
+      brake_tier: 5
+      startup_ramp_days: 3
+      ratchet_anchor_upward: false
+      rolling_anchor: false
     paper-inverse-vol:
       type: inverse-volatility
       instruments: [510300.SH, 511010.SH, 518880.SH]
