@@ -308,6 +308,200 @@ def test_dual_momentum_selects_positive_relative_leaders_and_defensive_fallback(
     assert defensive.target_weights == {"D.SH": Decimal("1")}
 
 
+def sector_policy_params(**overrides):
+    params = {
+        "whitelist_version": "cn-sector-etf-v1",
+        "sector_mapping": {
+            "bank": "A.SH",
+            "broker": "B.SH",
+            "consumer": "C.SH",
+            "health": "E.SH",
+        },
+        "defensive_instrument": "D.SH",
+        "short_momentum_days": 20,
+        "medium_momentum_days": 60,
+        "long_momentum_days": 120,
+        "short_weight": "0.20",
+        "medium_weight": "0.30",
+        "long_weight": "0.50",
+        "volatility_days": 60,
+        "select_count": 3,
+        "risk_budget": "0.90",
+        "max_sector_weight": "0.40",
+    }
+    params.update(overrides)
+    return params
+
+
+def sector_snapshot(
+    instrument_id,
+    short=0.10,
+    medium=0.10,
+    long=0.10,
+    volatility=0.20,
+):
+    return feature_snapshot(
+        instrument_id,
+        momentum={20: short, 60: medium, 120: long},
+        volatility={60: volatility},
+    )
+
+
+def test_sector_momentum_selects_top_three_caps_inverse_volatility_and_defends():
+    policy = build_policy("sector-momentum", sector_policy_params())
+    snapshots = {
+        "A.SH": sector_snapshot(
+            "A.SH",
+            short=0.20,
+            medium=0.20,
+            long=0.20,
+            volatility=0.10,
+        ),
+        "B.SH": sector_snapshot(
+            "B.SH",
+            short=0.15,
+            medium=0.15,
+            long=0.15,
+            volatility=0.20,
+        ),
+        "C.SH": sector_snapshot("C.SH", volatility=0.40),
+        "E.SH": sector_snapshot("E.SH", short=-0.1, medium=-0.1, long=-0.1),
+        "D.SH": feature_snapshot("D.SH"),
+    }
+    decision = policy.decide_from_snapshots(snapshots)
+    assert decision.audit["selected_sectors"] == ["bank", "broker", "consumer"]
+    assert decision.target_weights["A.SH"] == Decimal("0.40")
+    assert float(decision.target_weights["B.SH"]) == pytest.approx(1 / 3)
+    assert float(decision.target_weights["C.SH"]) == pytest.approx(1 / 6)
+    assert decision.target_weights["D.SH"] == Decimal("0.10")
+    assert sum(decision.target_weights.values()) == Decimal("1")
+
+    falling = {
+        key: sector_snapshot(key, short=-0.1, medium=-0.05, long=-0.01)
+        for key in ("A.SH", "B.SH", "C.SH", "E.SH")
+    }
+    falling["D.SH"] = feature_snapshot("D.SH")
+    assert policy.decide_from_snapshots(falling).target_weights == {
+        "D.SH": Decimal("1")
+    }
+
+
+def test_sector_momentum_requires_positive_long_and_composite_momentum():
+    policy = build_policy("sector-momentum", sector_policy_params())
+    snapshots = {
+        # Positive composite, but a negative long signal.
+        "A.SH": sector_snapshot("A.SH", short=0.50, medium=0.50, long=-0.01),
+        # Positive long signal, but a negative composite.
+        "B.SH": sector_snapshot("B.SH", short=-0.50, medium=-0.50, long=0.01),
+        "C.SH": sector_snapshot("C.SH", short=0.02, medium=0.02, long=0.02),
+        "E.SH": sector_snapshot("E.SH", short=-0.10, medium=-0.10, long=-0.10),
+        "D.SH": feature_snapshot("D.SH"),
+    }
+
+    decision = policy.decide_from_snapshots(snapshots)
+
+    assert decision.audit["selected_sectors"] == ["consumer"]
+    assert Decimal(decision.audit["scores"]["bank"]) > 0
+    assert Decimal(decision.audit["momentum"]["broker"]["120"]) > 0
+    assert decision.target_weights == {
+        "C.SH": Decimal("0.40"),
+        "D.SH": Decimal("0.60"),
+    }
+
+
+def test_sector_momentum_fails_closed_and_validates_cadence_hash_and_params(
+    monkeypatch,
+):
+    policy = build_policy("sector-momentum", sector_policy_params())
+    with pytest.raises(AgentPolicyError, match="lacks 60 return observations"):
+        policy.decide_from_snapshots({
+            "A.SH": sector_snapshot("A.SH"),
+            "B.SH": sector_snapshot("B.SH"),
+            "C.SH": feature_snapshot(
+                "C.SH",
+                momentum={20: 0.1, 60: 0.1, 120: 0.1},
+            ),
+            "E.SH": sector_snapshot("E.SH"),
+            "D.SH": feature_snapshot("D.SH"),
+        })
+    with pytest.raises(AgentPolicyError, match="duplicate ETF"):
+        build_policy(
+            "sector-momentum",
+            sector_policy_params(
+                sector_mapping={
+                    "bank": "A.SH",
+                    "broker": "A.SH",
+                    "consumer": "C.SH",
+                }
+            ),
+        )
+    with pytest.raises(AgentPolicyError, match="defensive_instrument"):
+        build_policy(
+            "sector-momentum",
+            sector_policy_params(defensive_instrument="A.SH"),
+        )
+    with pytest.raises(
+        AgentPolicyError,
+        match="weights must be positive and sum to 1",
+    ):
+        build_policy(
+            "sector-momentum",
+            sector_policy_params(short_weight="0"),
+        )
+    with pytest.raises(AgentPolicyError, match="Unknown sector-momentum params"):
+        build_policy("sector-momentum", sector_policy_params(typo=True))
+    assert policy.config_hash != build_policy(
+        "sector-momentum",
+        sector_policy_params(whitelist_version="v2"),
+    ).config_hash
+    assert policy.config_hash != build_policy(
+        "sector-momentum",
+        sector_policy_params(
+            sector_mapping={
+                "bank": "A.SH",
+                "broker": "B.SH",
+                "consumer": "C.SH",
+                "health": "F.SH",
+            }
+        ),
+    ).config_hash
+
+    class NotMonthEnd:
+        @staticmethod
+        def next_trading_day(day):
+            assert day == date(2026, 7, 30)
+            return date(2026, 7, 31)
+
+    monkeypatch.setattr(
+        policy_module,
+        "build_instrument_snapshots",
+        lambda *args, **kwargs: pytest.fail("non-month-end must hold"),
+    )
+    assert policy.decide(NotMonthEnd(), date(2026, 7, 30)).hold
+
+    custom = build_policy(
+        "sector-momentum",
+        sector_policy_params(
+            short_momentum_days=21,
+            medium_momentum_days=61,
+            long_momentum_days=121,
+            volatility_days=61,
+        ),
+    )
+    custom_snapshots = {
+        key: feature_snapshot(
+            key,
+            momentum={21: 0.1, 61: 0.1, 121: 0.1},
+            volatility={61: 0.2},
+        )
+        for key in ("A.SH", "B.SH", "C.SH", "E.SH")
+    }
+    custom_snapshots["D.SH"] = feature_snapshot("D.SH")
+    custom_decision = custom.decide_from_snapshots(custom_snapshots)
+    assert set(custom_decision.audit["momentum"]["bank"]) == {"21", "61", "121"}
+    assert "21/61/121 composite momentum" in custom_decision.reason
+
+
 def test_inverse_volatility_caps_concentration_and_fails_without_history():
     policy = build_policy("inverse-volatility", {
         "instruments": ["A.SH", "B.SH", "C.SH"],

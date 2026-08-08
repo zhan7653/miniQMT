@@ -40,6 +40,10 @@ daily:
       name: "Paper Dual Momentum"
       initial_cash: "1000000"
       strategy: agent-file
+    - account_id: paper-sector-momentum
+      name: "Paper China Sector Momentum"
+      initial_cash: "1000000"
+      strategy: agent-file
     - account_id: paper-inverse-vol
       name: "Paper Inverse Volatility"
       initial_cash: "1000000"
@@ -178,6 +182,35 @@ agent:
       long_momentum_days: 120
       select_count: 2
       threshold: "0"
+    paper-sector-momentum:
+      type: sector-momentum
+      # Manually confirmed against official fund/index disclosures on 2026-08-08.
+      # Changing any member requires a new version; names are precise index buckets,
+      # not classifications inferred from ETF display names at runtime.
+      whitelist_version: "cn-core-sector-etf-2026-08-08-v1"
+      sector_mapping:
+        银行: 512800.SH
+        证券公司: 512880.SH
+        主要消费: 159928.SZ
+        医药卫生: 512010.SH
+        半导体产品与设备: 512480.SH
+        通信设备: 515880.SH
+        计算机: 159998.SZ
+        国防军工: 512660.SH
+        有色金属: 512400.SH
+        煤炭: 515220.SH
+        房地产: 512200.SH
+      defensive_instrument: 511010.SH
+      short_momentum_days: 20
+      medium_momentum_days: 60
+      long_momentum_days: 120
+      short_weight: "0.20"
+      medium_weight: "0.30"
+      long_weight: "0.50"
+      volatility_days: 60
+      select_count: 3
+      risk_budget: "0.90"
+      max_sector_weight: "0.40"
     paper-inverse-vol:
       type: inverse-volatility
       instruments: [510300.SH, 511010.SH, 518880.SH]

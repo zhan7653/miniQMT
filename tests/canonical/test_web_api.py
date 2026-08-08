@@ -212,6 +212,62 @@ def test_overview_reports_market_accounts_and_schedule(dashboard):
     assert "error" in degraded["schedule"], "overview must degrade, not fail, when the scheduler errors"
 
 
+def test_sector_momentum_profile_exposes_confirmed_sector_roles(dashboard):
+    _, _, settings = dashboard
+    account = DailyAccountSettings(
+        "paper-sector-momentum",
+        "Paper China Sector Momentum",
+        Decimal("100000"),
+        "agent-file",
+    )
+    sector_policy = AgentPolicySettings(
+        "paper-sector-momentum",
+        "sector-momentum",
+        {
+            "whitelist_version": "cn-core-sector-etf-2026-08-08-v1",
+            "sector_mapping": {
+                "银行": "512800.SH",
+                "证券公司": "512880.SH",
+            },
+            "defensive_instrument": "511010.SH",
+        },
+    )
+    service = DashboardService(replace(
+        settings,
+        agent=replace(
+            settings.agent,
+            policies={**settings.agent.policies, account.account_id: sector_policy},
+        ),
+    ))
+
+    profile = service._strategy_profile(account, {
+        "512800.SH": "银行ETF华宝",
+        "512880.SH": "证券ETF国泰",
+        "511010.SH": "国债ETF",
+    })
+
+    assert profile["strategy_kind"] == "sector-momentum"
+    assert profile["strategy_name"] == "行业动量轮动"
+    assert profile["strategy_universe"] == "人工确认的 A 股行业 ETF 池"
+    assert profile["strategy_instruments"] == [
+        {
+            "instrument_id": "512800.SH",
+            "instrument_name": "银行ETF华宝",
+            "role": "行业池：银行",
+        },
+        {
+            "instrument_id": "512880.SH",
+            "instrument_name": "证券ETF国泰",
+            "role": "行业池：证券公司",
+        },
+        {
+            "instrument_id": "511010.SH",
+            "instrument_name": "国债ETF",
+            "role": "防守资产",
+        },
+    ]
+
+
 def test_dashboard_index_bypasses_stale_asset_cache(dashboard):
     client, _, _ = dashboard
 

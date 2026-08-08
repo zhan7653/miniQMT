@@ -333,6 +333,292 @@ class DualMomentumPolicy:
         )
 
 
+def _sector_mapping(raw: object) -> Mapping[str, str]:
+    if not isinstance(raw, Mapping) or not raw:
+        raise AgentPolicyError(
+            "sector_mapping must be a non-empty mapping of sector -> ETF"
+        )
+    mapping: dict[str, str] = {}
+    instrument_ids: set[str] = set()
+    for raw_sector, raw_instrument in raw.items():
+        sector = str(raw_sector).strip()
+        instrument_id = str(raw_instrument).strip()
+        if not sector or not instrument_id:
+            raise AgentPolicyError(
+                "sector_mapping contains an empty sector or instrument id"
+            )
+        if sector in mapping:
+            raise AgentPolicyError(
+                f"sector_mapping contains duplicate sector {sector!r}"
+            )
+        if instrument_id in instrument_ids:
+            raise AgentPolicyError(
+                f"sector_mapping contains duplicate ETF {instrument_id!r}"
+            )
+        mapping[sector] = instrument_id
+        instrument_ids.add(instrument_id)
+    return dict(sorted(mapping.items()))
+
+
+def _capped_inverse_volatility_allocation(
+    volatilities: Mapping[str, Decimal],
+    risk_budget: Decimal,
+    max_weight: Decimal,
+) -> dict[str, Decimal]:
+    """Allocate as much of ``risk_budget`` as the position cap permits."""
+
+    inverses = {key: Decimal("1") / value for key, value in volatilities.items()}
+    remaining = set(inverses)
+    remaining_budget = risk_budget
+    allocated: dict[str, Decimal] = {}
+    while remaining and remaining_budget > 0:
+        ordered = sorted(remaining)
+        total_inverse = sum(inverses[key] for key in ordered)
+        proposals = {
+            key: remaining_budget * inverses[key] / total_inverse for key in ordered
+        }
+        capped = [key for key in ordered if proposals[key] > max_weight]
+        if capped:
+            for key in capped:
+                allocated[key] = max_weight
+                remaining.remove(key)
+                remaining_budget -= max_weight
+            continue
+        for key in ordered[:-1]:
+            allocated[key] = proposals[key]
+        allocated[ordered[-1]] = remaining_budget - sum(
+            allocated[key] for key in ordered[:-1]
+        )
+        remaining.clear()
+    return dict(sorted(allocated.items()))
+
+
+@dataclass(frozen=True)
+class SectorMomentumPolicy:
+    """Monthly rotation across a versioned, manually declared sector ETF pool."""
+
+    whitelist_version: str
+    sector_mapping: Mapping[str, str]
+    defensive_instrument: str
+    short_momentum_days: int = 20
+    medium_momentum_days: int = 60
+    long_momentum_days: int = 120
+    short_weight: Decimal = Decimal("0.20")
+    medium_weight: Decimal = Decimal("0.30")
+    long_weight: Decimal = Decimal("0.50")
+    volatility_days: int = 60
+    select_count: int = 3
+    risk_budget: Decimal = Decimal("0.90")
+    max_sector_weight: Decimal = Decimal("0.40")
+    policy_id: str = "sector-momentum"
+    version: str = "1"
+
+    def __post_init__(self) -> None:
+        whitelist_version = self.whitelist_version.strip()
+        if not whitelist_version:
+            raise AgentPolicyError("whitelist_version cannot be empty")
+        mapping = _sector_mapping(self.sector_mapping)
+        defensive = self.defensive_instrument.strip()
+        if not defensive or defensive in mapping.values():
+            raise AgentPolicyError(
+                "defensive_instrument must be non-empty and outside sector_mapping"
+            )
+        if (
+            self.short_momentum_days < 1
+            or self.medium_momentum_days <= self.short_momentum_days
+            or self.long_momentum_days <= self.medium_momentum_days
+            or self.volatility_days < 2
+        ):
+            raise AgentPolicyError("sector momentum and volatility windows are invalid")
+        weights = tuple(
+            _decimal(value, label)
+            for value, label in (
+                (self.short_weight, "short_weight"),
+                (self.medium_weight, "medium_weight"),
+                (self.long_weight, "long_weight"),
+            )
+        )
+        if any(weight <= 0 for weight in weights) or sum(weights) != Decimal("1"):
+            raise AgentPolicyError(
+                "sector momentum weights must be positive and sum to 1"
+            )
+        risk_budget = _decimal(self.risk_budget, "risk_budget")
+        max_sector_weight = _decimal(
+            self.max_sector_weight,
+            "max_sector_weight",
+        )
+        if not Decimal("0") < risk_budget <= Decimal("1"):
+            raise AgentPolicyError("risk_budget must be in (0, 1]")
+        if not Decimal("0") < max_sector_weight <= risk_budget:
+            raise AgentPolicyError("max_sector_weight must be in (0, risk_budget]")
+        if not 1 <= self.select_count <= len(mapping):
+            raise AgentPolicyError("select_count must fit inside sector_mapping")
+        object.__setattr__(self, "whitelist_version", whitelist_version)
+        object.__setattr__(self, "sector_mapping", mapping)
+        object.__setattr__(self, "defensive_instrument", defensive)
+        object.__setattr__(self, "short_weight", weights[0])
+        object.__setattr__(self, "medium_weight", weights[1])
+        object.__setattr__(self, "long_weight", weights[2])
+        object.__setattr__(self, "risk_budget", risk_budget)
+        object.__setattr__(self, "max_sector_weight", max_sector_weight)
+
+    @property
+    def instrument_ids(self) -> tuple[str, ...]:
+        return (*self.sector_mapping.values(), self.defensive_instrument)
+
+    @property
+    def config_hash(self) -> str:
+        return stable_digest({
+            "policy_id": self.policy_id,
+            "version": self.version,
+            "whitelist_version": self.whitelist_version,
+            "sector_mapping": self.sector_mapping,
+            "defensive_instrument": self.defensive_instrument,
+            "short_momentum_days": self.short_momentum_days,
+            "medium_momentum_days": self.medium_momentum_days,
+            "long_momentum_days": self.long_momentum_days,
+            "short_weight": self.short_weight,
+            "medium_weight": self.medium_weight,
+            "long_weight": self.long_weight,
+            "volatility_days": self.volatility_days,
+            "select_count": self.select_count,
+            "risk_budget": self.risk_budget,
+            "max_sector_weight": self.max_sector_weight,
+            "cadence": "month_end",
+        })
+
+    def decide(self, market: CanonicalMarketData, as_of: date) -> PolicyDecision:
+        if not _last_session_of_month(market, as_of):
+            return PolicyDecision(
+                target_weights={},
+                reason=f"sector-momentum: {as_of.isoformat()} is not month end",
+                hold=True,
+                audit={"cadence": "month_end"},
+            )
+        snapshots = build_instrument_snapshots(
+            market,
+            self.instrument_ids,
+            as_of=as_of,
+            windows=(
+                self.short_momentum_days,
+                self.medium_momentum_days,
+                self.long_momentum_days,
+                self.volatility_days,
+            ),
+        )
+        return self.decide_from_snapshots(snapshots)
+
+    def decide_from_snapshots(
+        self,
+        snapshots: Mapping[str, InstrumentSnapshot],
+    ) -> PolicyDecision:
+        defensive = snapshots.get(self.defensive_instrument)
+        if defensive is None or defensive.last_close is None:
+            raise AgentPolicyError(
+                "Defensive instrument lacks a trustworthy current price"
+            )
+        scored: list[tuple[Decimal, str, str]] = []
+        scores: dict[str, str] = {}
+        momenta: dict[str, dict[str, str]] = {}
+        volatilities: dict[str, Decimal] = {}
+        for sector, instrument_id in self.sector_mapping.items():
+            snapshot = snapshots.get(instrument_id)
+            if snapshot is None or snapshot.last_close is None:
+                raise AgentPolicyError(
+                    f"{instrument_id} lacks a trustworthy current price; refusing to guess"
+                )
+            short = snapshot.momentum_for(self.short_momentum_days)
+            medium = snapshot.momentum_for(self.medium_momentum_days)
+            long = snapshot.momentum_for(self.long_momentum_days)
+            volatility = snapshot.volatility_for(self.volatility_days)
+            if short is None or medium is None or long is None:
+                raise AgentPolicyError(
+                    f"{instrument_id} lacks sector momentum history; refusing to guess"
+                )
+            if volatility is None:
+                raise AgentPolicyError(
+                    f"{instrument_id} lacks {self.volatility_days} return observations; "
+                    "refusing to guess"
+                )
+            short_value = Decimal(str(short))
+            medium_value = Decimal(str(medium))
+            long_value = Decimal(str(long))
+            volatility_value = Decimal(str(volatility))
+            if volatility_value <= 0:
+                raise AgentPolicyError(
+                    f"{instrument_id} has non-positive realized volatility; "
+                    "refusing to divide"
+                )
+            score = (
+                self.short_weight * short_value
+                + self.medium_weight * medium_value
+                + self.long_weight * long_value
+            )
+            scores[sector] = str(score)
+            momenta[sector] = {
+                str(self.short_momentum_days): str(short_value),
+                str(self.medium_momentum_days): str(medium_value),
+                str(self.long_momentum_days): str(long_value),
+            }
+            volatilities[instrument_id] = volatility_value
+            if long_value > 0 and score > 0:
+                scored.append((score, sector, instrument_id))
+        selected = sorted(
+            scored,
+            key=lambda item: (-item[0], item[1], item[2]),
+        )[: self.select_count]
+        selected_sectors = [sector for _, sector, _ in selected]
+        audit: dict[str, object] = {
+            "whitelist_version": self.whitelist_version,
+            "scores": scores,
+            "momentum": momenta,
+            "selected_sectors": selected_sectors,
+        }
+        if not selected:
+            return PolicyDecision(
+                target_weights={self.defensive_instrument: Decimal("1")},
+                reason=(
+                    f"sector-momentum v{self.version} whitelist "
+                    f"{self.whitelist_version}: no sector meets positive "
+                    f"{self.long_momentum_days}-session and composite momentum; defensive"
+                ),
+                audit=audit,
+            )
+        selected_volatilities = {
+            instrument_id: volatilities[instrument_id]
+            for _, _, instrument_id in selected
+        }
+        weights = _capped_inverse_volatility_allocation(
+            selected_volatilities,
+            self.risk_budget,
+            self.max_sector_weight,
+        )
+        weights[self.defensive_instrument] = Decimal("1") - sum(weights.values())
+        weights = dict(sorted(weights.items()))
+        audit.update({
+            "annualized_volatility": {
+                key: str(value) for key, value in selected_volatilities.items()
+            },
+            "selected_instruments": [
+                instrument_id for _, _, instrument_id in selected
+            ],
+            "risk_budget": str(self.risk_budget),
+            "max_sector_weight": str(self.max_sector_weight),
+        })
+        allocation = " ".join(
+            f"{instrument_id}={weight:.6f}"
+            for instrument_id, weight in weights.items()
+        )
+        reason = (
+            f"sector-momentum v{self.version} whitelist {self.whitelist_version}: "
+            f"selected {selected_sectors}; {self.short_momentum_days}/"
+            f"{self.medium_momentum_days}/{self.long_momentum_days} composite momentum "
+            f"with {self.volatility_days}-session inverse-volatility weights; "
+            f"target {allocation}"
+        )
+        return PolicyDecision(target_weights=weights, reason=reason, audit=audit)
+
+
 @dataclass(frozen=True)
 class InverseVolatilityPolicy:
     """Monthly capped inverse-volatility allocation over declared ETFs."""
@@ -2394,6 +2680,21 @@ _PARAM_WHITELIST: Mapping[str, frozenset[str]] = {
         "select_count",
         "threshold",
     }),
+    "sector-momentum": frozenset({
+        "whitelist_version",
+        "sector_mapping",
+        "defensive_instrument",
+        "short_momentum_days",
+        "medium_momentum_days",
+        "long_momentum_days",
+        "short_weight",
+        "medium_weight",
+        "long_weight",
+        "volatility_days",
+        "select_count",
+        "risk_budget",
+        "max_sector_weight",
+    }),
     "inverse-volatility": frozenset({
         "instruments",
         "volatility_days",
@@ -2538,6 +2839,40 @@ def build_policy(
                 long_momentum_days=int(str(params.get("long_momentum_days", 120))),
                 select_count=int(str(params.get("select_count", 2))),
                 threshold=_decimal(params.get("threshold", "0"), "threshold"),
+            )
+        if kind == "sector-momentum":
+            return SectorMomentumPolicy(
+                whitelist_version=str(params["whitelist_version"]),
+                sector_mapping=params["sector_mapping"],
+                defensive_instrument=str(params["defensive_instrument"]),
+                short_momentum_days=int(str(
+                    params.get("short_momentum_days", 20)
+                )),
+                medium_momentum_days=int(str(
+                    params.get("medium_momentum_days", 60)
+                )),
+                long_momentum_days=int(str(
+                    params.get("long_momentum_days", 120)
+                )),
+                short_weight=_decimal(
+                    params.get("short_weight", "0.20"),
+                    "short_weight",
+                ),
+                medium_weight=_decimal(
+                    params.get("medium_weight", "0.30"),
+                    "medium_weight",
+                ),
+                long_weight=_decimal(
+                    params.get("long_weight", "0.50"),
+                    "long_weight",
+                ),
+                volatility_days=int(str(params.get("volatility_days", 60))),
+                select_count=int(str(params.get("select_count", 3))),
+                risk_budget=_decimal(params.get("risk_budget", "0.90"), "risk_budget"),
+                max_sector_weight=_decimal(
+                    params.get("max_sector_weight", "0.40"),
+                    "max_sector_weight",
+                ),
             )
         if kind == "inverse-volatility":
             return InverseVolatilityPolicy(

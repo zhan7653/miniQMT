@@ -68,6 +68,12 @@ _STRATEGY_PRESENTATION: dict[str, tuple[str, str, str, bool]] = {
         "固定 ETF 池",
         False,
     ),
+    "sector-momentum": (
+        "行业动量轮动",
+        "在人工确认的行业 ETF 白名单中做多周期动量筛选，并以波动率和集中度上限控制仓位。",
+        "人工确认的 A 股行业 ETF 池",
+        False,
+    ),
     "inverse-volatility": (
         "逆波动率配置",
         "月末按历史波动率的倒数分配权重，让低波动 ETF 获得更高权重。",
@@ -1160,6 +1166,10 @@ def _configured_instruments(
             add(instrument_id, "目标配置")
     for instrument_id in params.get("risk_instruments") or ():
         add(instrument_id, "风险池")
+    sector_mapping = params.get("sector_mapping") or {}
+    if isinstance(sector_mapping, Mapping):
+        for sector, instrument_id in sector_mapping.items():
+            add(instrument_id, f"行业池：{sector}")
     for instrument_id in params.get("instruments") or ():
         add(instrument_id, "配置池")
     add(params.get("risk_instrument"), "风险资产")

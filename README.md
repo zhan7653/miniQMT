@@ -108,7 +108,7 @@ of degrading to a hold, and the decision content is bound into the run's strateg
 replay cannot silently execute a different decision.
 
 A local producer for that contract ships in `fundlab.agent`. Its deterministic policies are
-`momentum-rotation`, month-end `dual-momentum`, `inverse-volatility`, correlation-aware risk parity,
+`momentum-rotation`, month-end `dual-momentum`, `sector-momentum`, `inverse-volatility`, correlation-aware risk parity,
 trend/volatility targeting and liquid low-beta stocks, plus weekly `dividend-rules`, ST-removal
 momentum, tightly capped active-ST momentum, and stateful `crisis-drawdown` ETF variants; only the
 charter-bound `dividend-value` paper Agent
@@ -123,7 +123,17 @@ immutable, validated evidence under `data/agent/evaluations/<account>/<as_of>/`;
 enter that history, and an evidence-write failure prevents that account from publishing a new
 decision. The dashboard reads those saved evaluations instead of recomputing signals on page load,
 separates signal / queued decision / simulated execution, retains snapshot/config revisions, and
-marks accounts whose return path contains a manual decision. The rules-only
+marks accounts whose return path contains a manual decision.
+
+`paper-sector-momentum` is a prospective monthly rotation account over a manually confirmed,
+versioned set of eleven domestic sector ETFs. It combines 20/60/120-session adjusted momentum at
+20%/30%/50%, requires both positive 120-session momentum and a positive composite score, and selects
+at most three sectors. Selected sectors share a 90% risk budget by inverse 60-session volatility,
+subject to a 40% single-sector cap; the remainder goes to `511010.SH`, including 100% defensive
+allocation when no sector qualifies. The whitelist stores explicit sector labels and instrument IDs;
+the runtime never infers a sector from an ETF name.
+
+The rules-only
 dividend account is a direct comparison baseline: it requires a current trailing cash payment and
 a completed fiscal dividend no more than two years old, then ranks the eligible stocks by
 conservative sustainable yield, payout stability and liquidity. The LLM dividend Agent screens the

@@ -117,6 +117,7 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
         "paper-crash-semiconductor",
         "paper-crash-vol-control",
         "paper-dual-momentum",
+        "paper-sector-momentum",
         "paper-inverse-vol",
         "paper-low-beta",
         "paper-risk-parity",
@@ -132,6 +133,13 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
         settings.agent.policies["paper-dual-momentum"].kind,
         settings.agent.policies["paper-dual-momentum"].params,
     ).policy_id == "dual-momentum"
+    sector_policy = build_policy(
+        settings.agent.policies["paper-sector-momentum"].kind,
+        settings.agent.policies["paper-sector-momentum"].params,
+    )
+    assert sector_policy.policy_id == "sector-momentum"
+    assert sector_policy.whitelist_version == "cn-core-sector-etf-2026-08-08-v1"
+    assert sector_policy.sector_mapping["通信设备"] == "515880.SH"
     assert build_policy(
         settings.agent.policies["paper-inverse-vol"].kind,
         settings.agent.policies["paper-inverse-vol"].params,
