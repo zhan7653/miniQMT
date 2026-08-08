@@ -30,7 +30,7 @@ class DailyAccountSettings:
     weights: Mapping[str, Decimal] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.strategy not in {"static", "agent-file"}:
+        if self.strategy not in {"static", "agent-file", "moving-average-grid"}:
             raise ValueError(f"Unknown daily strategy: {self.strategy}")
         if self.strategy == "static" and not self.weights:
             raise ValueError(f"Static daily account needs weights: {self.account_id}")

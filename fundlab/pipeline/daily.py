@@ -14,6 +14,7 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -64,7 +65,12 @@ from fundlab.marketdata.contracts import (
     EXECUTION_EVIDENCE_GAP_RULE_ID,
 )
 from fundlab.settings import DailyAccountSettings, FoundationSettings
-from fundlab.strategies import FileIntentSource, StaticAllocationSource
+from fundlab.strategies import (
+    FileIntentSource,
+    MovingAverageGridSource,
+    StaticAllocationSource,
+)
+from fundlab.strategies.moving_average_grid import moving_average_grid_config
 from fundlab.trading import (
     PortfolioState,
     SimulationService,
@@ -3009,11 +3015,35 @@ class DailyPipeline:
                         head + timedelta(days=1), published_end,
                     )
             last_run_id = selected_parent
+            persistent_source = None
+            if sessions and account.strategy != "agent-file":
+                persistent_source = self._intent_source(account, sessions[0])
+                if (
+                    account.strategy == "moving-average-grid"
+                    and selected_parent is not None
+                ):
+                    assert isinstance(persistent_source, MovingAverageGridSource)
+                    previous_weight = self._last_moving_average_grid_weight(
+                        repository,
+                        selected_parent,
+                        persistent_source,
+                    )
+                    persistent_source = self._intent_source(
+                        account,
+                        sessions[0],
+                        initial_emitted_weight=previous_weight,
+                    )
             for session in sessions:
+                source = (
+                    self._intent_source(account, session)
+                    if account.strategy == "agent-file"
+                    else persistent_source
+                )
+                assert source is not None
                 outcome = service.run_daily(
                     account.account_id,
                     session,
-                    self._intent_source(account, session),
+                    source,
                 )
                 last_run_id = outcome.run.run_id
             payload: dict[str, Any] = {
@@ -3043,14 +3073,74 @@ class DailyPipeline:
                 "error": str(exc),
             }
 
-    def _intent_source(self, account: DailyAccountSettings, session: date):
+    def _intent_source(
+        self,
+        account: DailyAccountSettings,
+        session: date,
+        *,
+        initial_emitted_weight: Decimal | None = None,
+    ):
         if account.strategy == "static":
             return StaticAllocationSource(account.weights)
+        if account.strategy == "moving-average-grid":
+            policy = self.settings.agent.policies.get(account.account_id)
+            if policy is None:
+                raise ValueError(
+                    "moving-average-grid daily account has no matching policy: "
+                    f"{account.account_id}"
+                )
+            if policy.kind != "moving-average-grid":
+                raise ValueError(
+                    "moving-average-grid daily account has mismatched policy kind: "
+                    f"{account.account_id}={policy.kind}"
+                )
+            return MovingAverageGridSource(
+                moving_average_grid_config(policy.params),
+                initial_emitted_weight=initial_emitted_weight,
+            )
         return FileIntentSource(
             self.settings.daily.agent_decision_root,
             account.account_id,
             session,
         )
+
+    @staticmethod
+    def _last_moving_average_grid_weight(
+        repository: TradingRepository,
+        run_id: str,
+        source: MovingAverageGridSource,
+    ) -> Decimal | None:
+        current_run_id: str | None = run_id
+        while current_run_id is not None:
+            run = repository.run(current_run_id)
+            binding = run.binding
+            if (
+                binding.strategy_id != source.strategy_id
+                or binding.strategy_version != source.strategy_version
+                or binding.strategy_config_hash != source.config_hash
+            ):
+                return None
+            for event in reversed(repository.events(current_run_id)):
+                if event["event_type"] != "portfolio_intent_received":
+                    continue
+                payload = event["payload"]
+                if (
+                    payload.get("strategy_id") != source.strategy_id
+                    or payload.get("strategy_version") != source.strategy_version
+                    or payload.get("strategy_config_hash") != source.config_hash
+                ):
+                    continue
+                target_weights = payload.get("target_weights")
+                if not isinstance(target_weights, Mapping):
+                    raise ValueError("moving-average-grid ledger intent has invalid weights")
+                value = target_weights.get(source.config.instrument)
+                if value is None:
+                    raise ValueError(
+                        "moving-average-grid ledger intent omits its configured instrument"
+                    )
+                return Decimal(str(value))
+            current_run_id = binding.parent_run_id
+        return None
 
     # --------------------------------------------------------------- report
 

@@ -84,10 +84,12 @@ The dashboard binds to localhost only and manages nothing that the CLI does not 
 ## Agent integration
 
 The trading kernel accepts strategy decisions only as immutable `PortfolioIntent` objects through
-the `fundlab.trading.IntentSource` protocol. Two implementations ship in `fundlab.strategies`:
+the `fundlab.trading.IntentSource` protocol. Three implementations ship in `fundlab.strategies`:
 
 - `StaticAllocationSource` — fixed target weights (the `strategy: static` account type).
 - `FileIntentSource` — the out-of-process agent socket (the `strategy: agent-file` account type).
+- `MovingAverageGridSource` — the deterministic, stateful MA-grid source (the
+  `strategy: moving-average-grid` account type).
 
 An external agent — any language, any LLM harness — participates by writing one JSON file per
 account per session before the daily run, at `data/agent/decisions/<account_id>/<YYYY-MM-DD>.json`:
@@ -108,7 +110,7 @@ of degrading to a hold, and the decision content is bound into the run's strateg
 replay cannot silently execute a different decision.
 
 A local producer for that contract ships in `fundlab.agent`. Its deterministic policies are
-`momentum-rotation`, month-end `dual-momentum`, `sector-momentum`, `moving-average-grid`,
+`momentum-rotation`, month-end `dual-momentum`, `sector-momentum`,
 `inverse-volatility`, correlation-aware risk parity,
 trend/volatility targeting and liquid low-beta stocks, plus weekly `dividend-rules`, ST-removal
 momentum, tightly capped active-ST momentum, and stateful `crisis-drawdown` ETF variants; only the
@@ -141,7 +143,8 @@ neutral reset. Target weights follow a convex nine-level ladder; a falling 120-s
 new buying, persistent weakness stops it, and an extreme fifth-tier move reduces inventory toward
 the neutral allocation. Each account keeps an explicit cash reserve through its instrument-specific
 maximum weight. Historical research uses the same state machine through `PortfolioIntent`; daily
-operation remains prospective through the decision-file boundary. The long research matrix is not
+operation uses that same in-process `PortfolioIntent` source, so a signal at one session's close is
+scheduled for the next trading session's open without an extra decision-file delay. The long research matrix is not
 published performance: `511380.SH` runs are complete, while stock-ETF runs that held through cash
 distributions remain explicitly incomplete until an investor-tax identity is modeled; one
 `510500.SH` interval also reports an unmodeled fractional split. The kernel retains those quality

@@ -16,6 +16,31 @@ from fundlab.trading.state import PortfolioState
 
 
 WEIGHT_QUANTUM = Decimal("0.0001")
+MOVING_AVERAGE_GRID_PARAMS = frozenset({
+    "instrument",
+    "activation_date",
+    "max_weight",
+    "minimum_grid_step",
+    "moving_average_days",
+    "trend_average_days",
+    "trend_slope_days",
+    "residual_window_days",
+    "grid_step_multiplier",
+    "neutral_weight_fraction",
+    "linear_weight_step",
+    "convex_weight_step",
+    "cautious_weight_fraction",
+    "defensive_confirm_days",
+    "defensive_brake_days",
+    "reset_confirm_days",
+    "reset_band_fraction",
+    "maximum_cycle_days",
+    "pause_tier",
+    "brake_tier",
+    "startup_ramp_days",
+    "ratchet_anchor_upward",
+    "rolling_anchor",
+})
 
 
 @dataclass(frozen=True)
@@ -520,6 +545,7 @@ class MovingAverageGridSource:
         config: MovingAverageGridConfig,
         *,
         preload_end_date: date | None = None,
+        initial_emitted_weight: Decimal | None = None,
     ) -> None:
         self.config = config
         self._engine = MovingAverageGridEngine(config)
@@ -528,7 +554,12 @@ class MovingAverageGridSource:
         self._last_session: date | None = None
         self._last_price_date: date | None = None
         self._last_adjusted_close: float | None = None
-        self._last_emitted_weight: Decimal | None = None
+        seeded_weight = (
+            None if initial_emitted_weight is None else decimal_value(initial_emitted_weight)
+        )
+        if seeded_weight is not None and not Decimal("0") <= seeded_weight <= config.max_weight:
+            raise ValueError("initial emitted MA-grid weight is outside the configured range")
+        self._last_emitted_weight = seeded_weight
 
     @property
     def config_hash(self) -> str:
@@ -652,6 +683,12 @@ class MovingAverageGridSource:
 def moving_average_grid_config(
     params: Mapping[str, object], *, activation_date: date | None = None
 ) -> MovingAverageGridConfig:
+    unknown = set(map(str, params)) - MOVING_AVERAGE_GRID_PARAMS
+    if unknown:
+        raise ValueError(
+            f"Unknown moving-average-grid params {sorted(unknown)}; "
+            f"allowed: {sorted(MOVING_AVERAGE_GRID_PARAMS)}"
+        )
     configured_activation = activation_date or date.fromisoformat(
         str(params["activation_date"])
     )

@@ -9,13 +9,16 @@ import pytest
 
 from fundlab.agent import AgentPolicyError, PortfolioPolicyRuntime, build_policy
 from fundlab.marketdata.portal import PointInTimeMarketView
+from fundlab.pipeline.daily import DailyPipeline
 from fundlab.strategies.moving_average_grid import (
     MovingAverageGridConfig,
     MovingAverageGridEngine,
     MovingAverageGridSource,
     moving_average_grid_config,
 )
-from fundlab.trading import PortfolioState
+from fundlab.trading import PortfolioState, SimulationService, TradingRepository
+from tests.canonical.fixtures import DAYS, ready_market
+from tests.canonical.test_trading_kernel import fees, policies
 
 
 START = date(2026, 1, 1)
@@ -134,6 +137,22 @@ def test_ma_grid_hard_brake_reduces_downside_inventory_toward_neutral():
     assert hard_brake.paused is True
 
 
+def test_persistent_defense_brakes_before_the_fifth_downside_tier():
+    engine = MovingAverageGridEngine(grid_config(
+        defensive_confirm_days=2,
+        defensive_brake_days=3,
+        minimum_grid_step=Decimal("0.03"),
+    ))
+
+    evaluations = feed(engine, [100] * 8 + [94, 94, 94, 94])
+    hard_brake = next(item for item in evaluations if item and item.hard_braked)
+
+    assert hard_brake.defensive_streak == 3
+    assert hard_brake.tier == -1
+    assert hard_brake.target_fraction == Decimal("0.5617")
+    assert hard_brake.status == "hard_brake"
+
+
 def test_ma_grid_config_fails_closed_on_unsafe_boundaries_and_unknown_dates():
     with pytest.raises(ValueError, match="below trend_average_days"):
         grid_config(moving_average_days=5, trend_average_days=5)
@@ -174,7 +193,7 @@ def test_ma_grid_config_fails_closed_on_unsafe_boundaries_and_unknown_dates():
 
 @pytest.mark.parametrize("preload", [False, True])
 def test_historical_source_emits_only_changed_targets_through_portfolio_intent(preload):
-    prices = [100] * 8 + [96, 94, 92, 100, 103]
+    prices = [100] * 8 + [96, 94, 92, 100, 103, 103]
     rows = pd.DataFrame([
         {
             "instrument_id": "510050.SH",
@@ -224,3 +243,71 @@ def test_historical_source_emits_only_changed_targets_through_portfolio_intent(p
         (START + timedelta(days=11), Decimal("0.4000")),
         (START + timedelta(days=12), Decimal("0.2320")),
     ]
+
+    restarted_daily_source = MovingAverageGridSource(
+        grid_config(),
+        initial_emitted_weight=Decimal("0.2320"),
+    )
+    assert restarted_daily_source.decide(
+        account_id="research-grid",
+        market=PointInTimeMarketView(
+            FakeMarket(), START + timedelta(days=len(prices) - 1)
+        ),
+        state=state,
+    ) is None
+
+
+def test_restarted_daily_source_matches_historical_clock_exactly(tmp_path):
+    market = ready_market(tmp_path / "market")
+    repository = TradingRepository(tmp_path / "trading.sqlite3")
+    repository.create_account(
+        "paper-grid-clock",
+        "Paper Grid Clock",
+        PortfolioState.with_cash(100_000),
+    )
+    execution, risk = policies()
+    service = SimulationService(
+        market_data=market,
+        repository=repository,
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    config = MovingAverageGridConfig(
+        instrument="600000.SH",
+        activation_date=DAYS[2],
+        max_weight=Decimal("0.80"),
+        minimum_grid_step=Decimal("0.01"),
+        moving_average_days=1,
+        trend_average_days=2,
+        trend_slope_days=1,
+        residual_window_days=1,
+        startup_ramp_days=1,
+    )
+
+    historical = service.run_historical(
+        "paper-grid-clock",
+        DAYS[0],
+        DAYS[-1],
+        MovingAverageGridSource(config),
+    )
+    daily = None
+    for day in DAYS:
+        _, parent_run_id = repository.selected_state("paper-grid-clock")
+        seed = None
+        if parent_run_id is not None:
+            seed = DailyPipeline._last_moving_average_grid_weight(
+                repository,
+                parent_run_id,
+                MovingAverageGridSource(config),
+            )
+        daily = service.run_daily(
+            "paper-grid-clock",
+            day,
+            MovingAverageGridSource(config, initial_emitted_weight=seed),
+        )
+
+    assert daily is not None
+    assert daily.final_state.state_hash == historical.final_state.state_hash
+    assert daily.final_state.pending_orders == historical.final_state.pending_orders
+    assert daily.final_state.lots == historical.final_state.lots

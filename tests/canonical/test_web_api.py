@@ -274,7 +274,7 @@ def test_moving_average_grid_profile_exposes_single_grid_instrument(dashboard):
         "paper-ma-grid-511380",
         "Paper MA Grid 511380",
         Decimal("100000"),
-        "agent-file",
+        "moving-average-grid",
     )
     policy = AgentPolicySettings(
         account.account_id,

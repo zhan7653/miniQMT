@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
@@ -41,6 +42,8 @@ from fundlab.pipeline.daily import (
     DailyRunResult,
 )
 from fundlab.settings import (
+    AgentPolicySettings,
+    AgentSettings,
     DailyAccountSettings,
     DailySettings,
     FoundationPaths,
@@ -403,6 +406,52 @@ def test_daily_run_is_idempotent_and_advances_static_account(tmp_path):
     second = pipeline.run()
     assert second.status == "ok"
     assert second.accounts[0]["sessions_advanced"] == 0
+
+
+def test_daily_ma_grid_close_signal_schedules_the_next_session_without_file_lag(
+    tmp_path,
+):
+    ready_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "paper-grid", "Paper Grid", Decimal("100000"), "moving-average-grid"
+    )
+    settings = replace(
+        build_settings(tmp_path, (account,)),
+        agent=AgentSettings(policies={
+            account.account_id: AgentPolicySettings(
+                account.account_id,
+                "moving-average-grid",
+                {
+                    "instrument": "600000.SH",
+                    "activation_date": DAYS[-1].isoformat(),
+                    "max_weight": "0.80",
+                    "minimum_grid_step": "0.01",
+                    "moving_average_days": 2,
+                    "trend_average_days": 3,
+                    "trend_slope_days": 1,
+                    "residual_window_days": 2,
+                    "startup_ramp_days": 1,
+                },
+            ),
+        }),
+    )
+    result = DailyPipeline(
+        settings,
+        registry=registry_with_calendars(),
+        now_fn=lambda: evening_of(DAYS[-1]),
+    ).run()
+
+    assert result.status == "ok"
+    repository = TradingRepository(settings.paths.trading_database)
+    _, run_id = repository.selected_state(account.account_id)
+    assert run_id is not None
+    run = repository.run(run_id)
+    assert run.binding.strategy_id == "moving-average-grid"
+    assert run.binding.end_date == DAYS[-1]
+    pending = repository.final_state(run_id).pending_orders
+    assert len(pending) == 1
+    assert pending[0].execution_date == FUTURE_DAYS[0]
+    assert not (settings.daily.agent_decision_root / account.account_id).exists()
 
 
 def test_daily_run_blocks_when_calendar_sources_disagree(tmp_path):
