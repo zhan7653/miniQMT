@@ -618,7 +618,10 @@ class MovingAverageGridSource:
             return self._advance_precomputed(market)
         if self._last_price_date is None:
             instrument = market.market_data.instrument(self.config.instrument)
-            history_start = market.as_of - timedelta(days=800)
+            # A frozen cycle can outlive any rolling lookback. Rebuild from the
+            # strategy's activation warmup so a process restart restores the
+            # complete state machine rather than silently inventing a new anchor.
+            history_start = self.config.activation_date - timedelta(days=800)
             if instrument.listed_date is not None:
                 history_start = max(history_start, instrument.listed_date)
             frame = market.adjusted_history(

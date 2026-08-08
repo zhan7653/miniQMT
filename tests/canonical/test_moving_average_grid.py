@@ -311,3 +311,57 @@ def test_restarted_daily_source_matches_historical_clock_exactly(tmp_path):
     assert daily.final_state.state_hash == historical.final_state.state_hash
     assert daily.final_state.pending_orders == historical.final_state.pending_orders
     assert daily.final_state.lots == historical.final_state.lots
+
+
+def test_daily_restart_replays_a_frozen_cycle_older_than_800_days():
+    prices = [100] * 8 + [80] * 900 + [68]
+    rows = pd.DataFrame([
+        {
+            "instrument_id": "510050.SH",
+            "session_date": (START + timedelta(days=index)).isoformat(),
+            "close": price,
+        }
+        for index, price in enumerate(prices)
+    ])
+
+    class LongCycleMarket:
+        snapshot_id = "snapshot-long-cycle"
+
+        def instrument(self, instrument_id):
+            assert instrument_id == "510050.SH"
+            return SimpleNamespace(listed_date=START)
+
+        def adjusted_history(self, instrument_ids, start_date, end_date, *, as_of):
+            assert tuple(instrument_ids) == ("510050.SH",)
+            assert end_date <= as_of
+            return rows[rows["session_date"].between(
+                start_date.isoformat(), end_date.isoformat()
+            )].copy()
+
+    config = grid_config(
+        minimum_grid_step=Decimal("0.10"),
+        defensive_confirm_days=2,
+        defensive_brake_days=4,
+        maximum_cycle_days=2_000,
+    )
+    final_day = START + timedelta(days=len(prices) - 1)
+    market = PointInTimeMarketView(LongCycleMarket(), final_day)
+    unseeded = MovingAverageGridSource(config).decide(
+        account_id="research-grid",
+        market=market,
+        state=PortfolioState.with_cash(1_000_000),
+    )
+
+    assert unseeded is not None
+    assert unseeded.target_weights == {"510050.SH": Decimal("0.4000")}
+    assert unseeded.metadata["hard_braked"] is True
+    assert unseeded.metadata["anchor"] == pytest.approx(93.3333333333)
+    restarted = MovingAverageGridSource(
+        config,
+        initial_emitted_weight=Decimal("0.4000"),
+    )
+    assert restarted.decide(
+        account_id="research-grid",
+        market=PointInTimeMarketView(LongCycleMarket(), final_day),
+        state=PortfolioState.with_cash(1_000_000),
+    ) is None
