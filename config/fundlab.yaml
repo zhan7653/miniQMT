@@ -32,6 +32,70 @@ daily:
       name: "Paper Dividend Value Agent"
       initial_cash: "1000000"
       strategy: agent-file
+    - account_id: paper-dividend-rules
+      name: "Paper Dividend Rules"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-dual-momentum
+      name: "Paper Dual Momentum"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-inverse-vol
+      name: "Paper Inverse Volatility"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-risk-parity
+      name: "Paper Correlation Risk Parity"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-trend-vol
+      name: "Paper Trend Volatility Target"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-low-beta
+      name: "Paper Low Beta Volatility"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-st-removal
+      name: "Paper ST Removal Momentum"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-st-momentum
+      name: "Paper Active ST Momentum"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-global
+      name: "Paper Crisis Global"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-cn-small
+      name: "Paper Crisis China Compact"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-cn-wide
+      name: "Paper Crisis China Wide"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-conservative
+      name: "Paper Crisis Conservative"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-aggressive
+      name: "Paper Crisis Aggressive Ladder"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-vol-control
+      name: "Paper Crisis Volatility Control"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-fast-profit
+      name: "Paper Crisis Fast Profit"
+      initial_cash: "1000000"
+      strategy: agent-file
+    - account_id: paper-crash-semiconductor
+      name: "Paper Crisis China-Korea Semiconductor"
+      initial_cash: "1000000"
+      strategy: agent-file
 
 agent:
   # OpenAI-compatible Responses endpoint. The API key is read only from the
@@ -90,6 +154,273 @@ agent:
       cash_reserve: "0.05"
       candidate_pool_size: 50
       rebalance_cooldown_days: 28
+      # Passive high-dividend reference only; it never enters the stock portfolio.
+      benchmark_instrument: 159207.SZ
+      # Relative performance is diagnostic before 60 common trading sessions
+      # and can never be the sole reason for a rebalance afterwards.
+      benchmark_min_common_sessions: 60
+    paper-dividend-rules:
+      type: dividend-rules
+      charter: agents/dividend-value.yaml
+      top_n: 10
+      min_yield: "0.04"
+      min_dividend_years: 5
+      min_avg_amount: "20000000"
+      max_fiscal_year_lag: 2
+      require_ttm_cash: true
+      cash_reserve: "0.05"
+      rebalance_cooldown_days: 28
+    paper-dual-momentum:
+      type: dual-momentum
+      risk_instruments: [510300.SH, 510500.SH, 159915.SZ, 518880.SH]
+      defensive_instrument: 511010.SH
+      short_momentum_days: 60
+      long_momentum_days: 120
+      select_count: 2
+      threshold: "0"
+    paper-inverse-vol:
+      type: inverse-volatility
+      instruments: [510300.SH, 511010.SH, 518880.SH]
+      volatility_days: 60
+      max_weight: "0.60"
+    paper-risk-parity:
+      type: correlation-risk-parity
+      instruments: [510300.SH, 510500.SH, 159915.SZ, 518880.SH, 511010.SH]
+      return_days: 120
+      covariance_shrinkage: "0.25"
+      max_weight: "0.50"
+    paper-trend-vol:
+      type: trend-volatility-target
+      risk_instruments: [510300.SH, 510500.SH, 159915.SZ, 518880.SH]
+      defensive_instrument: 511010.SH
+      momentum_days: 120
+      volatility_days: 60
+      trend_threshold: "0"
+      target_volatility: "0.10"
+      max_risk_weight: "0.90"
+    paper-low-beta:
+      type: low-beta-volatility
+      benchmark_instrument: 510300.SH
+      defensive_instrument: 511010.SH
+      top_n: 20
+      beta_days: 120
+      volatility_days: 60
+      amount_window: 20
+      min_avg_amount: "50000000"
+      preselection_count: 800
+      minimum_listing_days: 250
+      min_beta: "-0.25"
+      max_beta: "1.00"
+      defensive_weight: "0.10"
+    paper-st-removal:
+      type: st-removal-momentum
+      defensive_instrument: 511010.SH
+      top_n: 5
+      short_momentum_days: 20
+      long_momentum_days: 60
+      amount_window: 20
+      min_avg_amount: "30000000"
+      minimum_listing_days: 250
+      max_recent_limit_hits: 3
+      stock_allocation: "0.25"
+      st_removal_lookback: 60
+      require_above_long_average: true
+    paper-st-momentum:
+      type: st-active-momentum
+      defensive_instrument: 511010.SH
+      top_n: 5
+      short_momentum_days: 60
+      long_momentum_days: 120
+      amount_window: 20
+      min_avg_amount: "30000000"
+      minimum_listing_days: 250
+      max_recent_limit_hits: 5
+      stock_allocation: "0.15"
+    paper-crash-cn-small:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 512100.SH, 563300.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.20"
+      rebound_threshold: "0.05"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.25"
+      max_positions: 2
+      entry_risk_weight: "0.40"
+      max_risk_weight: "0.40"
+      max_position_weight: "0.20"
+      cooldown_days: 120
+      rebalance_threshold: "0.05"
+    paper-crash-cn-wide:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.20"
+      rebound_threshold: "0.05"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.25"
+      max_positions: 3
+      entry_risk_weight: "0.60"
+      max_risk_weight: "0.60"
+      max_position_weight: "0.20"
+      cooldown_days: 120
+      rebalance_threshold: "0.05"
+    paper-crash-global:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ, 159920.SZ, 513500.SH, 159941.SZ, 513520.SH, 513030.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.20"
+      rebound_threshold: "0.05"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.25"
+      max_positions: 4
+      entry_risk_weight: "0.60"
+      max_risk_weight: "0.60"
+      max_position_weight: "0.15"
+      position_caps:
+        159920.SZ: "0.10"
+        513500.SH: "0.10"
+        159941.SZ: "0.10"
+        513520.SH: "0.10"
+        513030.SH: "0.10"
+      cooldown_days: 120
+      rebalance_threshold: "0.05"
+    paper-crash-conservative:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ, 159920.SZ, 513500.SH, 159941.SZ, 513520.SH, 513030.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 20
+      volatility_days: 60
+      minimum_drawdown: "0.25"
+      rebound_threshold: "0.08"
+      recovery_exit_gap: "0.03"
+      profit_take: "0.20"
+      max_positions: 2
+      entry_risk_weight: "0.35"
+      max_risk_weight: "0.35"
+      max_position_weight: "0.20"
+      position_caps:
+        159920.SZ: "0.10"
+        513500.SH: "0.10"
+        159941.SZ: "0.10"
+        513520.SH: "0.10"
+        513030.SH: "0.10"
+      cooldown_days: 180
+      rebalance_threshold: "0.05"
+    paper-crash-aggressive:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ, 159920.SZ, 513500.SH, 159941.SZ, 513520.SH, 513030.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: ladder
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.15"
+      rebound_threshold: "0"
+      recovery_exit_gap: "0.02"
+      profit_take: "0.35"
+      max_positions: 4
+      entry_risk_weight: "0.20"
+      max_risk_weight: "0.80"
+      max_position_weight: "0.30"
+      position_caps:
+        159920.SZ: "0.15"
+        513500.SH: "0.15"
+        159941.SZ: "0.15"
+        513520.SH: "0.15"
+        513030.SH: "0.15"
+      ladder_step: "0.075"
+      tranche_weight: "0.20"
+      cooldown_days: 90
+      rebalance_threshold: "0.05"
+    paper-crash-vol-control:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ, 159920.SZ, 513500.SH, 159941.SZ, 513520.SH, 513030.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.20"
+      rebound_threshold: "0.05"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.25"
+      max_positions: 4
+      entry_risk_weight: "0.60"
+      max_risk_weight: "0.60"
+      max_position_weight: "0.25"
+      position_caps:
+        159920.SZ: "0.10"
+        513500.SH: "0.10"
+        159941.SZ: "0.10"
+        513520.SH: "0.10"
+        513030.SH: "0.10"
+      target_volatility: "0.10"
+      cooldown_days: 120
+      rebalance_threshold: "0.05"
+    paper-crash-fast-profit:
+      type: crisis-drawdown
+      risk_instruments: [510300.SH, 510500.SH, 512100.SH, 563300.SH, 159915.SZ, 159920.SZ, 513500.SH, 159941.SZ, 513520.SH, 513030.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 60
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.20"
+      rebound_threshold: "0.05"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.15"
+      max_positions: 3
+      entry_risk_weight: "0.60"
+      max_risk_weight: "0.60"
+      max_position_weight: "0.20"
+      position_caps:
+        159920.SZ: "0.10"
+        513500.SH: "0.10"
+        159941.SZ: "0.10"
+        513520.SH: "0.10"
+        513030.SH: "0.10"
+      cooldown_days: 120
+      rebalance_threshold: "0.05"
+    paper-crash-semiconductor:
+      type: crisis-drawdown
+      risk_instruments: [513310.SH]
+      defensive_instrument: 511010.SH
+      entry_mode: reversal
+      drawdown_days: 252
+      event_lookback_days: 90
+      confirmation_days: 10
+      volatility_days: 60
+      minimum_drawdown: "0.30"
+      rebound_threshold: "0.08"
+      recovery_exit_gap: "0.05"
+      profit_take: "0.25"
+      max_positions: 1
+      entry_risk_weight: "0.15"
+      max_risk_weight: "0.15"
+      max_position_weight: "0.15"
+      cooldown_days: 180
+      rebalance_threshold: "0.03"
 
 execution:
   policy_id: cn-daily-conservative

@@ -13,7 +13,7 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -55,10 +55,14 @@ from fundlab.marketdata.schema import empty_table
 from fundlab.marketdata.history import (
     HistoryBuildSpec,
     HistoryDatabaseBuilder,
+    NoTradeSourceActiveError,
     find_no_trade_research_partition,
 )
 from fundlab.marketdata.simulation_data import reconcile_simulation_status
-from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+from fundlab.marketdata.contracts import (
+    DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
+)
 from fundlab.settings import DailyAccountSettings, FoundationSettings
 from fundlab.strategies import FileIntentSource, StaticAllocationSource
 from fundlab.trading import (
@@ -76,9 +80,6 @@ DIRECT_LIMIT_PROVIDERS = ("xtquant", "eastmoney-efinance")
 FACTOR_AUDIT_PROVIDER = "canonical-tickflow-adjusted-factor-audit-r2-v1"
 FACTOR_AUDIT_VERSION = "adjusted-price-factor-audit-r2-v1"
 DATA_GAP_QUARANTINE_PROVIDER = "fundlab-data-gap-quarantine"
-MAX_DEGRADED_INSTRUMENTS = 200
-MAX_DEGRADED_FRACTION = 0.03
-MAX_CONSECUTIVE_DEGRADED_SESSIONS = 5
 
 
 class DailyRunInProgress(RuntimeError):
@@ -154,6 +155,34 @@ class DailyRunResult:
     @property
     def exit_code(self) -> int:
         return 0 if self.status in {"ok", "up_to_date", "degraded"} else 2
+
+
+@dataclass(frozen=True)
+class _NoTradeResolution:
+    observation_id: str | None
+    confirmed_instrument_ids: tuple[str, ...]
+    active_conflicts: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class _UniverseResolution:
+    observation_id: str
+    frame: pd.DataFrame
+    degraded_detail: Mapping[str, Any] | None = None
+    execution_guard_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _DegradedCollectionResult:
+    status: str
+    build_id: str
+    requested_instruments: int
+    completed_instruments: int
+    observation_ids: tuple[str, ...]
+    blockers: tuple[str, ...]
+    unresolved_instrument_ids: tuple[str, ...]
+    checkpoint: Path | None = None
+    report: Path | None = None
 
 
 class DailyPipeline:
@@ -401,21 +430,29 @@ class DailyPipeline:
     ) -> str:
         increment_start = previous_scope.history_end + timedelta(days=1)
 
-        universe_obs, official_frame = self._official_universe(target)
+        universe = self._official_universe(target, predecessor=predecessor)
+        universe_obs, official_frame = universe.observation_id, universe.frame
         official_ids = set(map(str, official_frame["instrument_id"]))
         previous_ids = set(previous_scope.instrument_ids)
         quarantine_reasons: dict[str, list[str]] = {}
+        execution_guard_reasons: dict[str, list[str]] = {}
+        all_date_execution_guard_ids: set[str] = set(universe.execution_guard_ids)
+        self._add_quarantine_reasons(
+            execution_guard_reasons,
+            universe.execution_guard_ids,
+            source="universe",
+            blockers=(
+                str((universe.degraded_detail or {}).get("reason", "carried_universe")),
+            ),
+        )
         new_ids = tuple(sorted(official_ids - previous_ids))
-        removed = tuple(sorted(previous_ids - official_ids))
-        if removed:
-            raise DailyPipelineBlocked("universe", "official universe removed predecessor instruments", {
-                "removed_sample": removed[:20], "removed_count": len(removed),
-            })
         target_ids = tuple(sorted(official_ids))
-        stages.append(DailyStage("universe", "ok", {
+        stages.append(DailyStage(
+            "universe", "degraded" if universe.degraded_detail else "ok", {
             "universe_observation_id": universe_obs,
             "official_instruments": len(official_ids),
             "new_instruments": len(new_ids),
+            **dict(universe.degraded_detail or {}),
         }))
 
         builder = HistoryDatabaseBuilder(
@@ -483,26 +520,10 @@ class DailyPipeline:
             - set(new_master_missing)
             - set(carried_master_missing)
         ))
-        nonretryable_unexplained = tuple(
-            item for item in unexplained
-            if not self._only_retryable_provider_errors(excluded.get(item))
-        )
-        if nonretryable_unexplained:
-            raise DailyPipelineBlocked("bars", "instruments missing for reasons other than no-trade", {
-                "unexplained_sample": nonretryable_unexplained[:20],
-                "unexplained_count": len(nonretryable_unexplained),
-                "excluded_reasons_sample": {
-                    item: excluded.get(item) for item in nonretryable_unexplained[:10]
-                },
-                "retryable": False,
-            })
         for instrument_id in unexplained:
             quarantine_reasons.setdefault(instrument_id, []).append(
                 f"bars:{canonical_json(excluded.get(instrument_id))}"
             )
-        self._require_quarantine_within_daily_limit(
-            quarantine_reasons, universe_size=len(target_ids), stage="bars",
-        )
 
         research_source_id = build.snapshot_id
         supplement_snapshot_ids: tuple[str, ...] = ()
@@ -514,49 +535,90 @@ class DailyPipeline:
             *carried_master_missing,
         }))
         if official_master_missing:
-            supplement_id, supplement_partitions, detail = (
-                self._build_new_instrument_supplement(
-                    builder=builder,
-                    universe_observation_id=universe_obs,
-                    official_frame=official_frame,
-                    instrument_ids=official_master_missing,
-                    start=increment_start,
-                    end=target,
-                    trusted_predecessor_snapshot_id=(
-                        predecessor.snapshot_id if carried_master_missing else None
-                    ),
+            try:
+                supplement_id, supplement_partitions, detail = (
+                    self._build_new_instrument_supplement(
+                        builder=builder,
+                        universe_observation_id=universe_obs,
+                        official_frame=official_frame,
+                        instrument_ids=official_master_missing,
+                        start=increment_start,
+                        end=target,
+                        trusted_predecessor_snapshot_id=(
+                            predecessor.snapshot_id if carried_master_missing else None
+                        ),
+                    )
                 )
-            )
-            supplement_snapshot_ids = (supplement_id,)
-            build_partition_ids = tuple(sorted({
-                *build_partition_ids,
-                *supplement_partitions,
-            }))
-            detail = {
-                **detail,
-                "new_instrument_ids": new_master_missing,
-                "carried_instrument_ids": carried_master_missing,
-            }
-            stages.append(DailyStage(
-                "new_instruments" if new_master_missing else "carried_instruments",
-                "ok",
-                detail,
-            ))
+            except Exception as exc:
+                self._add_quarantine_reasons(
+                    quarantine_reasons,
+                    official_master_missing,
+                    source="new_instruments",
+                    blockers=(f"{type(exc).__name__}:{str(exc)[:500]}",),
+                )
+                stages.append(DailyStage(
+                    "new_instruments" if new_master_missing else "carried_instruments",
+                    "degraded",
+                    {
+                        "instrument_ids": official_master_missing,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:500],
+                        "policy": "retain_official_master_and_quarantine_missing_prices",
+                    },
+                ))
+            else:
+                supplement_snapshot_ids = (supplement_id,)
+                build_partition_ids = tuple(sorted({
+                    *build_partition_ids,
+                    *supplement_partitions,
+                }))
+                detail = {
+                    **detail,
+                    "new_instrument_ids": new_master_missing,
+                    "carried_instrument_ids": carried_master_missing,
+                }
+                stages.append(DailyStage(
+                    "new_instruments" if new_master_missing else "carried_instruments",
+                    "ok",
+                    detail,
+                ))
 
         no_trade_observation_id: str | None = None
+        confirmed_no_trade_ids: tuple[str, ...] = ()
         if no_trade_only:
-            no_trade_observation_id = self._record_no_trade(
-                predecessor_snapshot_id=predecessor.snapshot_id,
-                universe_observation_id=universe_obs,
-                calendar_observation_id=calendar_observation_id,
-                start=increment_start,
-                end=target,
-                instrument_ids=no_trade_only,
-            )
-            stages.append(DailyStage("no_trade", "ok", {
-                "instruments": no_trade_only,
-                "observation_id": no_trade_observation_id,
-            }))
+            try:
+                no_trade = self._record_no_trade(
+                    predecessor_snapshot_id=predecessor.snapshot_id,
+                    universe_observation_id=universe_obs,
+                    calendar_observation_id=calendar_observation_id,
+                    start=increment_start,
+                    end=target,
+                    instrument_ids=no_trade_only,
+                    quarantine_reasons=quarantine_reasons,
+                    universe_size=len(target_ids),
+                )
+            except Exception as exc:
+                self._add_quarantine_reasons(
+                    quarantine_reasons,
+                    no_trade_only,
+                    source="no_trade",
+                    blockers=(f"{type(exc).__name__}:{str(exc)[:500]}",),
+                )
+                stages.append(DailyStage("no_trade", "degraded", {
+                    "instruments": no_trade_only,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                    "policy": "quarantine_unresolved_missing_prices",
+                }))
+            else:
+                no_trade_observation_id = no_trade.observation_id
+                confirmed_no_trade_ids = no_trade.confirmed_instrument_ids
+                stages.append(DailyStage(
+                    "no_trade", "degraded" if no_trade.active_conflicts else "ok", {
+                    "instruments": confirmed_no_trade_ids,
+                    "observation_id": no_trade_observation_id,
+                    "quarantined_active_conflicts": dict(no_trade.active_conflicts),
+                }))
 
         quarantine_research_observation_id: str | None = None
         bar_quarantine_ids = tuple(sorted(quarantine_reasons))
@@ -583,7 +645,7 @@ class DailyPipeline:
                 main_snapshot_id=build.snapshot_id,
                 supplement_snapshot_ids=supplement_snapshot_ids,
                 no_trade_observation_id=no_trade_observation_id,
-                no_trade_ids=no_trade_only,
+                no_trade_ids=confirmed_no_trade_ids,
                 quarantine_observation_id=quarantine_research_observation_id,
                 quarantine_ids=bar_quarantine_ids,
                 target_ids=target_ids,
@@ -612,39 +674,39 @@ class DailyPipeline:
         }))
 
         status_results = {}
+        status_collector = SimulationStatusCollector(
+            self.warehouse, self.report_root, registry=self.registry,
+        )
         for provider in ("xtquant", "baostock"):
-            result = SimulationStatusCollector(
-                self.warehouse, self.report_root, registry=self.registry,
-            ).collect(StatusCollectionSpec(
-                source_snapshot_id=research.snapshot_id,
-                calendar_observation_id=calendar_observation_id,
-                provider_name=provider,
-                batch_size=50,
-            ))
+            try:
+                result = status_collector.collect(StatusCollectionSpec(
+                    source_snapshot_id=research.snapshot_id,
+                    calendar_observation_id=calendar_observation_id,
+                    provider_name=provider,
+                    batch_size=50,
+                ))
+            except Exception as exc:
+                result = _DegradedCollectionResult(
+                    "incomplete",
+                    f"unavailable-status-{provider}-{target.isoformat()}",
+                    len(target_ids),
+                    0,
+                    (),
+                    (f"{type(exc).__name__}:{str(exc)[:500]}",),
+                    target_ids,
+                )
             status_results[provider] = result
             if result.status != "complete":
-                retryable = self._only_retryable_collection_blockers(
-                    result.blockers,
-                    consequence_prefixes=("missing_status_instruments:",),
-                )
                 unresolved_ids = tuple(getattr(
                     result, "unresolved_instrument_ids", (),
-                ))
-                if not retryable or not unresolved_ids:
-                    raise DailyPipelineBlocked("status", f"{provider} status collection incomplete", {
-                        "blockers": result.blockers,
-                        "retryable": retryable,
-                        "retry_class": "transient_provider_or_commit" if retryable else None,
-                    })
+                )) or target_ids
                 self._add_quarantine_reasons(
-                    quarantine_reasons,
+                    execution_guard_reasons,
                     unresolved_ids,
                     source=f"status:{provider}",
                     blockers=result.blockers,
                 )
-                self._require_quarantine_within_daily_limit(
-                    quarantine_reasons, universe_size=len(target_ids), stage="status",
-                )
+                all_date_execution_guard_ids.update(unresolved_ids)
         stages.append(DailyStage(
             "status",
             "degraded" if any(
@@ -653,6 +715,7 @@ class DailyPipeline:
             {
             provider: {
                 "observations": len(result.observation_ids),
+                "blockers": tuple(result.blockers),
                 "unresolved_instrument_ids": tuple(getattr(
                     result, "unresolved_instrument_ids", (),
                 )),
@@ -672,34 +735,17 @@ class DailyPipeline:
             provider for provider, result in direct_limit_results.items()
             if not result["observation_ids"]
         )
-        if empty_limit_providers:
-            retryable = all(
-                self._only_retryable_capture_errors(
-                    (
-                        *direct_limit_results[provider]["request_errors"],
-                        *direct_limit_results[provider]["provider_errors"],
-                    )
-                )
-                for provider in empty_limit_providers
-            )
-            raise DailyPipelineBlocked(
-                "limits",
-                "direct price-limit collection produced no usable observations",
-                {
-                    "providers": empty_limit_providers,
-                    "details": {
-                        provider: {
-                            key: value
-                            for key, value in direct_limit_results[provider].items()
-                            if not key.startswith("_")
-                        }
-                        for provider in empty_limit_providers
-                    },
-                    "retryable": retryable,
-                    "retry_class": "transient_observation_commit" if retryable else None,
-                },
-            )
-        stages.append(DailyStage("limits", "ok", {
+        directly_verified_ids = set(target_ids)
+        for result in direct_limit_results.values():
+            directly_verified_ids.intersection_update(result["_covered_instrument_ids"])
+        missing_limit_ids = tuple(sorted(set(target_ids) - directly_verified_ids))
+        self._add_quarantine_reasons(
+            execution_guard_reasons,
+            missing_limit_ids,
+            source="limits:direct",
+            blockers=("direct_price_limit_evidence_incomplete",),
+        )
+        stages.append(DailyStage("limits", "degraded" if missing_limit_ids else "ok", {
             provider: {
                 "observations": len(result["observation_ids"]),
                 "observation_ids": result["observation_ids"],
@@ -709,14 +755,35 @@ class DailyPipeline:
                 "request_errors": result["request_errors"][-5:],
             }
             for provider, result in direct_limit_results.items()
+        } | {
+            "empty_providers": empty_limit_providers,
+            "execution_guard_instruments": len(missing_limit_ids),
+            "execution_guard_sample": missing_limit_ids[:20],
+            "policy": (
+                "publish_prices_and_disable_execution_for_missing_direct_limit_evidence"
+            ),
         }))
 
         evidence_results = {}
+        evidence_guard_ids: set[str] = set()
+        asset_types = official_frame.set_index("instrument_id")["asset_type"].astype(str)
+        evidence_collector = SimulationEvidenceCollector(
+            self.warehouse, self.report_root, registry=self.registry,
+        )
         for kind in ("stock-actions", "etf-actions", "factors"):
+            kind_ids = tuple(sorted(
+                target_ids
+                if kind == "factors"
+                else (
+                    instrument_id
+                    for instrument_id in target_ids
+                    if asset_types.get(instrument_id) == (
+                        "stock" if kind == "stock-actions" else "etf"
+                    )
+                )
+            ))
             try:
-                result = SimulationEvidenceCollector(
-                    self.warehouse, self.report_root, registry=self.registry,
-                ).collect(EvidenceCollectionSpec(
+                result = evidence_collector.collect(EvidenceCollectionSpec(
                     source_snapshot_id=research.snapshot_id,
                     kind=kind,
                     predecessor_snapshot_id=(
@@ -724,51 +791,29 @@ class DailyPipeline:
                     ),
                 ))
             except Exception as exc:
-                if kind != "stock-actions":
-                    raise
                 error = f"{type(exc).__name__}:{str(exc)[:500]}"
-                retryable = self._retryable_failure_text(error)
-                raise DailyPipelineBlocked(
-                    "evidence",
-                    "stock action announcement scan failed",
-                    {
-                        "error": error,
-                        "retryable": retryable,
-                        "retry_class": (
-                            "transient_provider_or_commit" if retryable else None
-                        ),
-                    },
-                ) from exc
+                result = _DegradedCollectionResult(
+                    "incomplete",
+                    f"unavailable-evidence-{kind}-{target.isoformat()}",
+                    len(kind_ids),
+                    0,
+                    (),
+                    (error,),
+                    kind_ids,
+                )
             evidence_results[kind] = result
             if result.status != "complete":
-                retryable = self._only_retryable_collection_blockers(
-                    result.blockers,
-                    consequence_prefixes=(f"missing_{kind}_instruments:",),
-                )
                 unresolved_ids = tuple(getattr(
                     result, "unresolved_instrument_ids", (),
-                ))
-                quarantinable = bool(unresolved_ids) and (
-                    self._quarantinable_action_collection(
-                        result.blockers, unresolved_ids,
-                    )
-                    if kind.endswith("-actions") else retryable
-                )
-                if not quarantinable:
-                    raise DailyPipelineBlocked("evidence", f"{kind} evidence collection incomplete", {
-                        "blockers": result.blockers,
-                        "retryable": retryable,
-                        "retry_class": "transient_provider_or_commit" if retryable else None,
-                    })
+                )) or kind_ids
+                evidence_guard_ids.update(unresolved_ids)
                 self._add_quarantine_reasons(
-                    quarantine_reasons,
+                    execution_guard_reasons,
                     unresolved_ids,
                     source=f"evidence:{kind}",
                     blockers=result.blockers,
                 )
-                self._require_quarantine_within_daily_limit(
-                    quarantine_reasons, universe_size=len(target_ids), stage="evidence",
-                )
+                all_date_execution_guard_ids.update(unresolved_ids)
         stages.append(DailyStage(
             "evidence",
             "degraded" if any(
@@ -782,6 +827,7 @@ class DailyPipeline:
                 "unresolved_instrument_ids": tuple(getattr(
                     result, "unresolved_instrument_ids", (),
                 )),
+                "blockers": tuple(result.blockers),
                 "report": str(getattr(result, "report", "")) or None,
             }
             for kind, result in evidence_results.items()
@@ -821,9 +867,23 @@ class DailyPipeline:
                 for result in direct_limit_results.values()
                 for observation_id in result["observation_ids"]
             })),
+            execution_guard_ids=tuple(sorted(execution_guard_reasons)),
+            all_date_execution_guard_ids=tuple(sorted(all_date_execution_guard_ids)),
+            target_only_execution_guard_ids=tuple(sorted(
+                set(missing_limit_ids) - all_date_execution_guard_ids
+            )),
+            execution_guard_reasons={
+                item: tuple(sorted(set(reasons)))
+                for item, reasons in sorted(execution_guard_reasons.items())
+            },
+            evidence_guard_ids=tuple(sorted(evidence_guard_ids)),
             quarantine_detail=quarantine_detail,
         )
-        stages.append(DailyStage("factor_reconciliation", "ok", factor_detail))
+        stages.append(DailyStage(
+            "factor_reconciliation",
+            "degraded" if factor_detail.get("status") == "degraded" else "ok",
+            factor_detail,
+        ))
         stages.append(DailyStage("candidate", "ok", {"observation_id": candidate_id}))
 
         try:
@@ -845,9 +905,24 @@ class DailyPipeline:
                 "retryable": retryable,
                 "retry_class": "transient_direct_limit_gap" if retryable else None,
             }) from exc
-        stages.append(DailyStage("validate", "ok", {
-            "observation_id": validated.observation_id,
-        }))
+        validated_manifest = self.warehouse.load_observation(
+            validated.observation_id,
+        )
+        validated_guard = validated_manifest.source_metadata.get(
+            "partition_quality", {}
+        ).get("execution_evidence_guard", {})
+        validator_added_guard = (
+            validated_guard.get("validator_added_reasons", {})
+            if isinstance(validated_guard, Mapping) else {}
+        )
+        stages.append(DailyStage(
+            "validate",
+            "degraded" if validator_added_guard else "ok",
+            {
+                "observation_id": validated.observation_id,
+                "validator_added_execution_guard": validator_added_guard,
+            },
+        ))
 
         extended_ids = tuple(sorted(previous_ids.union(target_ids)))
         target_scope = UniverseScope(
@@ -878,7 +953,7 @@ class DailyPipeline:
         }))
         return result.snapshot_id
 
-    def _official_universe(self, target: date) -> tuple[str, pd.DataFrame]:
+    def _official_universe(self, target: date, *, predecessor) -> _UniverseResolution:
         request = ProviderRequest(
             ProviderCapability.INSTRUMENTS,
             parameters={
@@ -887,11 +962,110 @@ class DailyPipeline:
                 "as_of_date": target.isoformat(),
             },
         )
-        observed, _ = self.ingestion.capture_resumable("exchange-public", request)
-        frame = self.warehouse.read_observation_table(
-            observed.observation_id, MarketTable.INSTRUMENTS,
+        prior = self.warehouse.query_loaded_snapshot_table(
+            predecessor, MarketTable.INSTRUMENTS,
+        ).sort_values("instrument_id", kind="stable").reset_index(drop=True)
+        try:
+            observed, _ = self.ingestion.capture_resumable("exchange-public", request)
+            frame = self.warehouse.read_observation_table(
+                observed.observation_id, MarketTable.INSTRUMENTS,
+            )
+        except Exception as exc:
+            detail = {
+                "reason": "official_universe_unavailable",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+                "carried_instruments": len(prior),
+                "source_snapshot_id": predecessor.snapshot_id,
+            }
+            carried = self._record_carried_universe(
+                target=target,
+                frame=prior,
+                predecessor_snapshot_id=predecessor.snapshot_id,
+                official_observation_id=None,
+                reason="official_universe_unavailable",
+                detail=detail,
+            )
+            return _UniverseResolution(
+                carried,
+                prior,
+                detail,
+                tuple(sorted(map(str, prior["instrument_id"]))),
+            )
+
+        official_ids = set(map(str, frame["instrument_id"]))
+        prior_ids = set(map(str, prior["instrument_id"]))
+        removed = tuple(sorted(prior_ids - official_ids))
+        if not removed:
+            return _UniverseResolution(observed.observation_id, frame)
+        carried_rows = prior.loc[prior["instrument_id"].astype(str).isin(removed)]
+        merged = pd.concat((frame, carried_rows), ignore_index=True)
+        merged = merged.drop_duplicates("instrument_id", keep="first").sort_values(
+            "instrument_id", kind="stable",
+        ).reset_index(drop=True)
+        detail = {
+            "reason": "official_universe_removed_predecessor_instruments",
+            "removed_count": len(removed),
+            "removed_sample": removed[:20],
+            "carried_instruments": len(removed),
+            "source_snapshot_id": predecessor.snapshot_id,
+        }
+        carried = self._record_carried_universe(
+            target=target,
+            frame=merged,
+            predecessor_snapshot_id=predecessor.snapshot_id,
+            official_observation_id=observed.observation_id,
+            reason="official_universe_removed_predecessor_instruments",
+            detail=detail,
         )
-        return observed.observation_id, frame
+        return _UniverseResolution(carried, merged, detail, removed)
+
+    def _record_carried_universe(
+        self,
+        *,
+        target: date,
+        frame: pd.DataFrame,
+        predecessor_snapshot_id: str,
+        official_observation_id: str | None,
+        reason: str,
+        detail: Mapping[str, Any],
+    ) -> str:
+        instrument_ids = tuple(sorted(map(str, frame["instrument_id"])))
+        input_ids = tuple(item for item in (official_observation_id,) if item)
+        request = ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            parameters={
+                "target_date": target.isoformat(),
+                "predecessor_snapshot_id": predecessor_snapshot_id,
+                "official_observation_ids": input_ids,
+                "reason": reason,
+                "pipeline": PIPELINE_VERSION,
+            },
+        )
+        provider = f"canonical-universe-carry-forward-{PIPELINE_VERSION}"
+        matches = self.warehouse.matching_observations(provider=provider, request=request)
+        if matches:
+            return matches[-1].observation_id
+        payload = ObservationPayload(
+            provider,
+            datetime.now(timezone.utc),
+            request,
+            {MarketTable.INSTRUMENTS: frame},
+            (CoverageClaim(
+                MarketTable.INSTRUMENTS,
+                True,
+                instrument_ids=instrument_ids,
+                detail="Complete carried membership from the last trusted published scope",
+            ),),
+            {
+                "kind": "degraded_universe_carry_forward",
+                "target_date": target,
+                "predecessor_snapshot_id": predecessor_snapshot_id,
+                "input_observation_ids": input_ids,
+                "degraded_detail": dict(detail),
+            },
+        )
+        return self.warehouse.record_observation(payload).observation_id
 
     def _historical_universe_refresh_required(
         self,
@@ -1461,7 +1635,9 @@ class DailyPipeline:
         start: date,
         end: date,
         instrument_ids: tuple[str, ...],
-    ) -> str:
+        quarantine_reasons: dict[str, list[str]],
+        universe_size: int,
+    ) -> _NoTradeResolution:
         existing = find_no_trade_research_partition(
             self.warehouse,
             predecessor_snapshot_id=predecessor_snapshot_id,
@@ -1472,7 +1648,7 @@ class DailyPipeline:
             instrument_ids=instrument_ids,
         )
         if existing is not None:
-            return existing.observation_id
+            return _NoTradeResolution(existing.observation_id, instrument_ids, {})
         source_ids = []
         request = ProviderRequest(
             ProviderCapability.DAILY_BARS_RAW, start, end, instrument_ids,
@@ -1480,17 +1656,50 @@ class DailyPipeline:
         for provider in NO_TRADE_PROVIDERS:
             observed, _ = self.ingestion.capture_resumable(provider, request)
             source_ids.append(observed.observation_id)
-        manifest = record_no_trade_research_partition(
-            self.warehouse,
-            predecessor_snapshot_id=predecessor_snapshot_id,
-            universe_observation_id=universe_observation_id,
-            calendar_observation_id=calendar_observation_id,
-            source_observation_ids=tuple(source_ids),
-            start_date=start,
-            end_date=end,
-            instrument_ids=instrument_ids,
-        )
-        return manifest.observation_id
+        common = {
+            "predecessor_snapshot_id": predecessor_snapshot_id,
+            "universe_observation_id": universe_observation_id,
+            "calendar_observation_id": calendar_observation_id,
+            "source_observation_ids": tuple(source_ids),
+            "start_date": start,
+            "end_date": end,
+        }
+        try:
+            manifest = record_no_trade_research_partition(
+                self.warehouse, **common, instrument_ids=instrument_ids,
+            )
+        except NoTradeSourceActiveError as exc:
+            unexpected = set(exc.active_observation_ids) - set(instrument_ids)
+            if unexpected:
+                raise ValueError(
+                    f"No-trade active evidence escaped requested scope: {sorted(unexpected)}"
+                ) from exc
+            active_conflicts = dict(exc.active_observation_ids)
+            for instrument_id, observation_ids in active_conflicts.items():
+                quarantine_reasons.setdefault(instrument_id, []).append(
+                    "no_trade:active_source_rows:"
+                    + canonical_json({"observation_ids": observation_ids})
+                )
+            confirmed = tuple(sorted(set(instrument_ids) - set(active_conflicts)))
+            if not confirmed:
+                return _NoTradeResolution(None, (), active_conflicts)
+            existing = find_no_trade_research_partition(
+                self.warehouse,
+                predecessor_snapshot_id=predecessor_snapshot_id,
+                universe_observation_id=universe_observation_id,
+                calendar_observation_id=calendar_observation_id,
+                start_date=start,
+                end_date=end,
+                instrument_ids=confirmed,
+            )
+            if existing is None:
+                existing = record_no_trade_research_partition(
+                    self.warehouse, **common, instrument_ids=confirmed,
+                )
+            return _NoTradeResolution(
+                existing.observation_id, confirmed, active_conflicts,
+            )
+        return _NoTradeResolution(manifest.observation_id, instrument_ids, {})
 
     @staticmethod
     def _add_quarantine_reasons(
@@ -1505,29 +1714,6 @@ class DailyPipeline:
         for instrument_id in sorted(set(map(str, instrument_ids))):
             target.setdefault(instrument_id, []).append(rendered)
 
-    @staticmethod
-    def _require_quarantine_within_daily_limit(
-        reasons: Mapping[str, Any],
-        *,
-        universe_size: int,
-        stage: str,
-    ) -> None:
-        count = len(reasons)
-        fraction = 0.0 if universe_size <= 0 else count / universe_size
-        if count > MAX_DEGRADED_INSTRUMENTS or fraction > MAX_DEGRADED_FRACTION:
-            raise DailyPipelineBlocked(
-                stage,
-                "instrument data gaps exceed the degraded-run boundary",
-                {
-                    "instrument_count": count,
-                    "universe_size": universe_size,
-                    "fraction": fraction,
-                    "maximum_instruments": MAX_DEGRADED_INSTRUMENTS,
-                    "maximum_fraction": MAX_DEGRADED_FRACTION,
-                    "instrument_ids": tuple(sorted(reasons)),
-                },
-            )
-
     def _finalize_quarantine(
         self,
         *,
@@ -1541,9 +1727,6 @@ class DailyPipeline:
     ) -> Mapping[str, Any] | None:
         if not reasons:
             return None
-        self._require_quarantine_within_daily_limit(
-            reasons, universe_size=universe_size, stage="quarantine",
-        )
         instrument_ids = tuple(sorted(reasons))
         prior = self.warehouse.query_loaded_snapshot_table(
             predecessor,
@@ -1587,32 +1770,13 @@ class DailyPipeline:
             )
             increment_sessions[instrument_id] = sessions
             consecutive[instrument_id] = prior_counts[instrument_id] + len(sessions)
-        exceeded = {
-            instrument_id: count
-            for instrument_id, count in consecutive.items()
-            if count > MAX_CONSECUTIVE_DEGRADED_SESSIONS
-        }
-        if exceeded:
-            raise DailyPipelineBlocked(
-                "quarantine",
-                "instrument data gap exceeded the consecutive-session boundary",
-                {
-                    "maximum_consecutive_sessions": MAX_CONSECUTIVE_DEGRADED_SESSIONS,
-                    "exceeded": exceeded,
-                    "reasons_by_instrument": {
-                        item: tuple(sorted(set(reasons[item]))) for item in exceeded
-                    },
-                },
-            )
         return {
-            "policy": "daily-instrument-data-gap-quarantine-v1",
+            "policy": "daily-instrument-data-gap-quarantine-never-block-v2",
             "instrument_ids": instrument_ids,
             "instrument_count": len(instrument_ids),
             "universe_size": universe_size,
             "fraction": len(instrument_ids) / universe_size,
-            "maximum_instruments": MAX_DEGRADED_INSTRUMENTS,
-            "maximum_fraction": MAX_DEGRADED_FRACTION,
-            "maximum_consecutive_sessions": MAX_CONSECUTIVE_DEGRADED_SESSIONS,
+            "blocking_thresholds_enforced": False,
             "consecutive_sessions": dict(sorted(consecutive.items())),
             "increment_sessions": dict(sorted(increment_sessions.items())),
             "reasons_by_instrument": {
@@ -2136,6 +2300,11 @@ class DailyPipeline:
         no_trade_observation_id: str | None,
         universe_observation_id: str,
         direct_limit_observation_ids: tuple[str, ...],
+        execution_guard_ids: tuple[str, ...],
+        all_date_execution_guard_ids: tuple[str, ...],
+        target_only_execution_guard_ids: tuple[str, ...],
+        execution_guard_reasons: Mapping[str, tuple[str, ...]],
+        evidence_guard_ids: tuple[str, ...],
         quarantine_detail: Mapping[str, Any] | None,
     ) -> tuple[str, Mapping[str, Any]]:
         research = self.warehouse.load_snapshot(research_snapshot_id)
@@ -2145,24 +2314,25 @@ class DailyPipeline:
         quarantine_ids = tuple(
             map(str, (quarantine_detail or {}).get("instrument_ids", ()))
         )
-        healthy_ids = tuple(sorted(
+        guard_reasons = {
+            str(item): tuple(map(str, values))
+            for item, values in execution_guard_reasons.items()
+        }
+        available_ids = tuple(sorted(
             set(increment_scope.instrument_ids) - set(quarantine_ids)
         ))
-        if not healthy_ids:
+        if not available_ids:
             raise DailyPipelineBlocked(
                 "quarantine", "instrument data gaps cover the whole daily universe"
             )
-        healthy_scope = UniverseScope(
-            increment_scope.definition,
-            increment_scope.as_of_date,
-            increment_scope.history_start,
-            increment_scope.history_end,
-            survivorship_bias=increment_scope.survivorship_bias,
-            instrument_ids=healthy_ids,
+        execution_guard = set(map(str, execution_guard_ids)) & set(available_ids)
+        all_date_guard = (
+            set(map(str, all_date_execution_guard_ids)) & set(available_ids)
         )
-        healthy_instruments = instruments.loc[
-            instruments["instrument_id"].astype(str).isin(healthy_ids)
-        ].reset_index(drop=True)
+        target_only_guard = (
+            set(map(str, target_only_execution_guard_ids)) & set(available_ids)
+        )
+        modeled_ids = tuple(sorted(set(available_ids) - all_date_guard))
         research_bars = self.warehouse.query_loaded_snapshot_table(
             research,
             MarketTable.DAILY_BARS,
@@ -2171,7 +2341,7 @@ class DailyPipeline:
             price_mode="raw",
         )
         research_bars = research_bars.loc[
-            research_bars["instrument_id"].astype(str).isin(healthy_ids)
+            research_bars["instrument_id"].astype(str).isin(available_ids)
         ].reset_index(drop=True)
         dense_status = self._concat_observation_tables(
             status_results["xtquant"].observation_ids, MarketTable.DAILY_BARS,
@@ -2179,33 +2349,71 @@ class DailyPipeline:
         stock_st = self._concat_observation_tables(
             status_results["baostock"].observation_ids, MarketTable.DAILY_BARS,
         )
-        dense_status = dense_status.loc[
-            dense_status["instrument_id"].astype(str).isin(healthy_ids)
-        ].reset_index(drop=True)
-        stock_st = stock_st.loc[
-            stock_st["instrument_id"].astype(str).isin(healthy_ids)
-        ].reset_index(drop=True)
         calendar_window = calendar_frame.loc[
             calendar_frame["session_date"].astype(str).between(
                 increment_scope.history_start.isoformat(),
                 increment_scope.history_end.isoformat(),
             )
         ].reset_index(drop=True)
-        status_bars = reconcile_simulation_status(
-            instruments=healthy_instruments,
-            research_bars=research_bars,
-            dense_status_bars=dense_status,
-            stock_st_bars=stock_st,
-            calendar=calendar_window,
-            universe_scope=healthy_scope,
-        )
-        bars = build_dense_simulation_bars(
-            instruments=healthy_instruments,
-            research_bars=research_bars,
-            status_bars=status_bars,
-            calendar=calendar_window,
-            universe_scope=healthy_scope,
-        )
+        if modeled_ids:
+            modeled_scope = UniverseScope(
+                increment_scope.definition,
+                increment_scope.as_of_date,
+                increment_scope.history_start,
+                increment_scope.history_end,
+                survivorship_bias=increment_scope.survivorship_bias,
+                instrument_ids=modeled_ids,
+            )
+            modeled_instruments = instruments.loc[
+                instruments["instrument_id"].astype(str).isin(modeled_ids)
+            ].reset_index(drop=True)
+            modeled_research = research_bars.loc[
+                research_bars["instrument_id"].astype(str).isin(modeled_ids)
+            ].reset_index(drop=True)
+            dense_status = dense_status.loc[
+                dense_status["instrument_id"].astype(str).isin(modeled_ids)
+            ].reset_index(drop=True)
+            stock_st = stock_st.loc[
+                stock_st["instrument_id"].astype(str).isin(modeled_ids)
+            ].reset_index(drop=True)
+            status_bars = reconcile_simulation_status(
+                instruments=modeled_instruments,
+                research_bars=modeled_research,
+                dense_status_bars=dense_status,
+                stock_st_bars=stock_st,
+                calendar=calendar_window,
+                universe_scope=modeled_scope,
+            )
+            bars = build_dense_simulation_bars(
+                instruments=modeled_instruments,
+                research_bars=modeled_research,
+                status_bars=status_bars,
+                calendar=calendar_window,
+                universe_scope=modeled_scope,
+            )
+        else:
+            bars = empty_table(MarketTable.DAILY_BARS, include_lineage=True)
+        if all_date_guard:
+            guarded_bars = self._build_execution_guard_bars(
+                instruments=instruments,
+                research_bars=research_bars,
+                calendar=calendar_window,
+                scope=increment_scope,
+                instrument_ids=tuple(sorted(all_date_guard)),
+                reasons=guard_reasons,
+                source_observation_id=universe_observation_id,
+            )
+            bars = pd.concat((bars, guarded_bars), ignore_index=True)
+            bars = bars.sort_values(
+                ["instrument_id", "session_date", "price_mode"], kind="stable",
+            ).reset_index(drop=True)
+        if target_only_guard:
+            bars = self._mark_execution_guard_bars(
+                bars,
+                instrument_ids=target_only_guard,
+                reasons={item: guard_reasons.get(item, ()) for item in target_only_guard},
+                session_dates={increment_scope.history_end.isoformat()},
+            )
         if quarantine_ids:
             quarantine_bars = self._build_quarantine_bars(
                 instruments=instruments,
@@ -2220,58 +2428,124 @@ class DailyPipeline:
             ).reset_index(drop=True)
         action_gap_ids = self._action_gap_instrument_ids(quarantine_detail)
         event_ids = tuple(sorted(
-            set(increment_scope.instrument_ids) - action_gap_ids
+            set(increment_scope.instrument_ids)
+            - action_gap_ids
+            - set(map(str, evidence_guard_ids))
         ))
-        event_scope = UniverseScope(
-            increment_scope.definition,
-            increment_scope.as_of_date,
-            increment_scope.history_start,
-            increment_scope.history_end,
-            survivorship_bias=increment_scope.survivorship_bias,
-            instrument_ids=event_ids,
-        )
-        event_instruments = instruments.loc[
-            instruments["instrument_id"].astype(str).isin(event_ids)
-        ].reset_index(drop=True)
-        event_bars = bars.loc[
-            bars["instrument_id"].astype(str).isin(event_ids)
-        ].reset_index(drop=True)
-        actions = self._scoped_events(
-            self._concat_observation_tables(
-                (
-                    *evidence_results["stock-actions"].observation_ids,
-                    *evidence_results["etf-actions"].observation_ids,
-                ),
-                MarketTable.CORPORATE_ACTIONS,
+        raw_actions = self._concat_observation_tables(
+            (
+                *evidence_results["stock-actions"].observation_ids,
+                *evidence_results["etf-actions"].observation_ids,
             ),
-            date_column="ex_date",
-            scope=event_scope,
+            MarketTable.CORPORATE_ACTIONS,
         )
-        factors = self._scoped_events(
-            self._concat_observation_tables(
-                evidence_results["factors"].observation_ids,
-                MarketTable.ADJUSTMENT_FACTORS,
-            ),
-            date_column="effective_date",
-            scope=event_scope,
+        raw_factors = self._concat_observation_tables(
+            evidence_results["factors"].observation_ids,
+            MarketTable.ADJUSTMENT_FACTORS,
         )
-        try:
-            reconciled, factor_audit_observation_ids, factor_detail = (
-                self._reconcile_action_factor_evidence(
-                    instruments=event_instruments,
-                    actions=actions,
-                    primary_factors=factors,
-                    bars=event_bars,
-                    calendar_frame=calendar_frame,
-                    increment_scope=event_scope,
-                )
+        event_evidence_guard = set(map(str, evidence_guard_ids))
+        remaining_event_ids = set(event_ids)
+        factor_failures: list[Mapping[str, Any]] = []
+        while remaining_event_ids:
+            active_event_ids = tuple(sorted(remaining_event_ids))
+            event_scope = UniverseScope(
+                increment_scope.definition,
+                increment_scope.as_of_date,
+                increment_scope.history_start,
+                increment_scope.history_end,
+                survivorship_bias=increment_scope.survivorship_bias,
+                instrument_ids=active_event_ids,
             )
-        except DailyPipelineBlocked:
-            raise
-        except Exception as exc:
-            raise DailyPipelineBlocked("factors", str(exc), {
-                "error_type": type(exc).__name__,
-            }) from exc
+            event_instruments = instruments.loc[
+                instruments["instrument_id"].astype(str).isin(active_event_ids)
+            ].reset_index(drop=True)
+            event_bars = bars.loc[
+                bars["instrument_id"].astype(str).isin(active_event_ids)
+            ].reset_index(drop=True)
+            actions = self._scoped_events(
+                raw_actions, date_column="ex_date", scope=event_scope,
+            )
+            factors = self._scoped_events(
+                raw_factors, date_column="effective_date", scope=event_scope,
+            )
+            try:
+                reconciled, factor_audit_observation_ids, factor_detail = (
+                    self._reconcile_action_factor_evidence(
+                        instruments=event_instruments,
+                        actions=actions,
+                        primary_factors=factors,
+                        bars=event_bars,
+                        calendar_frame=calendar_frame,
+                        increment_scope=event_scope,
+                    )
+                )
+                break
+            except Exception as exc:
+                error = f"{type(exc).__name__}:{str(exc)[:1000]}"
+                mentioned = set(re.findall(r"\b\d{6}\.(?:SH|SZ)\b", error))
+                affected = mentioned & remaining_event_ids
+                if not affected:
+                    try:
+                        affected = set(build_factor_audit_candidates(
+                            instruments=event_instruments,
+                            actions=actions,
+                            factors=factors,
+                            universe_scope=event_scope,
+                            daily_bars=event_bars,
+                        ))
+                    except Exception:
+                        affected = set()
+                    affected &= remaining_event_ids
+                if not affected:
+                    affected = set(remaining_event_ids)
+                for instrument_id in affected:
+                    guard_reasons[instrument_id] = (
+                        *guard_reasons.get(instrument_id, ()),
+                        f"factors:{error}",
+                    )
+                execution_guard.update(affected)
+                event_evidence_guard.update(affected)
+                bars = self._mark_execution_guard_bars(
+                    bars,
+                    instrument_ids=affected,
+                    reasons={item: guard_reasons[item] for item in affected},
+                )
+                factor_failures.append({
+                    "error": error,
+                    "instrument_ids": tuple(sorted(affected)),
+                })
+                remaining_event_ids.difference_update(affected)
+        else:
+            actions = empty_table(MarketTable.CORPORATE_ACTIONS, include_lineage=True)
+            factors = empty_table(MarketTable.ADJUSTMENT_FACTORS, include_lineage=True)
+            report = {
+                "policy": "corporate-action-factor-r2-v1",
+                "status": "degraded_no_trusted_event_scope",
+                "instrument_ids": (),
+                "action_count": 0,
+                "factor_count": 0,
+                "failures": tuple(factor_failures),
+            }
+            reconciled = CorporateActionReconciliationResult(
+                actions, factors, stable_digest(report), report,
+            )
+            factor_audit_observation_ids = ()
+            factor_detail = {
+                "status": "degraded",
+                "failures": tuple(factor_failures),
+                "guarded_instruments": len(event_evidence_guard),
+                "audit_observation_ids": (),
+                "reconciled_actions": 0,
+                "reconciled_factors": 0,
+                "evidence_hash": reconciled.evidence_hash,
+            }
+        if factor_failures and remaining_event_ids:
+            factor_detail = {
+                **dict(factor_detail),
+                "status": "degraded",
+                "failures": tuple(factor_failures),
+                "guarded_instruments": len(event_evidence_guard),
+            }
         actions = reconciled.actions
         factors = reconciled.factors
         input_ids = tuple(sorted({
@@ -2295,22 +2569,63 @@ class DailyPipeline:
         )
         if quarantine_ids:
             description += f" degraded_quarantine={len(quarantine_ids)}"
-        claims = tuple(
+        if execution_guard:
+            description += f" execution_evidence_guard={len(execution_guard)}"
+        complete_event_ids = tuple(sorted(
+            set(increment_scope.instrument_ids) - event_evidence_guard
+        ))
+        incomplete_event_ids = tuple(sorted(event_evidence_guard))
+        claims: list[CoverageClaim] = [
             CoverageClaim(
-                table,
+                MarketTable.INSTRUMENTS,
                 True,
-                None if table is MarketTable.INSTRUMENTS else increment_scope.history_start,
-                None if table is MarketTable.INSTRUMENTS else increment_scope.history_end,
+                instrument_ids=increment_scope.instrument_ids,
+                detail=f"Composed by {PIPELINE_VERSION}",
+            ),
+            CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                increment_scope.history_start,
+                increment_scope.history_end,
                 increment_scope.instrument_ids,
                 f"Composed by {PIPELINE_VERSION}",
-            )
-            for table in (
-                MarketTable.INSTRUMENTS,
-                MarketTable.DAILY_BARS,
-                MarketTable.CORPORATE_ACTIONS,
-                MarketTable.ADJUSTMENT_FACTORS,
-            )
-        )
+            ),
+        ]
+        for table in (
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        ):
+            if complete_event_ids:
+                claims.append(CoverageClaim(
+                    table,
+                    True,
+                    increment_scope.history_start,
+                    increment_scope.history_end,
+                    complete_event_ids,
+                    f"Complete trusted event scope composed by {PIPELINE_VERSION}",
+                ))
+            if incomplete_event_ids:
+                claims.append(CoverageClaim(
+                    table,
+                    False,
+                    increment_scope.history_start,
+                    increment_scope.history_end,
+                    incomplete_event_ids,
+                    "Auxiliary event evidence unresolved; execution prohibited",
+                ))
+        auxiliary_evidence_gap = {
+            "instrument_ids": incomplete_event_ids,
+            "start_date": increment_scope.history_start,
+            "end_date": increment_scope.history_end,
+            "tables": (
+                MarketTable.CORPORATE_ACTIONS.value,
+                MarketTable.ADJUSTMENT_FACTORS.value,
+            ),
+            "reasons_by_instrument": {
+                item: tuple(guard_reasons.get(item, ()))
+                for item in incomplete_event_ids
+            },
+        } if incomplete_event_ids else None
         payload = ObservationPayload(
             f"canonical-reconciler-{PIPELINE_VERSION}",
             observed_at,
@@ -2331,7 +2646,7 @@ class DailyPipeline:
                 MarketTable.CORPORATE_ACTIONS: actions,
                 MarketTable.ADJUSTMENT_FACTORS: factors,
             },
-            claims,
+            tuple(claims),
             {
                 "kind": "field_level_reconciliation",
                 "reconciliation_ready": True,
@@ -2345,8 +2660,30 @@ class DailyPipeline:
                     ),
                     "corporate_action_evidence_hash": reconciled.evidence_hash,
                     "degraded_quarantine": to_primitive(quarantine_detail),
+                    "execution_evidence_guard": {
+                        "instrument_ids": tuple(sorted(execution_guard)),
+                        "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                        "reasons_by_instrument": {
+                            item: tuple(guard_reasons.get(item, ()))
+                            for item in sorted(execution_guard)
+                        },
+                    },
+                    "degraded_auxiliary_evidence": auxiliary_evidence_gap,
+                    "non_blocking_degradations": (
+                        ("auxiliary_event_evidence_incomplete",)
+                        if incomplete_event_ids else ()
+                    ),
                 },
                 "degraded_quarantine": to_primitive(quarantine_detail),
+                "execution_evidence_guard": {
+                    "instrument_ids": tuple(sorted(execution_guard)),
+                    "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                    "reasons_by_instrument": {
+                        item: tuple(guard_reasons.get(item, ()))
+                        for item in sorted(execution_guard)
+                    },
+                },
+                "degraded_auxiliary_evidence": auxiliary_evidence_gap,
             },
         )
         return self.warehouse.record_observation(payload).observation_id, {
@@ -2388,9 +2725,8 @@ class DailyPipeline:
                 lineage = {
                     "kind": "daily_instrument_data_gap_quarantine_v1",
                     "policy": {
-                        "maximum_instruments": MAX_DEGRADED_INSTRUMENTS,
-                        "maximum_fraction": MAX_DEGRADED_FRACTION,
-                        "maximum_consecutive_sessions": MAX_CONSECUTIVE_DEGRADED_SESSIONS,
+                        "name": "daily-instrument-data-gap-quarantine-never-block-v2",
+                        "blocking_thresholds_enforced": False,
                     },
                     "consecutive_sessions": counts.get(instrument_id),
                     "reasons": reasons.get(instrument_id, ()),
@@ -2407,7 +2743,9 @@ class DailyPipeline:
                     "close": pd.NA,
                     "volume": 0,
                     "amount": pd.NA,
-                    "suspended": True,
+                    # A quarantine row means tradability is unresolved.  It is
+                    # not evidence that the instrument was suspended.
+                    "suspended": pd.NA,
                     "is_st": pd.NA,
                     "trade_rule_id": DATA_GAP_QUARANTINE_RULE_ID,
                     "trade_rule_known_date": session,
@@ -2434,6 +2772,144 @@ class DailyPipeline:
             ).columns,
         )
 
+    @staticmethod
+    def _build_execution_guard_bars(
+        *,
+        instruments: pd.DataFrame,
+        research_bars: pd.DataFrame,
+        calendar: pd.DataFrame,
+        scope: UniverseScope,
+        instrument_ids: tuple[str, ...],
+        reasons: Mapping[str, tuple[str, ...]],
+        source_observation_id: str,
+    ) -> pd.DataFrame:
+        """Keep every trustworthy research price while making execution impossible."""
+
+        selected = instruments.loc[
+            instruments["instrument_id"].astype(str).isin(instrument_ids)
+        ].set_index("instrument_id", drop=False)
+        research = research_bars.loc[
+            research_bars["instrument_id"].astype(str).isin(instrument_ids)
+            & research_bars["price_mode"].astype(str).eq("raw")
+        ].copy()
+        keys = ["instrument_id", "session_date"]
+        if research.duplicated(keys).any():
+            raise DailyPipelineBlocked(
+                "research", "execution-guard research prices contain duplicate daily keys"
+            )
+        research_by_key = {
+            (str(row["instrument_id"]), str(row["session_date"])[:10]): row
+            for row in research.to_dict("records")
+        }
+        open_by_exchange = {
+            str(exchange): tuple(sorted(map(str, group.loc[
+                group["is_open"].fillna(False).astype(bool), "session_date",
+            ])))
+            for exchange, group in calendar.groupby("exchange")
+        }
+        records: list[dict[str, Any]] = []
+        for instrument_id in instrument_ids:
+            item = selected.loc[instrument_id]
+            listed = str(item["listed_date"])[:10]
+            delisted = (
+                None if pd.isna(item.get("delisted_date"))
+                else str(item["delisted_date"])[:10]
+            )
+            for session in open_by_exchange.get(str(item["exchange"]), ()):
+                if not scope.history_start.isoformat() <= session <= scope.history_end.isoformat():
+                    continue
+                if session < listed or (delisted is not None and session > delisted):
+                    continue
+                upstream = research_by_key.get((instrument_id, session), {})
+                row = dict(upstream)
+                upstream_lineage = row.get("field_lineage")
+                lineage = {
+                    "kind": "daily_execution_evidence_gap_guard_v1",
+                    "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                    "reasons": tuple(reasons.get(instrument_id, ())),
+                    "price_semantics": (
+                        "trusted_research_price_preserved"
+                        if upstream else "no_trusted_price_available"
+                    ),
+                    "execution": "prohibited_and_deferred",
+                    "upstream_lineage": upstream_lineage,
+                    "upstream_observation_id": row.get("source_observation_id"),
+                }
+                row.update({
+                    "instrument_id": instrument_id,
+                    "session_date": session,
+                    "price_mode": "raw",
+                    "volume": row.get("volume", 0) if upstream else 0,
+                    "amount": row.get("amount", pd.NA),
+                    "suspended": pd.NA,
+                    "is_st": pd.NA,
+                    "trade_rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                    "trade_rule_known_date": session,
+                    "buy_lot": item["buy_lot"],
+                    "quantity_step": item.get("quantity_step"),
+                    "odd_lot_sell_all": item.get("odd_lot_sell_all"),
+                    "price_tick": item["price_tick"],
+                    "sell_delay_sessions": item.get("sell_delay_sessions"),
+                    "price_limit_state": "unknown",
+                    "previous_close": pd.NA,
+                    "price_limit_ratio": pd.NA,
+                    "limit_up": pd.NA,
+                    "limit_down": pd.NA,
+                    "field_lineage": canonical_json(lineage),
+                    "source_payload": canonical_json(lineage),
+                    "source_provider": row.get(
+                        "source_provider", DATA_GAP_QUARANTINE_PROVIDER,
+                    ),
+                    "source_observation_id": row.get(
+                        "source_observation_id", source_observation_id,
+                    ),
+                    "observed_at": row.get("observed_at", pd.NA),
+                })
+                for column in ("open", "high", "low", "close"):
+                    row.setdefault(column, pd.NA)
+                records.append(row)
+        return pd.DataFrame(
+            records,
+            columns=empty_table(
+                MarketTable.DAILY_BARS, include_lineage=True,
+            ).columns,
+        )
+
+    @staticmethod
+    def _mark_execution_guard_bars(
+        bars: pd.DataFrame,
+        *,
+        instrument_ids: set[str],
+        reasons: Mapping[str, tuple[str, ...]],
+        session_dates: set[str] | None = None,
+    ) -> pd.DataFrame:
+        result = bars.copy(deep=True)
+        mask = result["instrument_id"].astype(str).isin(instrument_ids)
+        if session_dates is not None:
+            mask &= result["session_date"].astype(str).isin(session_dates)
+        result.loc[mask, "suspended"] = pd.NA
+        result.loc[mask, "is_st"] = pd.NA
+        result.loc[mask, "trade_rule_id"] = EXECUTION_EVIDENCE_GAP_RULE_ID
+        result.loc[mask, "trade_rule_known_date"] = result.loc[mask, "session_date"]
+        result.loc[mask, "price_limit_state"] = "unknown"
+        result.loc[mask, [
+            "previous_close", "price_limit_ratio", "limit_up", "limit_down",
+        ]] = pd.NA
+        for index in result.index[mask]:
+            value = result.at[index, "field_lineage"]
+            try:
+                lineage = json.loads(str(value)) if str(value).strip() else {}
+            except json.JSONDecodeError:
+                lineage = {"upstream_lineage": str(value)}
+            instrument_id = str(result.at[index, "instrument_id"])
+            lineage["daily_execution_evidence_gap_guard_v1"] = {
+                "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                "reasons": tuple(reasons.get(instrument_id, ())),
+                "execution": "prohibited_and_deferred",
+            }
+            result.at[index, "field_lineage"] = canonical_json(lineage)
+        return result
+
     def _concat_observation_tables(
         self, observation_ids, table: MarketTable,
     ) -> pd.DataFrame:
@@ -2444,7 +2920,7 @@ class DailyPipeline:
                 continue
             frames.append(self.warehouse.read_observation_table(observation_id, table))
         if not frames:
-            return pd.DataFrame()
+            return empty_table(table, include_lineage=True)
         return pd.concat(frames, ignore_index=True)
 
     @staticmethod

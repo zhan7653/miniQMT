@@ -98,10 +98,68 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
     schedule = settings.fee_schedule
     agent = settings.agent.policies["paper-agent"]
     policy = build_policy(agent.kind, agent.params)
+    for declared in settings.agent.policies.values():
+        build_policy(declared.kind, declared.params)
 
     assert policy.policy_id == "momentum-rotation"
     assert policy.risk_instrument == "510300.SH"
     assert policy.defensive_instrument == "511010.SH"
+    assert {
+        item.account_id for item in settings.daily.accounts
+    } >= {
+        "paper-dividend-rules",
+        "paper-crash-aggressive",
+        "paper-crash-cn-small",
+        "paper-crash-cn-wide",
+        "paper-crash-conservative",
+        "paper-crash-fast-profit",
+        "paper-crash-global",
+        "paper-crash-semiconductor",
+        "paper-crash-vol-control",
+        "paper-dual-momentum",
+        "paper-inverse-vol",
+        "paper-low-beta",
+        "paper-risk-parity",
+        "paper-st-momentum",
+        "paper-st-removal",
+        "paper-trend-vol",
+    }
+    assert build_policy(
+        settings.agent.policies["paper-dividend-rules"].kind,
+        settings.agent.policies["paper-dividend-rules"].params,
+    ).policy_id == "dividend-rules"
+    assert build_policy(
+        settings.agent.policies["paper-dual-momentum"].kind,
+        settings.agent.policies["paper-dual-momentum"].params,
+    ).policy_id == "dual-momentum"
+    assert build_policy(
+        settings.agent.policies["paper-inverse-vol"].kind,
+        settings.agent.policies["paper-inverse-vol"].params,
+    ).policy_id == "inverse-volatility"
+    assert build_policy(
+        settings.agent.policies["paper-risk-parity"].kind,
+        settings.agent.policies["paper-risk-parity"].params,
+    ).policy_id == "correlation-risk-parity"
+    assert build_policy(
+        settings.agent.policies["paper-trend-vol"].kind,
+        settings.agent.policies["paper-trend-vol"].params,
+    ).policy_id == "trend-volatility-target"
+    assert build_policy(
+        settings.agent.policies["paper-low-beta"].kind,
+        settings.agent.policies["paper-low-beta"].params,
+    ).policy_id == "low-beta-volatility"
+    assert build_policy(
+        settings.agent.policies["paper-st-removal"].kind,
+        settings.agent.policies["paper-st-removal"].params,
+    ).policy_id == "st-removal-momentum"
+    assert build_policy(
+        settings.agent.policies["paper-st-momentum"].kind,
+        settings.agent.policies["paper-st-momentum"].params,
+    ).policy_id == "st-active-momentum"
+    assert build_policy(
+        settings.agent.policies["paper-crash-global"].kind,
+        settings.agent.policies["paper-crash-global"].params,
+    ).policy_id == "crisis-drawdown"
 
     before_2022 = schedule.calculate(
         day=date(2022, 4, 28), asset_type="stock", exchange="SH",

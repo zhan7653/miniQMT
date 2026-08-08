@@ -115,8 +115,21 @@ class DailyRunLauncher:
 
 
 def _tail(path: Path, lines: int) -> list[str]:
+    wanted = max(1, lines)
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            chunks: list[bytes] = []
+            newlines = 0
+            while position > 0 and newlines <= wanted:
+                size = min(8192, position)
+                position -= size
+                handle.seek(position)
+                chunk = handle.read(size)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
     except OSError:
         return []
-    return content.splitlines()[-max(1, lines):]
+    content = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    return content.splitlines()[-wanted:]

@@ -532,12 +532,16 @@ class _BaoStockClient:
 
     def __init__(self):
         self.logged_out = False
+        self.login_count = 0
+        self.logout_count = 0
 
     def login(self):
+        self.login_count += 1
         return _Result((), ())
 
     def logout(self):
         self.logged_out = True
+        self.logout_count += 1
 
     def query_history_k_data_plus(self, code, fields, **kwargs):
         assert code == "sh.600000" and kwargs["adjustflag"] == "3"
@@ -561,6 +565,77 @@ def test_baostock_adapter_preserves_tradability_and_share_units():
     assert bars.iloc[0]["suspended"] == False  # noqa: E712
     assert bars.iloc[0]["price_limit_state"] == "unknown"
     assert client.logged_out
+
+
+def test_baostock_session_reuses_one_login_without_changing_observations():
+    client = _BaoStockClient()
+    provider = BaoStockProvider(client=client)
+    request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW, START, END, ("600000.SH",),
+    )
+
+    with provider.session():
+        first = provider.observe(request)
+        second = provider.observe(request)
+
+    assert first.request == second.request == request
+    assert first.tables[MarketTable.DAILY_BARS].equals(
+        second.tables[MarketTable.DAILY_BARS]
+    )
+    assert client.login_count == 1
+    assert client.logout_count == 1
+
+
+def test_baostock_session_does_not_login_when_every_batch_is_already_restored():
+    client = _BaoStockClient()
+    provider = BaoStockProvider(client=client)
+
+    with provider.session():
+        pass
+
+    assert client.login_count == 0
+    assert client.logout_count == 0
+
+
+def test_baostock_session_cleanup_failure_does_not_erase_completed_batches():
+    class LogoutFailsClient(_BaoStockClient):
+        def logout(self):
+            super().logout()
+            raise RuntimeError("logout transport already closed")
+
+    client = LogoutFailsClient()
+    provider = BaoStockProvider(client=client)
+    request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW, START, END, ("600000.SH",),
+    )
+
+    with provider.session():
+        observed = provider.observe(request)
+
+    assert observed.coverage[0].complete
+    assert client.login_count == 1
+    assert client.logout_count == 1
+
+
+def test_baostock_shared_session_failure_replays_through_original_one_shot_path():
+    class FailsFirstSessionClient(_BaoStockClient):
+        def query_history_k_data_plus(self, code, fields, **kwargs):
+            if self.login_count == 1:
+                raise RuntimeError("shared session expired")
+            return super().query_history_k_data_plus(code, fields, **kwargs)
+
+    client = FailsFirstSessionClient()
+    provider = BaoStockProvider(client=client)
+    request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW, START, END, ("600000.SH",),
+    )
+
+    with provider.session():
+        observed = provider.observe(request)
+
+    assert observed.coverage[0].complete
+    assert client.login_count == 2
+    assert client.logout_count == 2
 
 
 def test_baostock_normalizes_blank_suspended_turnover_to_zero():

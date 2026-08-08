@@ -87,6 +87,12 @@ class MarketDataWarehouse:
         self.root = Path(root).resolve()
         self.observation_root = self.root / "observations"
         self.snapshot_root = self.root / "snapshots"
+        # Observation directories are immutable once committed.  Cache only
+        # parsed manifest headers so the hundreds of exact-match lookups in one
+        # daily cycle do not re-open every historical manifest.  Selected
+        # observations still go through ``load_observation`` and therefore keep
+        # the existing manifest-identity and Parquet-integrity checks.
+        self._observation_headers: dict[str, ObservationManifest] = {}
 
     def initialize(self) -> None:
         self.observation_root.mkdir(parents=True, exist_ok=True)
@@ -262,18 +268,11 @@ class MarketDataWarehouse:
     def observations(self, *, provider: str | None = None) -> tuple[ObservationManifest, ...]:
         """List verified immutable observations without relying on a mutable catalog."""
 
-        if not self.observation_root.is_dir():
-            return ()
-        found = []
-        for directory in sorted(self.observation_root.glob("obs-*")):
-            if not directory.is_dir():
-                continue
-            if provider is not None:
-                candidate = _observation_manifest(_read_json(directory / "manifest.json"))
-                if candidate.provider != provider:
-                    continue
-            manifest = self.load_observation(directory.name)
-            found.append(manifest)
+        found = [
+            self.load_observation(observation_id)
+            for observation_id, candidate in self._indexed_observation_headers()
+            if provider is None or candidate.provider == provider
+        ]
         return tuple(sorted(found, key=lambda item: (item.observed_at, item.observation_id)))
 
     def matching_observations(
@@ -284,14 +283,69 @@ class MarketDataWarehouse:
     ) -> tuple[ObservationManifest, ...]:
         """Find exact request matches, verifying Parquet only for matching manifests."""
 
-        if not self.observation_root.is_dir():
-            return ()
-        found = []
-        for manifest_path in sorted(self.observation_root.glob("obs-*/manifest.json")):
-            candidate = _observation_manifest(_read_json(manifest_path))
-            if candidate.provider == provider and candidate.request == request:
-                found.append(self.load_observation(candidate.observation_id))
+        found = [
+            self.load_observation(observation_id)
+            for observation_id, candidate in self._indexed_observation_headers()
+            if candidate.provider == provider and candidate.request == request
+        ]
         return tuple(sorted(found, key=lambda item: (item.observed_at, item.observation_id)))
+
+    def observations_for_capability(
+        self,
+        *,
+        provider: str,
+        capability: ProviderCapability,
+    ) -> tuple[ObservationManifest, ...]:
+        """List verified observations for one provider/capability request shape.
+
+        Manifest headers are filtered before Parquet verification so resumable
+        range-prefix discovery does not reopen unrelated status/evidence payloads.
+        """
+
+        found = [
+            self.load_observation(observation_id)
+            for observation_id, candidate in self._indexed_observation_headers()
+            if (
+                candidate.provider == provider
+                and candidate.request.capability is capability
+            )
+        ]
+        return tuple(sorted(found, key=lambda item: (item.observed_at, item.observation_id)))
+
+    def _indexed_observation_headers(
+        self,
+    ) -> tuple[tuple[str, ObservationManifest], ...]:
+        """Return current immutable headers, parsing each committed one once.
+
+        Directory names are still enumerated on every call.  That inexpensive
+        refresh makes observations committed by this or another process visible
+        immediately without trusting a mutable persistent catalog.
+        """
+
+        if not self.observation_root.is_dir():
+            self._observation_headers.clear()
+            return ()
+        directories = {
+            item.name: item
+            for item in self.observation_root.glob("obs-*")
+            if item.is_dir()
+        }
+        for observation_id in set(self._observation_headers) - set(directories):
+            self._observation_headers.pop(observation_id, None)
+        for observation_id in sorted(set(directories) - set(self._observation_headers)):
+            manifest_path = directories[observation_id] / "manifest.json"
+            manifest = _observation_manifest(
+                _read_json(manifest_path)
+            )
+            if manifest.observation_id != observation_id:
+                raise IntegrityError(
+                    f"Observation manifest identity mismatch: {observation_id}"
+                )
+            self._observation_headers[observation_id] = manifest
+        return tuple(
+            (key, self._observation_headers[key])
+            for key in sorted(self._observation_headers)
+        )
 
     def read_observation_table(self, observation_id: str, table: MarketTable) -> pd.DataFrame:
         manifest = self.load_observation(observation_id)
@@ -757,6 +811,29 @@ class MarketDataWarehouse:
             require_observation_id=True,
         )
 
+    def query_loaded_instrument_names(
+        self,
+        manifest: SnapshotManifest,
+        *,
+        instrument_ids: Iterable[str] = (),
+    ) -> pd.DataFrame:
+        """Read only canonical instrument identifiers and display names."""
+
+        if manifest.component_selections:
+            from fundlab.marketdata.incremental import (
+                compose_component_snapshot_instrument_names,
+            )
+
+            return compose_component_snapshot_instrument_names(
+                self, manifest, instrument_ids=instrument_ids,
+            )
+        frame = self.query_loaded_snapshot_table(
+            manifest,
+            MarketTable.INSTRUMENTS,
+            instrument_ids=instrument_ids,
+        )
+        return frame.loc[:, ["instrument_id", "name"]].copy()
+
     def publish(self, snapshot_id: str) -> None:
         manifest = self._publishable_snapshot(snapshot_id)
         if manifest.plan.readiness is ReadinessProfile.SIMULATION:
@@ -829,13 +906,18 @@ class MarketDataWarehouse:
             temporary.unlink(missing_ok=True)
 
     def current_snapshot_id(self) -> str:
+        return self.load_current_snapshot().snapshot_id
+
+    def load_current_snapshot(self) -> SnapshotManifest:
+        """Load and verify the manifest pinned by the atomic current pointer."""
+
         pointer = _read_json(self.root / "current.json")
         snapshot_id = str(pointer.get("snapshot_id", ""))
         manifest = self.load_snapshot(snapshot_id)
         actual = _file_hash(self.snapshot_path(snapshot_id) / "manifest.json")
         if pointer.get("manifest_sha256") != actual:
             raise IntegrityError("Current snapshot pointer checksum mismatch")
-        return manifest.snapshot_id
+        return manifest
 
     @staticmethod
     def _verify_files(directory: Path, files: Iterable[StoredFile]) -> None:
@@ -866,6 +948,10 @@ class MarketDataWarehouse:
         from fundlab.marketdata.components import ComponentStore
 
         store = ComponentStore(self.root / "components", self)
+        cache = getattr(self, "_component_manifest_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_component_manifest_cache", cache)
         seen: set[str] = set()
         manifests = []
         for selection in manifest.component_selections:
@@ -873,7 +959,11 @@ class MarketDataWarehouse:
                 raise IntegrityError(
                     f"Snapshot selects a component more than once: {selection.component_id}"
                 )
-            manifests.append(store.load(selection.component_id, verify_payload=False))
+            component = cache.get(selection.component_id)
+            if component is None:
+                component = store.load(selection.component_id, verify_payload=False)
+                cache[selection.component_id] = component
+            manifests.append(component)
             seen.add(selection.component_id)
         for component in manifests:
             missing = set(component.dependency_ids) - seen

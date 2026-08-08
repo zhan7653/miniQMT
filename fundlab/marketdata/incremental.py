@@ -337,10 +337,33 @@ class IncrementalCanonicalPublisher:
             increment_frames=increment_frames,
             added_count=len(added_ids),
         )
+        has_incomplete_auxiliary_coverage = any(
+            not claim.complete
+            and claim.table in {
+                MarketTable.CORPORATE_ACTIONS,
+                MarketTable.ADJUSTMENT_FACTORS,
+            }
+            for manifest in manifests
+            for claim in manifest.coverage
+        )
+        if has_incomplete_auxiliary_coverage:
+            quality = QualityReport(
+                quality.state,
+                quality.errors,
+                tuple(sorted({
+                    *quality.warnings,
+                    "degraded_auxiliary_evidence_coverage",
+                })),
+                quality.row_counts,
+            )
         snapshot = self.warehouse.build_component_snapshot(
             plan=SnapshotPlan(
                 tuple(plan_selections),
                 description,
+                require_complete_coverage=(
+                    predecessor.plan.require_complete_coverage
+                    and not has_incomplete_auxiliary_coverage
+                ),
                 readiness=ReadinessProfile.SIMULATION,
                 universe_scope=universe_scope,
             ),
@@ -968,6 +991,50 @@ def compose_component_snapshot_table(
         if price_mode is not None:
             result = result.loc[result["price_mode"].eq(price_mode)]
     return normalize_table(table, result, require_observation_id=True)
+
+
+def compose_component_snapshot_instrument_names(
+    warehouse,
+    snapshot: SnapshotManifest,
+    *,
+    instrument_ids: Iterable[str] = (),
+) -> pd.DataFrame:
+    """Compose the canonical market-fact fields needed for dashboard labels."""
+
+    requested_ids = tuple(sorted(set(map(str, instrument_ids))))
+    store = ComponentStore(warehouse.root / "components", warehouse)
+    cache = getattr(warehouse, "_component_manifest_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(warehouse, "_component_manifest_cache", cache)
+    selected: list[tuple[SnapshotComponentSelection, ComponentManifest]] = []
+    for ref in snapshot.component_selections:
+        manifest = cache.get(ref.component_id)
+        if manifest is None:
+            manifest = store.load(ref.component_id, verify_payload=False)
+            cache[ref.component_id] = manifest
+        if (
+            manifest.kind is not ComponentKind.MARKET_FACTS
+            or manifest.scope.table is not MarketTable.INSTRUMENTS
+            or "name" not in manifest.scope.fields
+        ):
+            continue
+        if requested_ids and manifest.scope.instrument_ids and not (
+            set(requested_ids) & set(manifest.scope.instrument_ids)
+        ):
+            continue
+        selected.append((ref, manifest))
+    facts = _overlay_kind(
+        store,
+        selected,
+        MarketTable.INSTRUMENTS,
+        requested_ids,
+        None,
+        None,
+    )
+    if facts.empty:
+        return pd.DataFrame(columns=("instrument_id", "name"))
+    return facts.loc[:, ["instrument_id", "name"]].reset_index(drop=True)
 
 
 def _fast_query_legacy(

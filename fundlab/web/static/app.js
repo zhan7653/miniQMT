@@ -3,6 +3,27 @@
 /* ------------------------------------------------------------------ utils */
 
 const $ = (selector) => document.querySelector(selector);
+const UI_BUILD = "20260807-4";
+const SCHEDULE_REFRESHING_MESSAGE = "Task scheduler state is refreshing";
+let scheduleRetryTimer = null;
+
+function scheduleIsRefreshing(value) {
+  if (!value) return false;
+  const message = typeof value === "string" ? value : (value.error || value.message);
+  return message === SCHEDULE_REFRESHING_MESSAGE;
+}
+
+function accountIdFromLocation() {
+  return new URLSearchParams(window.location.search).get("account");
+}
+
+function rememberAccountLocation(accountId) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("ui", UI_BUILD);
+  url.searchParams.set("account", accountId);
+  url.hash = "accounts";
+  window.history.replaceState(null, "", url);
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -119,6 +140,10 @@ const STATUS_LABELS = {
   pending: ["warn", "待执行"], partially_filled: ["warn", "部分成交"],
   partial: ["warn", "部分成交"], filled: ["ok", "已成交"], rejected: ["bad", "已拒绝"],
   expired: ["muted", "已过期"], cancelled: ["muted", "已撤销"],
+  current: ["ok", "当前"], stale: ["warn", "已过期"], missing: ["muted", "无记录"],
+  error: ["bad", "评估失败"], queued: ["warn", "待执行"], consumed: ["ok", "已进入账户"],
+  hold: ["muted", "无需决策"], none: ["muted", "无决策"], invalid: ["bad", "决策损坏"],
+  ready: ["ok", "有效"], idle: ["muted", "尚未成交"],
 };
 
 function statusLabel(status) {
@@ -147,6 +172,7 @@ const EVENT_LABELS = {
   share_distribution_listed: "送转股上市",
   split_applied: "拆并股执行",
   share_cost_basis_adjusted: "持仓成本调整",
+  zero_entitlements_pruned: "清理无效权益",
   portfolio_valued: "组合估值",
   simulation_marked_incomplete: "模拟标记不完整",
 };
@@ -158,6 +184,76 @@ const STAGE_LABELS = {
 };
 
 const SIDE_LABELS = { buy: "买入", sell: "卖出" };
+
+const CRISIS_ACTION_LABELS = {
+  wait: "等待危机", hold: "保持不变", enter: "触发建仓", add_tranche: "分档加仓",
+  exit: "触发退出", cooldown: "退出冷却", initialize_defensive: "建立防守仓",
+  pending_orders: "等待挂单", risk_held: "持有风险仓", defensive: "防守等待",
+};
+
+const CRISIS_PARAMETER_LABELS = {
+  risk_instruments: "风险 ETF 池", defensive_instrument: "防守 ETF", entry_mode: "入场模式",
+  drawdown_days: "回撤窗口", event_lookback_days: "危机事件窗口", confirmation_days: "确认均线",
+  volatility_days: "波动率窗口", minimum_drawdown: "最低回撤", rebound_threshold: "反弹确认",
+  recovery_exit_gap: "接近前高退出", profit_take: "止盈", max_positions: "最多持仓数",
+  entry_risk_weight: "初始风险仓", max_risk_weight: "最高风险仓", max_position_weight: "单标的上限",
+  position_caps: "单独仓位上限", ladder_step: "加仓回撤间隔", tranche_weight: "每档仓位",
+  target_volatility: "目标波动率", cooldown_days: "退出冷却天数", rebalance_threshold: "再平衡阈值",
+};
+
+const instrumentNames = {};
+
+function rememberInstrumentName(instrumentId, instrumentName) {
+  if (!instrumentId) return;
+  if (instrumentName) instrumentNames[instrumentId] = instrumentName;
+  else delete instrumentNames[instrumentId];
+}
+
+function rememberStrategyInstruments(accounts) {
+  for (const account of Array.isArray(accounts) ? accounts : []) {
+    for (const item of Array.isArray(account.strategy_instruments) ? account.strategy_instruments : []) {
+      rememberInstrumentName(item.instrument_id, item.instrument_name);
+    }
+    for (const collection of [account.positions, account.pending_orders]) {
+      for (const item of Array.isArray(collection) ? collection : []) {
+        rememberInstrumentName(item.instrument_id, item.instrument_name);
+      }
+    }
+    for (const item of Array.isArray(account.recent_events) ? account.recent_events : []) {
+      rememberInstrumentName(item.payload && item.payload.instrument_id, item.instrument_name);
+    }
+    const nearest = account.nearest_signal;
+    if (nearest) rememberInstrumentName(nearest.instrument_id, nearest.instrument_name);
+  }
+}
+
+function instrumentLabel(instrumentId, instrumentName = null) {
+  if (!instrumentId) return "—";
+  const name = instrumentName || instrumentNames[instrumentId];
+  return name ? `${name}（${instrumentId}）` : instrumentId;
+}
+
+function compactInstrumentList(items, limit = 4) {
+  const visible = (items || []).slice(0, limit);
+  const labels = visible.map((item) => instrumentLabel(item.instrument_id, item.instrument_name));
+  if ((items || []).length > limit) labels.push(`另 ${items.length - limit} 个`);
+  return labels.join("、");
+}
+
+function strategyUniverseSummary(item) {
+  const universe = item.strategy_universe || "动态选股";
+  const instruments = item.strategy_instruments || [];
+  if (!instruments.length) return `${universe}：标的随规则每日筛选`;
+  const separator = universe.includes("动态") ? "；固定参考标的：" : "：";
+  return `${universe}${separator}${compactInstrumentList(instruments)}`;
+}
+
+const CRISIS_SHORT_NAMES = {
+  "paper-crash-global": "全球宽池", "paper-crash-cn-small": "A股精简",
+  "paper-crash-cn-wide": "A股宽池", "paper-crash-conservative": "保守反转",
+  "paper-crash-aggressive": "激进阶梯", "paper-crash-vol-control": "波动控制",
+  "paper-crash-fast-profit": "快速止盈", "paper-crash-semiconductor": "半导体危机",
+};
 
 const REASON_LABELS = {
   static_allocation: "静态权重配置",
@@ -197,6 +293,7 @@ const PAYLOAD_FIELDS = [
   ["remaining_quantity", "剩余", qty],
   ["entitled_quantity", "登记数量", qty],
   ["new_quantity", "新增数量", qty],
+  ["pruned_count", "清理记录", qty],
   ["price", "价格", price],
   ["reference_price", "参考价", price],
   ["amount", "金额", money],
@@ -271,7 +368,7 @@ for (const tab of document.querySelectorAll(".tab")) {
     tab.classList.add("active");
     tab.setAttribute("aria-current", "true");
     $(`#panel-${tab.dataset.tab}`).classList.add("active");
-    refreshTab(tab.dataset.tab);
+    refreshTab(tab.dataset.tab, { onlyIfNeeded: true });
   });
 }
 
@@ -282,12 +379,20 @@ function activeTab() {
 /* --------------------------------------------------------------- overview */
 
 let sessionCutoff = null;
+let accountListCache = null;
+const accountDetailCache = new Map();
 
 async function loadOverview() {
+  clearTimeout(scheduleRetryTimer);
+  scheduleRetryTimer = null;
   const data = await api("/api/overview");
   const market = data.market || {};
   const schedule = data.schedule || {};
   sessionCutoff = data.config ? data.config.session_cutoff_local : null;
+  accountListCache = data.accounts || [];
+  accountDetailCache.clear();
+  for (const tabName of ["accounts", "monitor", "agent"]) loadedTabs.delete(tabName);
+  rememberStrategyInstruments(data.accounts);
 
   const run = data.run || {};
   let runValue;
@@ -305,12 +410,12 @@ async function loadOverview() {
   $("#overview-cards").replaceChildren(
     card("数据快照", market.published_end || market.error || "—",
       market.snapshot_id ? `${market.instruments} 个标的 · ${market.snapshot_id}` : ""),
-    card("计划任务", schedule.exists
-      ? `${schedule.time || "?"}（${schedule.enabled ? "已启用" : "已停用"}）`
-      : (schedule.error ? "查询失败" : "未设置"),
-      schedule.next_run_time ? `下次运行 ${fmtDateTime(schedule.next_run_time)}` : (schedule.error || "")),
+    overviewScheduleCard(schedule),
     card("手动运行", runValue, runSub),
   );
+  if (scheduleIsRefreshing(schedule)) {
+    scheduleRetryTimer = setTimeout(() => refreshOverviewSchedule(0), 750);
+  }
 
   const accounts = $("#overview-accounts");
   const accountCards = (data.accounts || []).map((item) => {
@@ -323,17 +428,21 @@ async function loadOverview() {
       }
     }
     const node = card(
-      `${item.name}（${item.strategy === "static" ? "静态权重" : "Agent 决策"}）`,
+      `${item.name} · ${item.strategy_name || item.strategy_kind || "策略"}`,
       value,
-      item.exists
-        ? `头寸日 ${item.head_date || "—"} · 持仓 ${item.positions} · 挂单 ${item.pending_orders}`
-        : `初始资金 ${money(item.initial_cash)}，首次运行时自动创建`,
+      el("div", { class: "strategy-card-details" }, [
+        el("div", { class: "strategy-idea", text: item.strategy_description || "—" }),
+        el("div", {
+          class: "strategy-instruments",
+          text: strategyUniverseSummary(item),
+        }),
+        el("div", { class: "strategy-account-state", text: item.exists
+          ? `头寸日 ${item.head_date || "—"} · 持仓 ${item.positions} · 挂单 ${item.pending_orders}`
+          : `初始资金 ${money(item.initial_cash)}，首次运行时自动创建` }),
+      ]),
     );
     clickable(node, () => {
-      // The accounts dropdown is only populated when that tab loads, so stash
-      // the choice and apply it after loadAccountList has filled the options.
-      pendingAccountId = item.account_id;
-      document.querySelector('[data-tab="accounts"]').click();
+      openAccountFromOverview(item.account_id).then(clearError).catch(showError);
     });
     return node;
   });
@@ -347,11 +456,49 @@ async function loadOverview() {
     last.replaceChildren(el("div", { class: "empty", text: "还没有运行记录" }));
   }
 
-  const now = new Date();
-  const clock = now.toTimeString().slice(0, 8);
   $("#topbar-status").textContent = market.snapshot_id
-    ? `快照 ${market.snapshot_id.slice(0, 18)}… · 数据至 ${market.published_end} · 更新于 ${clock}`
-    : `快照信息不可用 · 更新于 ${clock}`;
+    ? `快照 ${market.snapshot_id.slice(0, 18)}… · canonical 数据至 ${market.published_end} · UI ${UI_BUILD}`
+    : `快照信息不可用 · UI ${UI_BUILD}`;
+}
+
+function overviewScheduleCard(schedule) {
+  let value;
+  let sub = "";
+  if (scheduleIsRefreshing(schedule)) {
+    value = "正在读取";
+    sub = "后台读取 Windows 计划任务状态";
+  } else if (schedule.exists) {
+    value = `${schedule.time || "?"}（${schedule.enabled ? "已启用" : "已停用"}）`;
+    sub = schedule.next_run_time ? `下次运行 ${fmtDateTime(schedule.next_run_time)}` : "";
+  } else {
+    value = schedule.error ? "查询失败" : "未设置";
+    sub = schedule.error || "";
+  }
+  const node = card("计划任务", value, sub);
+  node.id = "overview-schedule-card";
+  return node;
+}
+
+async function refreshOverviewSchedule(attempt) {
+  if (activeTab() !== "overview") return;
+  try {
+    const state = await api("/api/schedule");
+    $("#overview-schedule-card").replaceWith(overviewScheduleCard(state));
+  } catch (error) {
+    if (scheduleIsRefreshing(error)) {
+      $("#overview-schedule-card").replaceWith(overviewScheduleCard({
+        error: SCHEDULE_REFRESHING_MESSAGE,
+      }));
+      scheduleRetryTimer = setTimeout(
+        () => refreshOverviewSchedule(attempt + 1),
+        Math.min(750 * (attempt + 1), 5000),
+      );
+      return;
+    }
+    $("#overview-schedule-card").replaceWith(overviewScheduleCard({
+      error: String(error.message || error),
+    }));
+  }
 }
 
 function card(title, value, sub) {
@@ -391,24 +538,370 @@ function renderReportSummary(report) {
   ]);
 }
 
+/* ------------------------------------------------------ strategy monitor */
+
+let monitorPayload = null;
+let monitorHistory = null;
+let monitorPerformanceChart = null;
+let monitorSignalChart = null;
+
+function crisisAction(action) {
+  return CRISIS_ACTION_LABELS[action] || action || "尚无评估";
+}
+
+function monitorAccount(accountId) {
+  return (monitorPayload && monitorPayload.accounts || []).find((item) => item.account_id === accountId);
+}
+
+async function loadMonitor() {
+  monitorPayload = await api("/api/agent/monitor");
+  rememberStrategyInstruments(monitorPayload.accounts);
+  const summary = monitorPayload.summary || {};
+  const market = monitorPayload.market || {};
+  $("#monitor-summary").replaceChildren(
+    card("危机策略", `${summary.configured || 0} 个`, `数据截至 ${market.published_end || "—"}`),
+    card("当前评估", `${summary.current || 0} / ${summary.configured || 0}`,
+      summary.errors ? `${summary.errors} 个失败` : "全部按证据状态展示"),
+    card("状态变化", `${summary.triggered || 0} 个`, "建仓、加仓或退出信号"),
+    card("人工干预", `${summary.manual || 0} 个`, "人工介入后不再视为纯策略"),
+  );
+
+  const accounts = monitorPayload.accounts || [];
+  const strategies = $("#monitor-strategies");
+  if (!accounts.length) {
+    strategies.replaceChildren(el("div", { class: "empty", text: "尚未配置危机策略账户" }));
+    renderMonitorPerformance([]);
+    return;
+  }
+  strategies.replaceChildren(...accounts.map((item) => monitorStrategyCard(item)));
+  renderMonitorPerformance(accounts);
+
+  const select = $("#monitor-account-select");
+  const current = select.value;
+  select.replaceChildren(...accounts.map((item) => el("option", {
+    value: item.account_id,
+    text: `${CRISIS_SHORT_NAMES[item.account_id] || item.name}（${item.account_id}）`,
+  })));
+  if (current && accounts.some((item) => item.account_id === current)) select.value = current;
+  await loadMonitorDetail();
+}
+
+function monitorStrategyCard(item) {
+  const evaluation = item.evaluation || {};
+  const successful = evaluation.status === "ready" ? evaluation : (item.last_success || {});
+  const nearest = item.nearest_signal;
+  const performance = item.performance || {};
+  const progress = nearest ? Math.max(0, Math.min(1, Number(nearest.trigger_progress))) : 0;
+  const node = el("div", { class: "card monitor-strategy-card" }, [
+    el("div", { class: "monitor-card-head" }, [
+      el("strong", { text: CRISIS_SHORT_NAMES[item.account_id] || item.name }),
+      statusBadge(item.evaluation_status),
+    ]),
+    el("div", { class: "monitor-action", text: crisisAction(successful.action) }),
+    nearest ? el("div", { class: "monitor-progress-block" }, [
+      el("div", { class: "hint", text: `${instrumentLabel(nearest.instrument_id, nearest.instrument_name)} · 触发进度 ${percent(progress)}` }),
+      el("div", { class: "progress-track" }, el("span", {
+        class: "progress-fill",
+        style: `width:${(progress * 100).toFixed(1)}%`,
+      })),
+    ]) : el("div", { class: "hint", text: item.stale_reason || "暂无可用 ETF 信号" }),
+    el("div", { class: "monitor-card-stats" }, [
+      el("span", {}, ["累计 ", signed(performance.actual_return, { asPercent: true })]),
+      el("span", {}, ["当前版本 ", signed(performance.current_config_return, { asPercent: true })]),
+    ]),
+    item.manual_intervention
+      ? el("span", { class: "badge warn", text: "含人工干预" })
+      : el("span", { class: "badge ok", text: "纯策略" }),
+  ]);
+  clickable(node, () => {
+    $("#monitor-account-select").value = item.account_id;
+    loadMonitorDetail().then(clearError).catch(showError);
+  });
+  return node;
+}
+
+function renderMonitorPerformance(accounts) {
+  const container = $("#monitor-performance-chart");
+  if (!monitorPerformanceChart) monitorPerformanceChart = echarts.init(container);
+  const labels = accounts.map((item) => {
+    const name = CRISIS_SHORT_NAMES[item.account_id] || item.name;
+    return item.manual_intervention ? `${name}*` : name;
+  });
+  const actual = accounts.map((item) => {
+    const value = Number((item.performance || {}).actual_return);
+    return Number.isFinite(value) ? value * 100 : null;
+  });
+  const version = accounts.map((item) => {
+    if (item.manual_intervention) return null;
+    const value = Number((item.performance || {}).current_config_return);
+    return Number.isFinite(value) ? value * 100 : null;
+  });
+  monitorPerformanceChart.setOption({
+    color: [cssVar("--accent", "#4f46e5"), cssVar("--warn", "#d97706")],
+    textStyle: { fontFamily: cssVar("--sans", "sans-serif") },
+    tooltip: { trigger: "axis", valueFormatter: (value) => value == null ? "—" : `${Number(value).toFixed(2)}%` },
+    legend: { top: 8, data: ["账户真实累计", "当前配置版本"] },
+    grid: { left: 20, right: 20, top: 48, bottom: 20, containLabel: true },
+    xAxis: { type: "category", data: labels, axisLabel: { interval: 0, rotate: labels.length > 5 ? 20 : 0 } },
+    yAxis: { type: "value", axisLabel: { formatter: "{value}%" } },
+    series: [
+      { name: "账户真实累计", type: "bar", data: actual, barMaxWidth: 30 },
+      { name: "当前配置版本", type: "bar", data: version, barMaxWidth: 30 },
+    ],
+  }, true);
+  monitorPerformanceChart.resize();
+}
+
+async function loadMonitorDetail() {
+  const accountId = $("#monitor-account-select").value;
+  const account = monitorAccount(accountId);
+  if (!account) return;
+  renderMonitorDetailLoading(account);
+  const history = await api(`/api/agent/evaluations/${encodeURIComponent(accountId)}?limit=90`);
+  if ($("#monitor-account-select").value !== accountId) return;
+  monitorHistory = history;
+  renderMonitorDetail(account, history);
+}
+
+function renderMonitorDetailLoading(account) {
+  $("#monitor-detail-freshness").replaceChildren(
+    statusBadge("running"),
+    el("span", { class: "hint", text: `正在读取 ${CRISIS_SHORT_NAMES[account.account_id] || account.name} 的正式评估证据` }),
+  );
+  $("#monitor-detail-metrics").replaceChildren(card("策略详情", "加载中…", "读取最近 90 个交易日"));
+  $("#monitor-state-flow").replaceChildren();
+  $("#monitor-signals-table").replaceChildren();
+  $("#monitor-parameters-table").replaceChildren();
+  $("#monitor-instrument-select").replaceChildren();
+  $("#monitor-timeline-table").replaceChildren();
+  if (monitorSignalChart) monitorSignalChart.clear();
+}
+
+function renderMonitorDetail(account, history) {
+  const evaluation = account.evaluation || {};
+  const successful = evaluation.status === "ready" ? evaluation : (account.last_success || {});
+  const performance = account.performance || {};
+  const decision = account.decision || { status: "none" };
+  const execution = account.execution || {};
+  const positions = execution.positions || [];
+  const pendingOrders = execution.pending_orders || [];
+  $("#monitor-detail-freshness").replaceChildren(...[
+    statusBadge(account.evaluation_status),
+    account.stale_reason ? el("span", { class: "hint", text: account.stale_reason }) : null,
+  ].filter(Boolean));
+  $("#monitor-detail-metrics").replaceChildren(
+    card("策略信号", crisisAction(successful.action), successful.as_of ? `数据截至 ${successful.as_of}` : "无成功评估"),
+    card("目标决策", statusLabel(decision.status), decision.decision_date ? `目标日 ${decision.decision_date}` : "未生成交易目标"),
+    card("实际账户", positions.length ? `${positions.length} 个持仓` : "暂无持仓",
+      `头寸日 ${execution.head_date || "—"} · 挂单 ${pendingOrders.length}`),
+    card("累计收益", signed(performance.actual_return, { asPercent: true }),
+      `当前配置 ${percent(performance.current_config_return)} · 自 ${performance.current_config_start || "—"}`),
+  );
+  renderMonitorFlow(account, successful);
+  renderMonitorSignals(successful);
+  renderMonitorParameters(account.parameters || {});
+  renderMonitorHistory(history);
+}
+
+function renderMonitorFlow(account, successful) {
+  const decision = account.decision || { status: "none" };
+  const execution = account.execution || {};
+  let executionStatus = "idle";
+  let executionText = "尚未进入持仓";
+  if ((execution.pending_orders || []).length) {
+    executionStatus = "pending";
+    executionText = `${execution.pending_orders.length} 个挂单`;
+  } else if ((execution.positions || []).length) {
+    executionStatus = "active";
+    executionText = `${execution.positions.length} 个实际持仓`;
+  }
+  $("#monitor-state-flow").replaceChildren(
+    monitorFlowStep("1. 策略信号", account.evaluation_status,
+      crisisAction(successful.action), successful.reason),
+    el("span", { class: "state-arrow", text: "→" }),
+    monitorFlowStep("2. 目标决策", decision.status,
+      statusLabel(decision.status), decision.decision_date ? `目标日 ${decision.decision_date}` : "无可执行文件"),
+    el("span", { class: "state-arrow", text: "→" }),
+    monitorFlowStep("3. 模拟执行", executionStatus,
+      statusLabel(executionStatus), executionText),
+  );
+}
+
+function monitorFlowStep(title, status, value, detail) {
+  return el("div", { class: "state-step" }, [
+    el("div", { class: "hint", text: title }),
+    el("div", { class: "row compact-row" }, [statusBadge(status), el("strong", { text: value })]),
+    el("div", { class: "hint", text: detail || "—" }),
+  ]);
+}
+
+function renderMonitorSignals(evaluation) {
+  const signals = evaluation.audit && evaluation.audit.signals || {};
+  $("#monitor-signals-table").replaceChildren(table(
+    [
+      { label: "ETF" }, { label: "当前回撤", num: true }, { label: "事件回撤", num: true },
+      { label: "低点反弹", num: true }, { label: "恢复比例", num: true },
+      { label: "均线确认" }, { label: "年化波动", num: true },
+    ],
+    Object.entries(signals).map(([instrumentId, item]) => [
+      el("span", { class: "mono", title: instrumentNames[instrumentId] || "", text: instrumentLabel(instrumentId) }),
+      percent(item.current_drawdown), percent(item.event_drawdown), percent(item.rebound_from_low),
+      percent(item.recovery_ratio), item.above_confirmation_average ? "是" : "否",
+      percent(item.annualized_volatility),
+    ]),
+    { empty: "最近成功评估没有 ETF 信号" },
+  ));
+}
+
+function renderMonitorParameters(parameters) {
+  const percentKeys = new Set([
+    "minimum_drawdown", "rebound_threshold", "recovery_exit_gap", "profit_take",
+    "entry_risk_weight", "max_risk_weight", "max_position_weight", "ladder_step",
+    "tranche_weight", "target_volatility", "rebalance_threshold",
+  ]);
+  const rows = Object.entries(parameters).map(([key, value]) => {
+    let shown;
+    if (key === "risk_instruments") shown = (value || []).map(instrumentLabel).join("、");
+    else if (key === "defensive_instrument") shown = instrumentLabel(value);
+    else if (key === "position_caps") shown = Object.entries(value || {})
+      .map(([instrumentId, cap]) => `${instrumentLabel(instrumentId)} ${percent(cap)}`).join("；");
+    else if (percentKeys.has(key)) shown = percent(value);
+    else if (key.endsWith("_days")) shown = `${value} 个交易日`;
+    else if (key === "entry_mode") shown = value === "ladder" ? "回撤阶梯" : "反转确认";
+    else shown = String(value);
+    return [CRISIS_PARAMETER_LABELS[key] || key, shown];
+  });
+  $("#monitor-parameters-table").replaceChildren(table(
+    [{ label: "参数" }, { label: "当前配置" }], rows,
+    { empty: "暂无策略参数" },
+  ));
+}
+
+function renderMonitorHistory(history) {
+  const latestReady = (history.records || []).filter((item) => item.status === "ready" && item.is_latest_for_date);
+  const instruments = new Set();
+  for (const record of latestReady) {
+    for (const instrumentId of Object.keys(record.audit && record.audit.signals || {})) instruments.add(instrumentId);
+  }
+  const select = $("#monitor-instrument-select");
+  const current = select.value;
+  select.replaceChildren(...[...instruments].sort().map((instrumentId) => el("option", {
+    value: instrumentId, text: instrumentLabel(instrumentId),
+  })));
+  if (current && instruments.has(current)) select.value = current;
+  renderMonitorSignalChart(history, select.value);
+
+  $("#monitor-timeline-table").replaceChildren(table(
+    [
+      { label: "数据日" }, { label: "状态" }, { label: "动作" },
+      { label: "目标日" }, { label: "配置" }, { label: "说明" },
+    ],
+    (history.records || []).map((item) => [
+      item.evidence_date,
+      item.is_latest_for_date
+        ? statusBadge(item.status === "ready" ? (item.is_current ? "current" : "ready") : "error")
+        : el("span", { class: "badge muted", text: "旧修订" }),
+      item.status === "ready" ? crisisAction(item.action) : item.error_type,
+      item.decision_date || "—",
+      el("span", { class: "mono", text: shortId(item.config_hash) }),
+      item.status === "ready" ? item.reason : item.error,
+    ]),
+    { empty: "尚无正式评估历史" },
+  ));
+}
+
+function renderMonitorSignalChart(history, instrumentId) {
+  const container = $("#monitor-signal-chart");
+  if (!monitorSignalChart) monitorSignalChart = echarts.init(container);
+  const records = (history.records || [])
+    .filter((item) => item.status === "ready" && item.is_latest_for_date)
+    .slice().reverse();
+  const points = records.map((item) => {
+    const signal = item.audit && item.audit.signals && item.audit.signals[instrumentId];
+    return { date: item.as_of, signal };
+  }).filter((item) => item.signal);
+  const dates = points.map((item) => item.date);
+  const seriesData = (key) => points.map((item) => {
+    const value = Number(item.signal[key]);
+    return Number.isFinite(value) ? value * 100 : null;
+  });
+  const configMarks = (history.configuration_changes || []).filter((item) => !item.initial).map((item) => ({
+    xAxis: item.as_of,
+  }));
+  monitorSignalChart.setOption({
+    color: [cssVar("--accent", "#4f46e5"), cssVar("--bad", "#dc2626"),
+      cssVar("--ok", "#16a34a"), cssVar("--warn", "#d97706")],
+    textStyle: { fontFamily: cssVar("--sans", "sans-serif") },
+    tooltip: { trigger: "axis", valueFormatter: (value) => value == null ? "—" : `${Number(value).toFixed(2)}%` },
+    legend: { top: 8, data: ["当前回撤", "事件回撤", "低点反弹", "年化波动"] },
+    grid: { left: 18, right: 18, top: 48, bottom: 30, containLabel: true },
+    xAxis: { type: "category", data: dates, boundaryGap: false },
+    yAxis: { type: "value", axisLabel: { formatter: "{value}%" } },
+    series: [
+      {
+        name: "当前回撤", type: "line", data: seriesData("current_drawdown"), showSymbol: false,
+        markLine: { silent: true, symbol: "none", label: { formatter: "配置切换" }, data: configMarks },
+      },
+      { name: "事件回撤", type: "line", data: seriesData("event_drawdown"), showSymbol: false },
+      { name: "低点反弹", type: "line", data: seriesData("rebound_from_low"), showSymbol: false },
+      { name: "年化波动", type: "line", data: seriesData("annualized_volatility"), showSymbol: false },
+    ],
+    graphic: points.length ? [] : [{
+      type: "text", left: "center", top: "middle",
+      style: { text: instrumentId ? "所选 ETF 暂无历史信号" : "暂无 ETF 信号", fill: cssVar("--muted", "#64748b") },
+    }],
+  }, true);
+  monitorSignalChart.resize();
+}
+
+$("#monitor-account-select").addEventListener("change", () => loadMonitorDetail().then(clearError).catch(showError));
+$("#monitor-instrument-select").addEventListener("change", () => {
+  if (monitorHistory) renderMonitorSignalChart(monitorHistory, $("#monitor-instrument-select").value);
+});
+
 /* --------------------------------------------------------------- accounts */
 
 let equityChart = null;
 let chartAccountId = null;
 let pendingAccountId = null;
+let accountNameRetryTimer = null;
 
-async function loadAccountList() {
-  const accounts = await api("/api/accounts");
+async function openAccountFromOverview(accountId) {
+  const accountsAlreadyLoaded = loadedTabs.has("accounts");
+  rememberAccountLocation(accountId);
+  pendingAccountId = accountId;
+  document.querySelector('[data-tab="accounts"]').click();
+  if (!accountsAlreadyLoaded) return;
+
   const select = $("#account-select");
-  const wanted = pendingAccountId || select.value;
+  const optionExists = [...select.options].some((option) => option.value === accountId);
+  if (!optionExists) return;
+  pendingAccountId = null;
+  select.value = accountId;
+  await loadAccountDetail();
+}
+
+async function loadAccountList({ force = false } = {}) {
+  const accounts = !force && accountListCache
+    ? accountListCache
+    : await api("/api/accounts");
+  accountListCache = accounts;
+  rememberStrategyInstruments(accounts);
+  const select = $("#account-select");
+  const wanted = pendingAccountId || accountIdFromLocation() || select.value;
   pendingAccountId = null;
   select.replaceChildren(...accounts.map((item) =>
-    el("option", { value: item.account_id, text: `${item.name}（${item.account_id}）` })));
+    el("option", {
+      value: item.account_id,
+      text: `${item.strategy_name || item.name}（${item.account_id}）`,
+    })));
   if (wanted && accounts.some((item) => item.account_id === wanted)) select.value = wanted;
   return accounts;
 }
 
-async function loadAccountDetail() {
+async function loadAccountDetail({ force = false, nameRetryAttempt = 0 } = {}) {
+  clearTimeout(accountNameRetryTimer);
+  accountNameRetryTimer = null;
   const accountId = $("#account-select").value;
   if (!accountId) {
     $("#account-detail").classList.add("hidden");
@@ -417,7 +910,24 @@ async function loadAccountDetail() {
   }
   $("#account-empty").classList.add("hidden");
   $("#account-detail").classList.remove("hidden");
-  const data = await api(`/api/accounts/${encodeURIComponent(accountId)}`);
+  let data = !force ? accountDetailCache.get(accountId) : null;
+  if (!data) {
+    data = await api(`/api/accounts/${encodeURIComponent(accountId)}`);
+    if (data.instrument_names_pending) accountDetailCache.delete(accountId);
+    else accountDetailCache.set(accountId, data);
+  }
+  if ($("#account-select").value !== accountId) return;
+  rememberStrategyInstruments([data]);
+  renderAccountStrategy(data);
+  if (data.instrument_names_pending) {
+    accountNameRetryTimer = setTimeout(() => {
+      if (activeTab() !== "accounts" || $("#account-select").value !== accountId) return;
+      loadAccountDetail({
+        force: true,
+        nameRetryAttempt: nameRetryAttempt + 1,
+      }).then(clearError).catch(showError);
+    }, Math.min(750 * (nameRetryAttempt + 1), 5000));
+  }
 
   if (data.exists === false) {
     $("#account-metrics").replaceChildren(card(
@@ -425,7 +935,7 @@ async function loadAccountDetail() {
       "等待首次运行",
       `初始资金 ${money(data.cash)} · 首次每日运行时自动创建`,
     ));
-    renderEquityChart([], accountId);
+    renderEquityChart([], accountId, [], []);
     const notCreated = () => el("div", { class: "empty", text: "账户尚未创建" });
     $("#positions-table").replaceChildren(notCreated());
     $("#orders-table").replaceChildren(notCreated());
@@ -434,7 +944,7 @@ async function loadAccountDetail() {
   }
 
   const fb = data.feedback || {};
-  $("#account-metrics").replaceChildren(
+  const metrics = [
     card("总权益", money(fb.final_equity || data.cash), `现金 ${money(data.cash)}`),
     card("累计收益", signed(fb.overall_return, { asPercent: true }),
       el("span", {}, ["本段收益 ", signed(fb.run_return, { asPercent: true })])),
@@ -442,9 +952,31 @@ async function loadAccountDetail() {
       `质量 ${fb.quality === "complete" ? "完整" : fb.quality === "incomplete" ? "不完整" : (fb.quality || "—")}`),
     card("已实现盈亏", signed(data.realized_pnl), `分红 ${money(data.dividend_income)}`),
     card("累计费用", money(data.fees_paid), `成交 ${fb.fills ?? "—"} / 订单 ${fb.orders ?? "—"}`),
-  );
+  ];
+  const benchmark = data.benchmark;
+  if (benchmark) {
+    if (benchmark.status === "ready") {
+      const evidenceRole = benchmark.actionability === "supporting_evidence"
+        ? "可作辅助证据" : "观察期（不可触发调仓）";
+      metrics.push(card(
+        `相对 ${benchmark.instrument_id || "基准"}`,
+        signed(benchmark.excess_return, { asPercent: true }),
+        `组合 ${percent(benchmark.portfolio_return)} · 基准 ${percent(benchmark.benchmark_total_return)} · ${benchmark.common_trading_sessions}日 · ${evidenceRole}`,
+      ));
+    } else {
+      metrics.push(card(
+        `基准 ${benchmark.instrument_id || "159207.SZ"}`,
+        benchmark.status === "waiting_for_first_investment" ? "等待建仓" : "数据不可用",
+        benchmark.reason || "暂无可比数据",
+      ));
+    }
+  }
+  $("#account-metrics").replaceChildren(...metrics);
 
-  renderEquityChart(data.equity_curve || [], accountId);
+  renderEquityChart(
+    data.equity_curve || [], accountId, data.benchmark_history || [],
+    data.strategy_config_changes || [],
+  );
 
   $("#positions-table").replaceChildren(table(
     [
@@ -453,7 +985,10 @@ async function loadAccountDetail() {
       { label: "市值", num: true }, { label: "浮动盈亏", num: true },
     ],
     (data.positions || []).map((item) => [
-      el("span", { class: "mono", text: item.instrument_id }),
+      el("span", {
+        class: "instrument-cell",
+        text: instrumentLabel(item.instrument_id, item.instrument_name),
+      }),
       qty(item.quantity), qty(item.sellable_quantity),
       price(item.average_cost), price(item.last_price),
       money(item.market_value), signed(item.unrealized_pnl),
@@ -467,7 +1002,10 @@ async function loadAccountDetail() {
       { label: "数量", num: true }, { label: "剩余", num: true }, { label: "状态" },
     ],
     (data.pending_orders || []).map((item) => [
-      el("span", { class: "mono", text: item.instrument_id }),
+      el("span", {
+        class: "instrument-cell",
+        text: instrumentLabel(item.instrument_id, item.instrument_name),
+      }),
       el("span", { class: item.side === "buy" ? "up" : "down", text: SIDE_LABELS[item.side] || item.side }),
       item.execution_date,
       qty(item.requested_quantity), qty(item.remaining_quantity),
@@ -481,7 +1019,10 @@ async function loadAccountDetail() {
     (data.recent_events || []).slice(0, 80).map((item) => {
       const payload = item.payload || {};
       const subject = payload.instrument_id
-        ? el("span", { class: "mono", text: payload.instrument_id })
+        ? el("span", {
+          class: "instrument-cell",
+          text: instrumentLabel(payload.instrument_id, item.instrument_name),
+        })
         : el("span", { class: "mono", title: item.entity_id || "", text: shortId(item.entity_id) });
       return [
         item.session_date,
@@ -494,7 +1035,32 @@ async function loadAccountDetail() {
   ));
 }
 
-function renderEquityChart(curve, accountId) {
+function renderAccountStrategy(data) {
+  const instruments = data.strategy_instruments || [];
+  const instrumentRows = instruments.map((item) => [
+    item.role || "固定标的",
+    instrumentLabel(item.instrument_id, item.instrument_name),
+  ]);
+  $("#account-strategy-profile").replaceChildren(
+    el("div", { class: "strategy-profile-head" }, [
+      el("div", {}, [
+        el("div", { class: "hint", text: "策略思想" }),
+        el("strong", { class: "strategy-profile-name", text: data.strategy_name || data.strategy_kind || "—" }),
+      ]),
+      el("span", {
+        class: `badge ${data.strategy_uses_llm ? "warn" : "ok"}`,
+        text: data.strategy_uses_llm ? "含 LLM 复核" : "纯规则策略",
+      }),
+    ]),
+    el("p", { class: "strategy-profile-description", text: data.strategy_description || "—" }),
+    el("div", { class: "hint", text: data.strategy_universe || "—" }),
+    instrumentRows.length
+      ? table([{ label: "角色" }, { label: "标的中文名与代码" }], instrumentRows)
+      : el("div", { class: "empty compact-empty", text: "标的由策略规则动态筛选，固定池中没有可逐项列出的股票。" }),
+  );
+}
+
+function renderEquityChart(curve, accountId, benchmarkHistory = [], configChanges = []) {
   const container = $("#equity-chart");
   if (!equityChart) equityChart = echarts.init(container);
 
@@ -521,6 +1087,7 @@ function renderEquityChart(curve, accountId) {
 
   const accent = cssVar("--accent", "#4f46e5");
   const warnColor = cssVar("--warn", "#d97706");
+  const benchmarkColor = cssVar("--good", "#0f766e");
   const border = cssVar("--border", "#e2e8f0");
   const muted = cssVar("--muted", "#64748b");
   const sans = cssVar("--sans", "sans-serif");
@@ -529,9 +1096,17 @@ function renderEquityChart(curve, accountId) {
   const dates = curve.map((item) => item.session_date);
   const equity = curve.map((item) => Number(item.total_equity));
   const nav = curve.map((item) => Number(item.nav));
+  const benchmarkByDate = new Map(benchmarkHistory.map((item) => [
+    item.comparison_end || item.as_of, Number(item.benchmark_nav),
+  ]));
+  const benchmarkNav = dates.map((day) => (
+    benchmarkByDate.has(day) ? benchmarkByDate.get(day) : null
+  ));
+  const hasBenchmark = benchmarkNav.some((value) => Number.isFinite(value));
+  const legend = ["总权益", "净值", ...(hasBenchmark ? ["159207 含分红基准"] : [])];
 
   equityChart.setOption({
-    color: [accent, warnColor],
+    color: [accent, warnColor, benchmarkColor],
     textStyle: { fontFamily: sans },
     tooltip: {
       trigger: "axis",
@@ -543,7 +1118,7 @@ function renderEquityChart(curve, accountId) {
       itemWidth: 14,
       itemHeight: 3,
       textStyle: { color: cssVar("--gray-700", "#334155") },
-      data: ["总权益", "净值"],
+      data: legend,
     },
     grid: { left: 16, right: 16, top: 44, bottom: showSlider ? 64 : 24, containLabel: true },
     xAxis: {
@@ -586,16 +1161,42 @@ function renderEquityChart(curve, accountId) {
         name: "净值", type: "line", yAxisIndex: 1, data: nav, showSymbol: false,
         lineStyle: { width: 1.5 },
         tooltip: { valueFormatter: (v) => Number(v).toFixed(4) },
+        markLine: {
+          silent: true,
+          symbol: "none",
+          lineStyle: { color: warnColor, type: "dashed", width: 1 },
+          label: { color: warnColor, formatter: "配置切换" },
+          data: (configChanges || []).filter((item) => !item.initial).map((item) => ({
+            xAxis: item.as_of,
+          })),
+        },
       },
+      ...(hasBenchmark ? [{
+        name: "159207 含分红基准", type: "line", yAxisIndex: 1,
+        data: benchmarkNav, connectNulls: true, showSymbol: true, symbolSize: 6,
+        lineStyle: { width: 1.8, type: "dashed" },
+        tooltip: { valueFormatter: (v) => Number(v).toFixed(4) },
+      }] : []),
     ],
   }, true);
   equityChart.resize();
 }
 
-window.addEventListener("resize", () => equityChart && equityChart.resize());
+window.addEventListener("resize", () => {
+  if (equityChart) equityChart.resize();
+  if (monitorPerformanceChart) monitorPerformanceChart.resize();
+  if (monitorSignalChart) monitorSignalChart.resize();
+});
 // 网格折行、面板切换等只改容器不改窗口的情况,window resize 不会触发。
 new ResizeObserver(() => equityChart && equityChart.resize()).observe($("#equity-chart"));
-$("#account-select").addEventListener("change", () => loadAccountDetail().then(clearError).catch(showError));
+new ResizeObserver(() => monitorPerformanceChart && monitorPerformanceChart.resize())
+  .observe($("#monitor-performance-chart"));
+new ResizeObserver(() => monitorSignalChart && monitorSignalChart.resize())
+  .observe($("#monitor-signal-chart"));
+$("#account-select").addEventListener("change", () => {
+  rememberAccountLocation($("#account-select").value);
+  loadAccountDetail().then(clearError).catch(showError);
+});
 
 /* ------------------------------------------------------------------- runs */
 
@@ -666,7 +1267,9 @@ function renderCutoffHint() {
     : "";
 }
 
-async function loadSchedule() {
+async function loadSchedule(retryAttempt = 0) {
+  clearTimeout(scheduleRetryTimer);
+  scheduleRetryTimer = null;
   renderCutoffHint();
   // 首屏总览还没返回(或失败)时 sessionCutoff 为空,单独补拉一次。
   if (sessionCutoff == null) {
@@ -679,6 +1282,15 @@ async function loadSchedule() {
   try {
     state = await api("/api/schedule");
   } catch (error) {
+    if (scheduleIsRefreshing(error)) {
+      $("#schedule-cards").replaceChildren(card(
+        "计划任务", "正在读取", "后台读取 Windows 计划任务状态",
+      ));
+      scheduleRetryTimer = setTimeout(() => {
+        if (activeTab() === "schedule") loadSchedule(retryAttempt + 1);
+      }, Math.min(750 * (retryAttempt + 1), 5000));
+      return;
+    }
     $("#schedule-cards").replaceChildren(card("计划任务", "查询失败", String(error.message)));
     return;
   }
@@ -824,7 +1436,7 @@ async function pollRunStatus() {
     if (runWasRunning) {
       runWasRunning = false;
       if (activeTab() === "schedule") loadSchedule().then(clearError).catch(showError);
-      else refreshTab(activeTab(), { auto: true });
+      else refreshTab(activeTab(), { auto: true, force: true });
     }
   }
 }
@@ -833,10 +1445,14 @@ async function pollRunStatus() {
 
 async function loadAgentTab() {
   const accounts = await api("/api/agent/accounts");
+  rememberStrategyInstruments(accounts);
   const select = $("#agent-account-select");
   const current = select.value;
   select.replaceChildren(...accounts.map((item) =>
-    el("option", { value: item.account_id, text: `${item.name}（${item.account_id}）` })));
+    el("option", {
+      value: item.account_id,
+      text: `${item.strategy_name || item.name}（${item.account_id}）`,
+    })));
   if (current && accounts.some((item) => item.account_id === current)) select.value = current;
   if (!accounts.length) {
     $("#decision-form").classList.add("hidden");
@@ -1017,30 +1633,63 @@ function clearError() {
   $("#global-error").classList.add("hidden");
 }
 
-async function refreshTab(name, { auto = false } = {}) {
+const loadedTabs = new Set();
+const loadingTabs = new Set();
+const tabLoadedAt = new Map();
+const tabRefreshes = new Map();
+
+function refreshTab(name, { auto = false, force = false, onlyIfNeeded = false } = {}) {
+  if (onlyIfNeeded && (loadedTabs.has(name) || loadingTabs.has(name))) {
+    return tabRefreshes.get(name) || Promise.resolve();
+  }
+  const existing = tabRefreshes.get(name);
+  if (existing) return existing;
   const panel = $(`#panel-${name}`);
   const refreshBtn = $("#refresh-btn");
+  loadingTabs.add(name);
   panel.classList.add("loading");
   refreshBtn.disabled = true;
-  try {
-    if (name === "overview") await loadOverview();
-    else if (name === "accounts") { await loadAccountList(); await loadAccountDetail(); }
-    else if (name === "runs") await loadRuns({ auto });
-    else if (name === "schedule") { await loadSchedule(); await pollRunStatus(); }
-    else if (name === "agent") await loadAgentTab();
-    clearError();
-  } catch (error) {
-    showError(error);
-  } finally {
-    panel.classList.remove("loading");
-    refreshBtn.disabled = false;
-  }
+  const pending = (async () => {
+    try {
+      if (name === "overview") await loadOverview();
+      else if (name === "monitor") await loadMonitor();
+      else if (name === "accounts") {
+        await loadAccountList({ force });
+        await loadAccountDetail({ force });
+      }
+      else if (name === "runs") await loadRuns({ auto });
+      else if (name === "schedule") { await loadSchedule(); await pollRunStatus(); }
+      else if (name === "agent") await loadAgentTab();
+      loadedTabs.add(name);
+      tabLoadedAt.set(name, Date.now());
+      clearError();
+    } catch (error) {
+      showError(error);
+    } finally {
+      loadingTabs.delete(name);
+      panel.classList.remove("loading");
+      refreshBtn.disabled = false;
+      tabRefreshes.delete(name);
+    }
+  })();
+  tabRefreshes.set(name, pending);
+  return pending;
 }
 
-$("#refresh-btn").addEventListener("click", () => refreshTab(activeTab()));
+$("#refresh-btn").addEventListener("click", () => refreshTab(activeTab(), { force: true }));
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refreshTab(activeTab(), { auto: true });
+  const name = activeTab();
+  const age = Date.now() - (tabLoadedAt.get(name) || 0);
+  if (!document.hidden && age > 5 * 60 * 1000) {
+    refreshTab(name, { auto: true, force: true });
+  }
 });
 
-refreshTab("overview");
+const initialAccountId = accountIdFromLocation();
+refreshTab("overview").then(() => {
+  if (initialAccountId) {
+    return openAccountFromOverview(initialAccountId);
+  }
+  return null;
+}).then(clearError).catch(showError);

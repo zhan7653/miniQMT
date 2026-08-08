@@ -4,7 +4,8 @@
 
 `fundlab/web` 是单用户本地量化基础设施的浏览器控制台，由 `fundlab web` 命令启动（默认 `127.0.0.1:8610`，启动后自动打开浏览器）。它默认只绑定 localhost、**没有任何鉴权**——这是 `app.py` 模块 docstring 里明文声明的边界：控制台是单人本机工具，不为暴露到网络设计。
 
-核心设计边界是"**只管理 CLI 已拥有的东西**"。控制台不引入任何新的数据通道或写入路径，可变操作被严格限定为三类，且每一类都复用已有机制：
+核心设计边界是"**只管理 CLI 已拥有的东西**"。策略监控只读取 Agent 正式运行已经
+落盘的评估证据，绝不因打开页面而重算行情。控制台的可变操作仍严格限定为三类，且每一类都复用已有机制：
 
 | 可变操作 | 复用的已有机制 |
 |---|---|
@@ -29,7 +30,7 @@
 - `service.py`（约 480 行）——`DashboardService`（frozen dataclass）只读聚合 + 唯一的写操作 `submit_agent_decision`；`DashboardError` 表示用户侧请求错误（映射为 404/422）。
 - `runner.py`（约 120 行）——`DailyRunLauncher`：加锁单飞启动 `daily run` 子进程，stdout/stderr 合并写入 `logs/daily/web-run-<时间戳>.log`，`status()` 返回运行态与日志尾部。
 - `schedule.py`（约 155 行）——`TaskScheduler` Protocol、`ScheduledTaskState`、`WindowsTaskScheduler`：通过 `pwsh`/`powershell` 子进程查询（`Get-ScheduledTask` → JSON）、注册（调 `scripts/register-daily-task.ps1 -Time HH:MM`）、启停、删除名为 `FundLab Daily` 的任务；错误一律抛 `TaskSchedulerError` 上浮到 API（502），不静默吞掉。
-- `static/index.html`（约 125 行)——页面骨架：顶栏 + 五个页签（总览/账户/运行记录/计划任务/Agent 决策）+ 全局错误横幅。
+- `static/index.html`——页面骨架：顶栏 + 六个页签（总览/策略监控/账户/运行记录/计划任务/Agent 决策）+ 全局错误横幅。
 - `static/app.js`（约 975 行）——全部前端逻辑：`api()` fetch 封装、`el()` DOM 构造、状态中文映射、五个页签的加载函数、ECharts 净值曲线、运行状态轮询、决策投递表单。
 - `static/style.css`（约 450 行）——设计 token 体系：`:root` 定义灰阶梯（`--gray-50`…`--gray-900`，全站唯一灰色来源）、语义色（`--ok/--warn/--bad` 状态色与 `--up/--down` 涨跌色相互独立）、圆角/阴影/字体变量。2026-07-27 完成一轮视觉与交互改版。
 - `static/vendor/echarts.min.js`——本地 vendor 的 ECharts，满足"页面零外网依赖"。
@@ -93,10 +94,12 @@ API 路由（全部 JSON）：
 | POST `/api/daily/run`、GET `/api/daily/run/status` | 手动触发一次每日运行 / 轮询状态与日志尾部 |
 | GET/PUT/DELETE `/api/schedule` | 查询 / 创建或改时间与启停 / 删除 `FundLab Daily` 计划任务 |
 | GET `/api/agent/accounts` | 列出 `agent-file` 策略账户（`paper-agent`、`paper-dividend`） |
+| GET `/api/agent/monitor` | 聚合 8 个危机策略的评估新鲜度、信号、决策、实际账户与收益 |
+| GET `/api/agent/evaluations/{id}` | 最近 90 个数据日的不可变评估及同日修订历史 |
 | GET/POST `/api/agent/decisions/{id}` | 决策历史（含无效文件的错误原因）/ 投递新决策 |
 | POST `/api/agent/decide/{id}` | 运行该账户配置的 Agent；支持 `dry_run`、`overwrite`、`force_review` |
 
-前端五个页签与上表一一对应；页签切换按需拉取，窗口重新聚焦（`visibilitychange`）自动刷新当前页签，自动刷新不折叠用户展开的运行详情、不重置净值图上用户拖出的缩放区间（仅切换账户时重置）。净值图为双轴折线（总权益 + 净值），超过 60 个点出现缩放滑条，颜色全部取自 CSS 变量。涨跌数字用 `signed()` 渲染：红涨绿跌（A 股习惯）、正数带 `+`、按展示精度归一化后约等于零的尾差保持中性色。
+前端六个页签与上表一一对应；页签切换按需拉取，窗口重新聚焦（`visibilitychange`）自动刷新当前页签。策略监控页严格区分"正式信号 → 目标决策 → 模拟执行"，总览只展示最接近触发的 ETF，单策略下钻再读取 90 日动作、回撤/反弹/波动率与配置切换。含人工决策的账户仍展示真实累计收益，但不再展示为纯策略当前版本比较结果。自动刷新不折叠用户展开的运行详情、不重置净值图上用户拖出的缩放区间（仅切换账户时重置）。
 
 ## 不变量与约束
 
@@ -108,6 +111,7 @@ API 路由（全部 JSON）：
 - **路径与文件名白名单**：报告名须匹配 `daily-[A-Za-z0-9-]+\.json` 且拒绝 `/`、`\`、`..`；决策名须匹配 `YYYY-MM-DD.json`——目录遍历在 service 层被阻断。
 - **错误上浮而非吞掉**：PowerShell 调用失败/超时抛 `TaskSchedulerError` → API 502；总览页里计划任务查询失败降级为 `{"error": ...}` 字段而不拖垮整页。快照读取失败同样降级为错误字段。
 - **零外网依赖**：ECharts 本地 vendor，页面不发起任何跨域请求；也因此没有引入 CDN 版本漂移。
+- **监控不驱动策略**：Web 只读取 `data/agent/evaluations/`；评估文件损坏会显式报错，旧成功结果不会冒充当前结果，页面也没有修改危机策略参数的接口。
 
 ## 测试对应
 

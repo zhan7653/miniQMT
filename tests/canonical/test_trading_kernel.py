@@ -10,9 +10,11 @@ import pytest
 from fundlab.marketdata import CorporateAction, CorporateActionType
 from fundlab.marketdata.contracts import (
     DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
     PriceLimitState,
 )
 from fundlab.trading import (
+    Entitlement,
     ExecutionPolicy,
     FeeRule,
     FeeSchedule,
@@ -177,7 +179,7 @@ def test_data_gap_quarantine_uses_stale_value_and_defers_due_order(tmp_path):
         close=None,
         volume=0,
         amount=None,
-        suspended=True,
+        suspended=False,
         is_st=None,
         trade_rule_id=DATA_GAP_QUARANTINE_RULE_ID,
         price_limit_state=PriceLimitState.UNKNOWN,
@@ -198,6 +200,90 @@ def test_data_gap_quarantine_uses_stale_value_and_defers_due_order(tmp_path):
     assert result.state.pending_orders[0].execution_date == DAYS[2]
     deferred = [event for event in result.events if event.event_type == "order_deferred"]
     assert deferred and deferred[0].payload["reason"] == "instrument_data_gap_quarantine"
+
+
+def test_execution_evidence_guard_preserves_close_value_and_defers_due_order(tmp_path):
+    market = ready_market(tmp_path / "market")
+    execution, risk = policies()
+    instrument = market.instrument("600000.SH")
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=market.all_trading_days(),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    lot = PositionLot(
+        "held", instrument.instrument_id, 100, DAYS[0], DAYS[0], Decimal("1000"),
+    )
+    order = Order(
+        "defer-me", "intent", instrument.instrument_id, Side.SELL,
+        DAYS[0], DAYS[1], DAYS[1], 100, 100,
+    )
+    state = PortfolioState(
+        Decimal("2000"),
+        Decimal("1000"),
+        (lot,),
+        (order,),
+        last_prices={instrument.instrument_id: Decimal("10")},
+    )
+    ordinary = market.session(DAYS[1])
+    guarded = replace(
+        ordinary.bars[instrument.instrument_id],
+        trade_rule_id=EXECUTION_EVIDENCE_GAP_RULE_ID,
+    )
+
+    result = kernel.process_session(
+        state,
+        replace(ordinary, bars={instrument.instrument_id: guarded}),
+    )
+
+    assert result.fills == ()
+    assert result.valuation.stale_instruments == ()
+    assert result.valuation.market_value == Decimal(str(guarded.close * 100)).quantize(
+        Decimal("0.01")
+    )
+    assert result.state.pending_orders[0].execution_date == DAYS[2]
+    deferred = [event for event in result.events if event.event_type == "order_deferred"]
+    assert deferred and deferred[0].payload["reason"] == "execution_evidence_gap"
+
+
+def test_execution_evidence_guard_never_fills_on_last_known_session(tmp_path):
+    market = ready_market(tmp_path / "market")
+    execution, risk = policies()
+    instrument = market.instrument("600000.SH")
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=(DAYS[1],),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    order = Order(
+        "never-fill", "intent", instrument.instrument_id, Side.BUY,
+        DAYS[0], DAYS[1], DAYS[1], 100, 100,
+    )
+    state = PortfolioState(
+        Decimal("2000"), Decimal("2000"), (), (order,),
+    )
+    ordinary = market.session(DAYS[1])
+    guarded = replace(
+        ordinary.bars[instrument.instrument_id],
+        trade_rule_id=EXECUTION_EVIDENCE_GAP_RULE_ID,
+    )
+
+    result = kernel.process_session(
+        state,
+        replace(ordinary, bars={instrument.instrument_id: guarded}),
+    )
+
+    assert result.fills == ()
+    assert result.state.pending_orders == ()
+    blocked = [
+        event for event in result.events
+        if event.event_type == "order_not_executed"
+    ]
+    assert blocked and blocked[0].payload["reason"] == "execution_evidence_gap"
 
 
 def test_star_orders_use_200_minimum_one_share_step_and_full_odd_residual(tmp_path):
@@ -346,6 +432,145 @@ def test_cash_dividend_is_explicit_and_unknown_tax_marks_run_incomplete(tmp_path
     assert paid.state.cash == Decimal("10500.00")
     assert "dividend_tax_unmodeled:dividend-1" in paid.state.incomplete_reasons
     assert any(event.event_type == "cash_dividend_paid" for event in paid.events)
+
+
+def test_unheld_corporate_action_does_not_pollute_account_state_or_events(tmp_path):
+    market = ready_market(tmp_path / "market")
+    instrument = market.instrument("600000.SH")
+    execution, risk = policies()
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=market.all_trading_days(),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    action = CorporateAction(
+        "unheld-dividend", instrument.instrument_id, CorporateActionType.CASH_DIVIDEND,
+        DAYS[0], DAYS[0], DAYS[1], DAYS[2], None, 0.5, None, None,
+        "fixture", "obs-unheld",
+    )
+    empty = PortfolioState.with_cash(20_000)
+
+    recorded = kernel.process_session(
+        empty, replace(market.session(DAYS[0]), record_actions=(action,)),
+    )
+    ex_date = kernel.process_session(
+        recorded.state, replace(market.session(DAYS[1]), ex_actions=(action,)),
+    )
+    paid = kernel.process_session(
+        ex_date.state, replace(market.session(DAYS[2]), pay_actions=(action,)),
+    )
+
+    assert paid.state.entitlements == ()
+    assert paid.state.cash == Decimal("20000.00")
+    assert paid.state.incomplete_reasons == ()
+    action_events = {
+        event.event_type
+        for result in (recorded, ex_date, paid)
+        for event in result.events
+        if event.entity_type == "corporate_action"
+    }
+    assert action_events == set()
+
+
+def test_buying_after_record_date_does_not_create_missing_entitlement_noise(tmp_path):
+    market = ready_market(tmp_path / "market")
+    instrument = market.instrument("600000.SH")
+    execution, risk = policies()
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=market.all_trading_days(),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    cash = CorporateAction(
+        "later-buyer-cash", instrument.instrument_id, CorporateActionType.CASH_DIVIDEND,
+        DAYS[0], DAYS[0], DAYS[1], DAYS[2], None, 0.5, None, None,
+        "fixture", "obs-later-buyer-cash",
+    )
+    shares = CorporateAction(
+        "later-buyer-shares", instrument.instrument_id, CorporateActionType.STOCK_DIVIDEND,
+        DAYS[0], DAYS[0], DAYS[1], None, DAYS[2], None, 0.1, None,
+        "fixture", "obs-later-buyer-shares",
+    )
+    split = CorporateAction(
+        "later-buyer-split", instrument.instrument_id, CorporateActionType.SPLIT,
+        DAYS[0], DAYS[0], DAYS[1], None, DAYS[1], None, None, None,
+        "fixture", "obs-later-buyer-split", quantity_multiplier=2.0,
+    )
+    record = kernel.process_session(
+        PortfolioState.with_cash(30_000),
+        replace(market.session(DAYS[0]), record_actions=(cash, shares, split)),
+    )
+    lot = PositionLot(
+        "later-purchase", instrument.instrument_id, 1000,
+        DAYS[1], DAYS[1], Decimal("10000"),
+    )
+    later_buyer = replace(
+        record.state, cash=Decimal("20000"), lots=(lot,),
+    )
+
+    ex_date = kernel.process_session(
+        later_buyer,
+        replace(market.session(DAYS[1]), ex_actions=(cash, shares, split)),
+    )
+    distribution = kernel.process_session(
+        ex_date.state,
+        replace(market.session(DAYS[2]), pay_actions=(cash,), listing_actions=(shares,)),
+    )
+
+    assert distribution.state.quantity(instrument.instrument_id) == 1000
+    assert distribution.state.cash == Decimal("20000.00")
+    assert distribution.state.dividend_income == Decimal("0.00")
+    assert distribution.state.incomplete_reasons == ()
+    assert not any(
+        event.entity_type == "corporate_action"
+        for result in (record, ex_date, distribution)
+        for event in result.events
+    )
+
+
+def test_legacy_zero_entitlements_are_pruned_without_economic_effect(tmp_path):
+    market = ready_market(tmp_path / "market")
+    instrument = market.instrument("600000.SH")
+    execution, risk = policies()
+    kernel = TradingKernel(
+        instruments={instrument.instrument_id: instrument},
+        sessions=market.all_trading_days(),
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    )
+    action = CorporateAction(
+        "legacy-zero", instrument.instrument_id, CorporateActionType.CASH_DIVIDEND,
+        DAYS[0], DAYS[0], DAYS[1], DAYS[1], None, 0.5, None, None,
+        "fixture", "obs-legacy-zero",
+    )
+    lot = PositionLot(
+        "current-position", instrument.instrument_id, 1000,
+        DAYS[0], DAYS[0], Decimal("10000"),
+    )
+    legacy = PortfolioState(
+        Decimal("30000"), Decimal("20000"), (lot,),
+        entitlements=(Entitlement("legacy-zero", instrument.instrument_id, 0, DAYS[0]),),
+    )
+
+    result = kernel.process_session(
+        legacy,
+        replace(market.session(DAYS[1]), ex_actions=(action,), pay_actions=(action,)),
+    )
+
+    assert result.state.entitlements == ()
+    assert result.state.cash == Decimal("20000.00")
+    assert result.state.quantity(instrument.instrument_id) == 1000
+    assert result.state.incomplete_reasons == ()
+    assert [
+        event.event_type for event in result.events
+        if event.event_type == "zero_entitlements_pruned"
+    ] == ["zero_entitlements_pruned"]
+    assert not any(event.entity_type == "corporate_action" for event in result.events)
 
 
 def test_split_preserves_and_allocates_cost_basis_before_partial_sale(tmp_path):

@@ -11,6 +11,8 @@ from fundlab.marketdata.adjustments import derive_ratio_adjusted_bars
 from fundlab.marketdata.contracts import (
     AssetType,
     CorporateActionType,
+    DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
     MarketTable,
     PriceLimitState,
     PriceMode,
@@ -402,7 +404,7 @@ def _bar(row: Mapping[str, object], instrument: Instrument) -> DailyBar:
         _optional_float(row.get("close")),
         float(row["volume"]),
         _optional_float(row.get("amount")),
-        bool(row["suspended"]),
+        _bar_suspended(row),
         _optional_bool(row.get("is_st")),
         str(row["trade_rule_id"]),
         date.fromisoformat(str(row["trade_rule_known_date"])),
@@ -454,6 +456,21 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_bool(value: object) -> bool | None:
     return None if value is None or pd.isna(value) else bool(value)
+
+
+def _bar_suspended(row: Mapping[str, object]) -> bool:
+    value = row.get("suspended")
+    if value is not None and not pd.isna(value):
+        return bool(value)
+    if str(row.get("trade_rule_id")) in {
+        DATA_GAP_QUARANTINE_RULE_ID,
+        EXECUTION_EVIDENCE_GAP_RULE_ID,
+    }:
+        return False
+    raise SnapshotNotReadyError(
+        f"Daily bar has unknown suspension state: {row.get('instrument_id')}/"
+        f"{row.get('session_date')}"
+    )
 
 
 def _optional_str(value: object) -> str | None:

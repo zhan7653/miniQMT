@@ -10,6 +10,7 @@ from fundlab.marketdata.portal import CorporateAction, DailyBar, Instrument, Mar
 from fundlab.marketdata.contracts import (
     CorporateActionType,
     DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
     PriceLimitState,
 )
 from fundlab.trading.fees import FeeBreakdown, FeeSchedule, money
@@ -61,6 +62,8 @@ class TradingKernel:
         events: list[LedgerEvent] = []
         fills: list[Fill] = []
         current = state
+        current, cleanup_events = self._prune_zero_entitlements(current, day)
+        events.extend(cleanup_events)
         if not self.fee_schedule.trusted_for_simulation:
             current, event = _mark_incomplete(
                 current, day, "untrusted_simulation_fee_schedule", self.fee_schedule.schedule_id,
@@ -87,7 +90,10 @@ class TradingKernel:
 
         for order in sorted(due, key=lambda item: (item.side is Side.BUY, item.instrument_id, item.order_id)):
             bar = market.bars.get(order.instrument_id)
-            if bar is not None and bar.trade_rule_id == DATA_GAP_QUARANTINE_RULE_ID:
+            if bar is not None and bar.trade_rule_id in {
+                DATA_GAP_QUARANTINE_RULE_ID,
+                EXECUTION_EVIDENCE_GAP_RULE_ID,
+            }:
                 next_session = self._advance_session(day, 1)
                 if next_session != date.max:
                     deferred = replace(
@@ -100,12 +106,30 @@ class TradingKernel:
                         pending_orders=tuple((*current.pending_orders, deferred)),
                     )
                     events.append(_order_event(day, "order_deferred", order, {
-                        "reason": "instrument_data_gap_quarantine",
+                        "reason": (
+                            "instrument_data_gap_quarantine"
+                            if bar.trade_rule_id == DATA_GAP_QUARANTINE_RULE_ID
+                            else "execution_evidence_gap"
+                        ),
                         "previous_execution_date": day,
                         "next_execution_date": next_session,
                         "remaining_quantity": order.remaining_quantity,
                     }))
-                    continue
+                else:
+                    events.append(_order_event(day, "order_not_executed", order, {
+                        "reason": (
+                            "instrument_data_gap_quarantine"
+                            if bar.trade_rule_id == DATA_GAP_QUARANTINE_RULE_ID
+                            else "execution_evidence_gap"
+                        ),
+                        "previous_execution_date": day,
+                        "next_execution_date": None,
+                        "remaining_quantity": order.remaining_quantity,
+                    }))
+                # A no-execution rule is unconditional.  In particular, the
+                # last calendar session must never fall through into the fill
+                # path merely because there is no later session to defer to.
+                continue
             current, fill, order_events = self._execute_order(current, order, bar)
             if fill is not None:
                 fills.append(fill)
@@ -520,6 +544,8 @@ class TradingKernel:
         current = state
         events: list[LedgerEvent] = []
         for action in market.ex_actions:
+            if not self._action_is_relevant(current, action):
+                continue
             events.append(_action_event(market.session_date, "corporate_action_ex_date", action, {}))
             if action.action_type is CorporateActionType.STOCK_DIVIDEND:
                 current, allocation_events = self._allocate_share_action_cost(current, action, market.session_date)
@@ -530,6 +556,8 @@ class TradingKernel:
         for action in market.pay_actions:
             entitlement = next((item for item in current.entitlements if item.action_id == action.action_id), None)
             if action.action_type is CorporateActionType.RIGHTS_ISSUE:
+                if entitlement is None or entitlement.quantity <= 0:
+                    continue
                 events.append(_action_event(market.session_date, "rights_issue_declined", action, {
                     "policy": "do_not_subscribe",
                     "entitled_quantity": 0 if entitlement is None else entitlement.quantity,
@@ -541,12 +569,6 @@ class TradingKernel:
             if action.action_type is not CorporateActionType.CASH_DIVIDEND:
                 continue
             if entitlement is None:
-                if current.quantity(action.instrument_id):
-                    current, event = _mark_incomplete(
-                        current, market.session_date, f"missing_entitlement:{action.action_id}", action.action_id,
-                    )
-                    if event is not None:
-                        events.append(event)
                 continue
             gross = money(Decimal(entitlement.quantity) * decimal_value(action.cash_per_share))
             current = replace(
@@ -575,12 +597,6 @@ class TradingKernel:
                 continue
             entitlement = next((item for item in current.entitlements if item.action_id == action.action_id), None)
             if entitlement is None:
-                if current.quantity(action.instrument_id):
-                    current, event = _mark_incomplete(
-                        current, market.session_date, f"missing_entitlement:{action.action_id}", action.action_id,
-                    )
-                    if event is not None:
-                        events.append(event)
                 continue
             quantity = entitlement.distributed_quantity
             if entitlement.adjusted_on is None:
@@ -618,6 +634,47 @@ class TradingKernel:
                     events.append(event)
         return current, tuple(events)
 
+    @staticmethod
+    def _action_is_relevant(state: PortfolioState, action: CorporateAction) -> bool:
+        """Whether an account can be economically affected by an action."""
+        entitled = any(
+            item.action_id == action.action_id and item.quantity > 0
+            for item in state.entitlements
+        )
+        if entitled:
+            return True
+        # Same-session actions have no previously captured entitlement yet.
+        # A position acquired after an earlier record date is deliberately not
+        # considered entitled merely because it still exists on the ex-date.
+        return (
+            action.record_date == action.ex_date
+            and state.quantity(action.instrument_id) > 0
+        )
+
+    @staticmethod
+    def _prune_zero_entitlements(
+        state: PortfolioState, day: date,
+    ) -> tuple[PortfolioState, tuple[LedgerEvent, ...]]:
+        """Remove zero-quantity records created by the former market-wide bug."""
+        zero = tuple(item for item in state.entitlements if item.quantity <= 0)
+        if not zero:
+            return state, ()
+        current = replace(
+            state,
+            entitlements=tuple(item for item in state.entitlements if item.quantity > 0),
+        )
+        event = LedgerEvent(
+            day,
+            "zero_entitlements_pruned",
+            "portfolio_state",
+            f"zero-entitlements-{stable_digest(tuple(item.action_id for item in zero))[:20]}",
+            {
+                "pruned_count": len(zero),
+                "action_ids": tuple(item.action_id for item in zero),
+            },
+        )
+        return current, (event,)
+
     def _apply_split(
         self, state: PortfolioState, action: CorporateAction, day: date,
     ) -> tuple[PortfolioState, tuple[LedgerEvent, ...]]:
@@ -628,10 +685,10 @@ class TradingKernel:
             if not state.quantity(action.instrument_id):
                 return state, ()
             if action.record_date != action.ex_date:
-                current, event = _mark_incomplete(
-                    state, day, f"missing_entitlement:{action.action_id}", action.action_id,
-                )
-                return current, () if event is None else (event,)
+                # No positive record-date entitlement means the account bought
+                # after the entitlement boundary.  It must not receive or be
+                # marked incomplete for this action.
+                return state, ()
         multiplier = action.quantity_multiplier
         if multiplier is None or multiplier <= 0:
             current, event = _mark_incomplete(
@@ -704,12 +761,7 @@ class TradingKernel:
     ) -> tuple[PortfolioState, tuple[LedgerEvent, ...]]:
         entitlement = next((item for item in state.entitlements if item.action_id == action.action_id), None)
         if entitlement is None:
-            if not state.quantity(action.instrument_id):
-                return state, ()
-            current, event = _mark_incomplete(
-                state, day, f"missing_entitlement:{action.action_id}", action.action_id,
-            )
-            return current, () if event is None else (event,)
+            return state, ()
         if entitlement.adjusted_on is not None:
             return state, ()
         existing_lots = [lot for lot in state.lots if lot.instrument_id == action.instrument_id]
@@ -778,6 +830,8 @@ class TradingKernel:
             if action.action_id in existing:
                 continue
             quantity = state.quantity(action.instrument_id)
+            if quantity <= 0:
+                continue
             entitlement = Entitlement(action.action_id, action.instrument_id, quantity, market.session_date)
             entitlements.append(entitlement)
             events.append(_action_event(market.session_date, "corporate_action_entitlement", action, {

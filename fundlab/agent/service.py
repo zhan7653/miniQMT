@@ -10,16 +10,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from fundlab.agent.benchmark import PortfolioPerformancePoint
+from fundlab.agent.evaluations import (
+    evaluation_root,
+    write_agent_evaluation,
+)
 from fundlab.agent.llm import (
     DividendValueAdviser,
     ResponsesDividendValueAdviser,
 )
-from fundlab.agent.policy import DividendPolicyRuntime, PolicyDecision, build_policy
-from fundlab.agent.tools import AgentMemory, AgentRunLock, EmailNotifier, ReadingLibrary
+from fundlab.agent.policy import (
+    DividendPolicyRuntime,
+    PolicyDecision,
+    PortfolioPolicyRuntime,
+    build_policy,
+)
+from fundlab.agent.tools import (
+    AgentMemory,
+    AgentRunLock,
+    AgentRunLocked,
+    EmailNotifier,
+    ReadingLibrary,
+)
 from fundlab.common.canonical import stable_digest
 from fundlab.marketdata.portal import CanonicalMarketData
 from fundlab.settings import AgentLLMSettings, FoundationSettings
@@ -57,18 +74,39 @@ class AgentDecisionService:
         overwrite: bool = False,
         dry_run: bool = False,
         force_review: bool = False,
+        _market: CanonicalMarketData | None = None,
     ) -> dict[str, Any]:
         account, policy_settings = self._configured_account(account_id)
-        if policy_settings.kind == "dividend-value":
-            with AgentRunLock(self.settings.agent.memory.root, account_id):
-                return self._decide_locked(
-                    account,
-                    policy_settings,
-                    target_date=target_date,
-                    overwrite=overwrite,
-                    dry_run=dry_run,
-                    force_review=force_review,
-                )
+        if policy_settings.kind in {"dividend-value", "crisis-drawdown"}:
+            lock_root = (
+                self.settings.agent.memory.root
+                if policy_settings.kind == "dividend-value"
+                else evaluation_root(self.settings.daily.agent_decision_root)
+            )
+            try:
+                with AgentRunLock(lock_root, account_id):
+                    return self._decide_locked(
+                        account,
+                        policy_settings,
+                        target_date=target_date,
+                        overwrite=overwrite,
+                        dry_run=dry_run,
+                        force_review=force_review,
+                        market=_market,
+                    )
+            except Exception as exc:
+                if (
+                    policy_settings.kind == "crisis-drawdown"
+                    and not dry_run
+                    and not isinstance(exc, AgentRunLocked)
+                ):
+                    self._record_crisis_failure(
+                        account.account_id,
+                        policy_settings,
+                        target_date=target_date,
+                        error=exc,
+                    )
+                raise
         if force_review:
             raise AgentServiceError("--force-review is only valid for review-cadence policies")
         return self._decide_locked(
@@ -78,6 +116,7 @@ class AgentDecisionService:
             overwrite=overwrite,
             dry_run=dry_run,
             force_review=False,
+            market=_market,
         )
 
     def _decide_locked(
@@ -89,8 +128,9 @@ class AgentDecisionService:
         overwrite: bool,
         dry_run: bool,
         force_review: bool,
+        market: CanonicalMarketData | None,
     ) -> dict[str, Any]:
-        market = CanonicalMarketData.open(self.settings.paths.market_data)
+        market = market or CanonicalMarketData.open(self.settings.paths.market_data)
         scope = market.manifest.plan.universe_scope
         if scope is None:
             raise AgentServiceError("Published snapshot carries no universe scope")
@@ -132,7 +172,32 @@ class AgentDecisionService:
                 last_decision_date=self._last_decision_date(
                     account.account_id, before=decision_date,
                 ),
+                performance_points=self._portfolio_performance_points(
+                    account.account_id,
+                ),
                 force_review=force_review,
+            )
+        elif policy_settings.kind in {"dividend-rules", "crisis-drawdown"}:
+            last_risk_exit_date = None
+            if policy_settings.kind == "crisis-drawdown":
+                raw_risks = policy_settings.params.get("risk_instruments", ())
+                risk_instruments = (
+                    tuple(str(item).strip() for item in raw_risks)
+                    if isinstance(raw_risks, (list, tuple))
+                    else ()
+                )
+                last_risk_exit_date = self._last_risk_exit_date(
+                    account.account_id,
+                    risk_instruments=risk_instruments,
+                    before=decision_date,
+                )
+            runtime = PortfolioPolicyRuntime(
+                account_id=account.account_id,
+                state=state,
+                last_decision_date=self._last_decision_date(
+                    account.account_id, before=decision_date,
+                ),
+                last_risk_exit_date=last_risk_exit_date,
             )
         policy = build_policy(policy_settings.kind, policy_settings.params, runtime=runtime)
         agent_id = f"{policy.policy_id}-v{policy.version}"
@@ -169,7 +234,9 @@ class AgentDecisionService:
                     f"({exc}); inspect and repair or remove it before retrying"
                 ) from exc
             assert existing is not None
-            if not overwrite:
+            if not overwrite and (
+                policy_settings.kind != "crisis-drawdown" or dry_run
+            ):
                 result.update({
                     "skipped": "already_present",
                     "existing_agent_id": existing.agent_id,
@@ -196,6 +263,44 @@ class AgentDecisionService:
                     for instrument_id, weight in decision.target_weights.items()
                 }
             return result
+
+        if policy_settings.kind == "crisis-drawdown":
+            evaluation = write_agent_evaluation(
+                evaluation_root(self.settings.daily.agent_decision_root),
+                status="ready",
+                account_id=account.account_id,
+                policy_kind=policy_settings.kind,
+                agent_id=agent_id,
+                config_hash=policy.config_hash,
+                parameters=policy_settings.params,
+                as_of=as_of,
+                decision_date=decision_date,
+                snapshot_id=market.snapshot_id,
+                state_hash=state.state_hash,
+                hold=decision.hold,
+                action=str(decision.audit.get("action") or "hold"),
+                reason=decision.reason,
+                target_weights=decision.target_weights,
+                audit=decision.audit,
+            )
+            result["evaluation"] = {
+                "revision_id": evaluation.revision_id,
+                "content_hash": evaluation.content_hash,
+                "file": evaluation.source_path,
+            }
+            if existing is not None and not overwrite:
+                result.update({
+                    "skipped": "already_present",
+                    "existing_agent_id": existing.agent_id,
+                    "existing_content_hash": existing.content_hash,
+                    "file": existing.source_path,
+                })
+                if not decision.hold:
+                    result["target_weights"] = {
+                        instrument_id: str(weight)
+                        for instrument_id, weight in decision.target_weights.items()
+                    }
+                return result
 
         if decision.hold and existing is not None:
             if not review_completed:
@@ -263,11 +368,44 @@ class AgentDecisionService:
             self._notify(result, memory, account.account_id, decision_date, as_of, decision)
         return result
 
+    def _record_crisis_failure(
+        self,
+        account_id: str,
+        policy_settings,
+        *,
+        target_date: date | None,
+        error: Exception,
+    ) -> None:
+        """Best-effort failure evidence; the original policy error stays authoritative."""
+
+        try:
+            write_agent_evaluation(
+                evaluation_root(self.settings.daily.agent_decision_root),
+                status="error",
+                account_id=account_id,
+                policy_kind="crisis-drawdown",
+                agent_id="crisis-drawdown-v1",
+                config_hash=stable_digest({
+                    "kind": policy_settings.kind,
+                    "params": policy_settings.params,
+                }),
+                parameters=policy_settings.params,
+                decision_date=target_date,
+                error_type=type(error).__name__,
+                error=str(error) or type(error).__name__,
+            )
+        except Exception:  # noqa: BLE001 - preserve the original official-run failure
+            # A broken/unwritable evidence store already makes the original
+            # official run fail closed.  Never replace that cause with a
+            # secondary attempt to describe it.
+            return
+
     def decide_all(
         self, *, overwrite: bool = False, dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         """Attempt scheduled policies without cross-account failure propagation."""
         outcomes: list[dict[str, Any]] = []
+        market = None
         for account in self.settings.daily.accounts:
             if account.strategy != "agent-file":
                 continue
@@ -280,10 +418,13 @@ class AgentDecisionService:
                 })
                 continue
             try:
+                if policy_settings is not None and market is None:
+                    market = CanonicalMarketData.open(self.settings.paths.market_data)
                 outcomes.append(self.decide(
                     account.account_id,
                     overwrite=overwrite,
                     dry_run=dry_run,
+                    _market=market,
                 ))
             except Exception as exc:  # noqa: BLE001 - failures are isolated per account
                 outcomes.append({
@@ -405,6 +546,88 @@ class AgentDecisionService:
         assert decision is not None
         return latest
 
+    def _last_risk_exit_date(
+        self,
+        account_id: str,
+        *,
+        risk_instruments: tuple[str, ...],
+        before: date,
+    ) -> date | None:
+        """Find the last saved risk-to-defensive transition, not initial defense."""
+
+        if not risk_instruments:
+            return None
+        root = Path(self.settings.daily.agent_decision_root) / account_id
+        if not root.is_dir():
+            return None
+        dated: list[date] = []
+        for path in root.glob("*.json"):
+            try:
+                parsed = date.fromisoformat(path.stem)
+            except ValueError:
+                continue
+            if parsed < before:
+                dated.append(parsed)
+        previous_had_risk = False
+        last_exit = None
+        risk_set = set(risk_instruments)
+        for decision_date in sorted(dated):
+            try:
+                decision = load_agent_decision(
+                    self.settings.daily.agent_decision_root,
+                    account_id,
+                    decision_date,
+                )
+            except AgentDecisionError as exc:
+                raise AgentServiceError(
+                    f"Prior decision {decision_date.isoformat()} is invalid; "
+                    "risk-exit cooldown cannot be proven"
+                ) from exc
+            assert decision is not None
+            current_has_risk = any(
+                instrument_id in risk_set and weight > 0
+                for instrument_id, weight in decision.target_weights.items()
+            )
+            if previous_had_risk and not current_has_risk:
+                last_exit = decision_date
+            previous_had_risk = current_has_risk
+        return last_exit
+
+    def _portfolio_performance_points(
+        self, account_id: str,
+    ) -> tuple[PortfolioPerformancePoint, ...]:
+        database = Path(self.settings.paths.trading_database)
+        if not database.is_file():
+            return ()
+        repository = TradingRepository(database)
+        try:
+            _, head_run_id = repository.selected_state(account_id)
+        except KeyError:
+            return ()
+        if head_run_id is None:
+            return ()
+        chain = []
+        seen: set[str] = set()
+        cursor: str | None = head_run_id
+        while cursor is not None:
+            if cursor in seen or len(chain) >= 20_000:
+                raise AgentServiceError(
+                    f"Invalid promoted run chain while reading performance: {account_id}"
+                )
+            seen.add(cursor)
+            record = repository.run(cursor)
+            chain.append(record)
+            cursor = record.binding.parent_run_id
+        points: list[PortfolioPerformancePoint] = []
+        for record in reversed(chain):
+            for checkpoint in repository.checkpoints(record.run_id):
+                points.append(PortfolioPerformancePoint(
+                    session_date=date.fromisoformat(str(checkpoint["session_date"])),
+                    nav=checkpoint["nav"],
+                    market_value=checkpoint["market_value"],
+                ))
+        return tuple(points)
+
     @staticmethod
     def _attach_review_result(result: dict[str, Any], decision: PolicyDecision) -> None:
         if not decision.audit:
@@ -455,6 +678,14 @@ class AgentDecisionService:
             "summary": audit.get("summary"),
             "selected_instruments": audit.get("selected_instruments", []),
             "selection_rationale": audit.get("selection_rationale", {}),
+            "benchmark": audit.get("benchmark", {}),
+            "benchmark_assessment": audit.get("benchmark_assessment"),
+            "portfolio_assessment": audit.get("portfolio_assessment"),
+            "action_reasons": audit.get("action_reasons", []),
+            "ignored_action_reasons": audit.get("ignored_action_reasons", []),
+            "action_guard_reason": audit.get("action_guard_reason"),
+            "holding_assessments": audit.get("holding_assessments", []),
+            "watch_items": audit.get("watch_items", []),
             "hard_rule_violations": audit.get("portfolio_hard_rule_violations", []),
             "highlight_evidence_hashes": [
                 item.evidence_hash for item in decision.highlights
@@ -492,6 +723,36 @@ class AgentDecisionService:
                 item.detail,
                 "",
             ))
+        benchmark = decision.audit.get("benchmark")
+        if isinstance(benchmark, Mapping):
+            body_lines.extend(("基准对比：",))
+            if benchmark.get("status") == "ready":
+                body_lines.extend((
+                    f"基准：{benchmark.get('name')} ({benchmark.get('instrument_id')})",
+                    (
+                        f"区间：{benchmark.get('comparison_start')} 至 "
+                        f"{benchmark.get('comparison_end')}，共同交易日 "
+                        f"{benchmark.get('common_trading_sessions')}"
+                    ),
+                    (
+                        f"组合收益 {_percent_text(benchmark.get('portfolio_return'))}；"
+                        f"基准收益 {_percent_text(benchmark.get('benchmark_total_return'))}；"
+                        f"超额 {_percent_text(benchmark.get('excess_return'))}"
+                    ),
+                    (
+                        f"组合最大回撤 {_percent_text(benchmark.get('portfolio_max_drawdown'))}；"
+                        f"基准最大回撤 {_percent_text(benchmark.get('benchmark_max_drawdown'))}；"
+                        f"证据角色 {benchmark.get('actionability')}"
+                    ),
+                ))
+            else:
+                body_lines.append(
+                    f"{benchmark.get('status')}：{benchmark.get('reason') or '暂无可比数据'}"
+                )
+            body_lines.extend((
+                f"模型判断：{decision.audit.get('benchmark_assessment')}",
+                "",
+            ))
         body_lines.extend((
             "模型结论：",
             str(decision.audit.get("summary", decision.reason)),
@@ -518,3 +779,12 @@ class AgentDecisionService:
             "message_id": message_id,
             "evidence_hashes": evidence_hashes,
         })
+
+
+def _percent_text(value: object) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{Decimal(str(value)) * 100:.2f}%"
+    except Exception:  # noqa: BLE001 - notification formatting is best effort
+        return str(value)

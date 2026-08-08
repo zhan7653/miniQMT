@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
 from importlib import import_module, util
 from typing import Any, Mapping
@@ -44,6 +45,8 @@ class BaoStockProvider:
 
     def __init__(self, *, client: Any | None = None) -> None:
         self._client = client
+        self._shared_client: Any | None = None
+        self._reuse_session = False
 
     @property
     def available(self) -> bool:
@@ -52,17 +55,73 @@ class BaoStockProvider:
     def observe(self, request: ProviderRequest) -> ObservationPayload:
         if request.capability not in self.capabilities:
             raise ValueError(f"BaoStock does not support {request.capability.value}")
+        if self._reuse_session and self._shared_client is None:
+            client = self._client or import_module("baostock")
+            self._login(client)
+            self._shared_client = client
+        if self._shared_client is not None:
+            shared = self._shared_client
+            try:
+                return self._observe_authenticated(shared, request)
+            except Exception:
+                # The optimization must never make collection less available.
+                # Retire the shared session and replay this request through the
+                # original one-login-per-request path.
+                self._close_shared_client(shared, suppress_logout_error=True)
+        return self._observe_one_shot(request)
+
+    @contextmanager
+    def session(self):
+        """Reuse one authenticated client while callers retain batch boundaries."""
+
+        if self._reuse_session:
+            raise RuntimeError("BaoStock session is already active")
+        self._reuse_session = True
+        try:
+            yield self
+        finally:
+            self._reuse_session = False
+            if self._shared_client is not None:
+                # Every completed batch has already been validated, recorded,
+                # and checkpointed.  A transport cleanup failure must not turn
+                # those durable successes into an all-universe status failure.
+                self._close_shared_client(
+                    self._shared_client, suppress_logout_error=True,
+                )
+
+    def _observe_one_shot(self, request: ProviderRequest) -> ObservationPayload:
         client = self._client or import_module("baostock")
+        self._login(client)
+        try:
+            return self._observe_authenticated(client, request)
+        finally:
+            client.logout()
+
+    @staticmethod
+    def _login(client: Any) -> None:
         login = client.login()
         if getattr(login, "error_code", "") != "0":
             raise ObservationError(
                 f"BaoStock login failed: {getattr(login, 'error_code', '?')} "
                 f"{getattr(login, 'error_msg', '')}"
             )
+
+    def _close_shared_client(
+        self, client: Any, *, suppress_logout_error: bool = False,
+    ) -> None:
+        if self._shared_client is not client:
+            return
+        self._shared_client = None
         try:
-            table, frame, complete, hashes, detail = self._collect(client, request)
-        finally:
             client.logout()
+        except Exception:
+            if not suppress_logout_error:
+                raise
+
+    def _observe_authenticated(
+        self, client: Any, request: ProviderRequest,
+    ) -> ObservationPayload:
+        table, frame, complete, hashes, detail = self._collect(client, request)
         start, end = _frame_dates(table, frame, request)
         instruments = (
             request.instrument_ids

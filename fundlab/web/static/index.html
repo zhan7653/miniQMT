@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FundLab 模拟盘</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260807-4">
 <script src="/static/vendor/echarts.min.js"></script>
 </head>
 <body>
@@ -19,6 +19,7 @@
 <nav class="tabs" id="tabs">
   <div class="tabs-inner">
     <button class="tab active" data-tab="overview" aria-current="true">总览</button>
+    <button class="tab" data-tab="monitor">策略监控</button>
     <button class="tab" data-tab="accounts">账户</button>
     <button class="tab" data-tab="runs">运行记录</button>
     <button class="tab" data-tab="schedule">计划任务</button>
@@ -36,6 +37,42 @@
     <div id="overview-last-run" class="boxed"></div>
   </section>
 
+  <section class="panel" id="panel-monitor">
+    <div class="cards" id="monitor-summary"></div>
+    <div class="boxed monitor-boundary">
+      <strong>前瞻危机策略监控</strong>
+      <span class="hint">只读取正式评估证据，不在打开页面时重算行情。信号、目标决策和模拟成交分别展示；不使用 ETF 溢价数据。</span>
+    </div>
+    <h2>危机策略总览</h2>
+    <div class="monitor-strategy-grid" id="monitor-strategies"></div>
+    <h2>收益比较</h2>
+    <div id="monitor-performance-chart" class="chart monitor-chart"></div>
+    <div class="row monitor-detail-toolbar">
+      <label for="monitor-account-select">策略详情</label>
+      <select id="monitor-account-select"></select>
+      <span id="monitor-detail-freshness"></span>
+    </div>
+    <div class="cards" id="monitor-detail-metrics"></div>
+    <div id="monitor-state-flow" class="state-flow"></div>
+    <div class="grid-2col">
+      <div>
+        <h2>当前 ETF 信号</h2>
+        <div id="monitor-signals-table"></div>
+      </div>
+      <div>
+        <h2>策略参数（只读）</h2>
+        <div id="monitor-parameters-table"></div>
+      </div>
+    </div>
+    <div class="row monitor-detail-toolbar">
+      <label for="monitor-instrument-select">90 日信号曲线</label>
+      <select id="monitor-instrument-select"></select>
+    </div>
+    <div id="monitor-signal-chart" class="chart monitor-chart"></div>
+    <h2>正式评估时间线</h2>
+    <div id="monitor-timeline-table"></div>
+  </section>
+
   <section class="panel" id="panel-accounts">
     <div class="row">
       <label for="account-select">选择账户</label>
@@ -43,6 +80,7 @@
     </div>
     <div id="account-empty" class="empty hidden">config/fundlab.yaml 中尚未配置任何账户</div>
     <div id="account-detail">
+      <div class="boxed strategy-profile" id="account-strategy-profile"></div>
       <div class="cards" id="account-metrics"></div>
       <h2>净值曲线</h2>
       <div id="equity-chart" class="chart"></div>
@@ -98,41 +136,45 @@
       <label for="agent-account-select">Agent 账户</label>
       <select id="agent-account-select"></select>
     </div>
-    <div class="boxed" id="auto-decision">
-      <h2>策略自动决策</h2>
-      <p class="hint">运行 config/fundlab.yaml 里为该账户配置的确定性策略(与每日计划任务
-        执行的 <code>fundlab agent decide</code> 相同),生成下一交易日的决策文件。</p>
-      <div class="row">
-        <button class="btn ghost" id="agent-preview">预演(不落盘)</button>
-        <button class="btn" id="agent-decide">生成并投递</button>
-        <label><input type="checkbox" id="agent-force-review"> 忽略周度节奏，立即评估</label>
-        <label><input type="checkbox" id="agent-overwrite"> 覆盖同日已有决策</label>
-      </div>
-      <div id="agent-decide-result" class="boxed hidden"></div>
-      <div id="agent-decide-message" class="message"></div>
-    </div>
-    <div class="grid-2col">
-      <div class="boxed" id="decision-form">
-        <h2>投递新决策</h2>
-        <div class="row"><label for="decision-date">决策日期</label><input type="date" id="decision-date"></div>
-        <div id="weight-rows"></div>
-        <button class="btn ghost small" id="add-weight">+ 添加标的</button>
-        <div class="row"><label for="decision-reason">决策理由</label></div>
-        <textarea id="decision-reason" rows="3" placeholder="为什么要这个配置（必填，写入审计账本）"></textarea>
+    <details class="boxed advanced-operations">
+      <summary>高级操作：运行策略或人工投递决策</summary>
+      <p class="hint warning-copy">危机策略账户发生人工投递或覆盖后，将永久标记为“含人工干预”，不再作为纯策略结果参与比较。</p>
+      <div id="auto-decision">
+        <h2>策略自动决策</h2>
+        <p class="hint">运行 config/fundlab.yaml 里为该账户配置的确定性策略(与每日计划任务
+          执行的 <code>fundlab agent decide</code> 相同),生成下一交易日的决策文件。</p>
         <div class="row">
-          <label><input type="checkbox" id="decision-overwrite"> 覆盖同日已有决策</label>
-          <button class="btn" id="decision-submit">投递决策</button>
+          <button class="btn ghost" id="agent-preview">预演(不落盘)</button>
+          <button class="btn" id="agent-decide">生成并投递</button>
+          <label><input type="checkbox" id="agent-force-review"> 忽略周度节奏，立即评估</label>
+          <label><input type="checkbox" id="agent-overwrite"> 覆盖同日已有决策</label>
         </div>
-        <div id="decision-message" class="message"></div>
+        <div id="agent-decide-result" class="boxed hidden"></div>
+        <div id="agent-decide-message" class="message"></div>
       </div>
-      <div>
-        <h2>决策历史</h2>
-        <div id="decisions-table"></div>
+      <div class="grid-2col">
+        <div class="boxed" id="decision-form">
+          <h2>投递新决策</h2>
+          <div class="row"><label for="decision-date">决策日期</label><input type="date" id="decision-date"></div>
+          <div id="weight-rows"></div>
+          <button class="btn ghost small" id="add-weight">+ 添加标的</button>
+          <div class="row"><label for="decision-reason">决策理由</label></div>
+          <textarea id="decision-reason" rows="3" placeholder="为什么要这个配置（必填，写入审计账本）"></textarea>
+          <div class="row">
+            <label><input type="checkbox" id="decision-overwrite"> 覆盖同日已有决策</label>
+            <button class="btn" id="decision-submit">投递决策</button>
+          </div>
+          <div id="decision-message" class="message"></div>
+        </div>
+        <div>
+          <h2>决策历史</h2>
+          <div id="decisions-table"></div>
+        </div>
       </div>
-    </div>
+    </details>
   </section>
 </main>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260807-4"></script>
 </body>
 </html>

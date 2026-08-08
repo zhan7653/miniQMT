@@ -249,6 +249,37 @@ h2::before {
   transform: translateY(-1px);
 }
 
+.strategy-card-details > div + div { margin-top: 5px; }
+.strategy-card-details .strategy-idea { color: var(--gray-700); }
+.strategy-card-details .strategy-instruments { color: var(--gray-800); }
+.strategy-card-details .strategy-account-state {
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+}
+
+.strategy-profile { margin-bottom: 16px; }
+.strategy-profile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.strategy-profile-name {
+  display: block;
+  margin-top: 3px;
+  color: var(--gray-900);
+  font-size: 20px;
+}
+.strategy-profile-description {
+  max-width: 920px;
+  margin: 10px 0 8px;
+  color: var(--gray-700);
+  line-height: 1.65;
+}
+.strategy-profile .table-wrap { margin-top: 10px; }
+.compact-empty { margin-top: 10px; padding: 12px; }
+.instrument-cell { color: var(--gray-800); }
+
 .boxed {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -256,6 +287,105 @@ h2::before {
   box-shadow: var(--shadow-1);
   padding: 16px 20px;
   margin-top: 16px;
+}
+
+/* ---------------------------------------------------- strategy monitor */
+
+.monitor-boundary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  border-left: 4px solid var(--accent);
+}
+
+.monitor-strategy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px;
+}
+
+.monitor-strategy-card { padding: 15px 16px; }
+.monitor-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.monitor-action {
+  margin: 12px 0 8px;
+  color: var(--gray-800);
+  font-size: 18px;
+  font-weight: 700;
+}
+.monitor-progress-block { margin: 8px 0 12px; }
+.progress-track {
+  height: 7px;
+  margin-top: 6px;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--gray-100);
+}
+.progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #818cf8);
+}
+.monitor-card-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.monitor-detail-toolbar { margin-top: 30px; }
+.monitor-detail-toolbar select { min-width: 280px; }
+.monitor-detail-toolbar > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.monitor-chart { height: 360px; }
+
+.state-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  margin: 18px 0 8px;
+}
+.state-step {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  box-shadow: var(--shadow-1);
+}
+.state-step .hint:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.state-arrow {
+  align-self: center;
+  color: var(--gray-400);
+  font-size: 22px;
+}
+.compact-row { margin: 6px 0; }
+
+.advanced-operations > summary {
+  cursor: pointer;
+  color: var(--gray-800);
+  font-weight: 650;
+}
+.advanced-operations[open] > summary { margin-bottom: 12px; }
+.warning-copy {
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: #92400e;
 }
 
 /* --------------------------------------------------------------- forms */
@@ -384,6 +514,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 @media (max-width: 1100px) {
   .grid-2col { grid-template-columns: minmax(0, 1fr); }
+  .state-flow { grid-template-columns: minmax(0, 1fr); }
+  .state-arrow { display: none; }
 }
 
 /* ------------------------------------------------------------- feedback */
@@ -448,4 +580,6 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .card { padding: 13px 16px; }
   .card .card-value { font-size: 22px; }
   .brand span { display: none; }
+  .monitor-boundary { align-items: flex-start; flex-direction: column; }
+  .monitor-detail-toolbar select { min-width: 0; width: 100%; }
 }

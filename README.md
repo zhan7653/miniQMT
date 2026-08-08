@@ -41,13 +41,17 @@ uv run fundlab daily status
 
 Accounts, the session cutoff, and the agent decision directory live in the `daily:` section of
 `config/fundlab.yaml`. Exit code 0 means ok, already up to date, or explicitly `degraded`; exit
-code 2 means a fail-closed gate blocked the run. A degraded run isolates at most 200 instruments
-and at most 3% of the universe for no more than five consecutive sessions: valuation uses the
-last trusted price, trading is prohibited, and due orders are deferred. The reason is in the
-console JSON and in the ops report under `data/reports/daily/`. Re-running after a block resumes
-from the durable observation warehouse. The scheduled wrapper retries only failures explicitly
-classified as transient provider transport errors (up to three daily attempts, waiting 30 then
-60 seconds); schema, reconciliation, and data-conflict failures still stop immediately.
+code 2 is reserved for failures that physically prevent a trustworthy durable/atomic publication.
+Normal prices are never discarded because an instrument or auxiliary evidence source failed.
+Instrument price gaps use explicit quarantine (last trusted valuation, no execution, deferred due
+orders) without a count or consecutive-day cutoff that could block unrelated prices. Missing
+status, action, factor, or direct-limit evidence keeps real OHLC/volume visible but applies a
+separate no-execution rule. A temporarily unavailable official universe carries the last trusted
+membership with an explicit stale marker and the same no-execution rule. Only prefixes with a
+complete coverage claim are composed with the new suffix. If a no-trade candidate has an active
+row from another source, the exact instrument and conflicting observation IDs are quarantined
+while the rest advances. Full
+details remain in the console JSON and `data/reports/daily/`.
 
 Schedule it Tuesday-Saturday at 06:00, after the previous trading day's upstream data has settled,
 with catch-up and retries:
@@ -71,8 +75,8 @@ real T+1 prices.
 uv run fundlab web
 ```
 
-Starts a localhost dashboard (default `http://127.0.0.1:8610`, change with `--port`) with five
-views: overview, per-account equity curve / positions / orders / ledger events, daily run reports
+Starts a localhost dashboard (default `http://127.0.0.1:8610`, change with `--port`) with six
+views: overview, a read-only crisis-strategy monitor, per-account equity curve / positions / orders / ledger events, daily run reports
 with stage-level detail, Windows scheduled-task management plus a manual "run now" trigger with
 live log tail, and agent decision submission with the same validation the account run applies.
 The dashboard binds to localhost only and manages nothing that the CLI does not already own.
@@ -103,13 +107,34 @@ file (wrong account, wrong date, negative weight, missing reason) fails the acco
 of degrading to a hold, and the decision content is bound into the run's strategy config hash so a
 replay cannot silently execute a different decision.
 
-A local producer for that contract ships in `fundlab.agent`. It contains the deterministic
-`momentum-rotation` baseline and the charter-bound, LLM-backed `dividend-value` paper Agent. The
-dividend Agent screens the canonical stock universe deterministically, sends only the bounded
+A local producer for that contract ships in `fundlab.agent`. Its deterministic policies are
+`momentum-rotation`, month-end `dual-momentum`, `inverse-volatility`, correlation-aware risk parity,
+trend/volatility targeting and liquid low-beta stocks, plus weekly `dividend-rules`, ST-removal
+momentum, tightly capped active-ST momentum, and stateful `crisis-drawdown` ETF variants; only the
+charter-bound `dividend-value` paper Agent
+uses an LLM. The stock price/ST policies are prospective incubators from their account creation date:
+the v2 universe does not claim complete delisted history, so they do not publish historical-backtest
+performance. Eight independent crisis accounts are also prospective-only: they wait in
+`511010.SH`, enter only after declared ETF-price drawdown/reversal or drawdown-ladder evidence,
+and exit on the simulated account's own cost return or recovery toward the prior peak. Premium/
+discount data is deliberately not an input; cross-border exposure is constrained through smaller
+per-position caps instead. Every official non-dry-run crisis evaluation is first published as
+immutable, validated evidence under `data/agent/evaluations/<account>/<as_of>/`; dry-runs never
+enter that history, and an evidence-write failure prevents that account from publishing a new
+decision. The dashboard reads those saved evaluations instead of recomputing signals on page load,
+separates signal / queued decision / simulated execution, retains snapshot/config revisions, and
+marks accounts whose return path contains a manual decision. The rules-only
+dividend account is a direct comparison baseline: it requires a current trailing cash payment and
+a completed fiscal dividend no more than two years old, then ranks the eligible stocks by
+conservative sustainable yield, payout stability and liquidity. The LLM dividend Agent screens the
+canonical stock universe deterministically, sends only the bounded
 candidate/library/memory context to an OpenAI-compatible **Responses** endpoint, accepts a strict
 JSON Schema result, then re-validates every selected instrument and portfolio limit before the
-shared decision writer can publish anything. The scheduled task tries enabled policies before the
-daily cycle and again after a successful publication:
+shared decision writer can publish anything. Its 10-stock paper portfolio is evaluated against
+`159207.SZ` on an adjusted total-return basis from the first invested session. Relative performance
+is diagnostic for the first 60 common sessions and can only be supporting — never sole — rebalance
+evidence afterwards. The dashboard projects the saved weekly comparison onto the account view. The
+scheduled task tries enabled policies before the daily cycle and again after a successful publication:
 
 ```powershell
 uv run fundlab agent decide --all        # or --account-id paper-agent [--dry-run]

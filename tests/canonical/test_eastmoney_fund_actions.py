@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from fundlab.marketdata import MarketTable, ProviderCapability, ProviderRequest
+from fundlab.marketdata import (
+    MarketTable,
+    ObservationError,
+    ProviderCapability,
+    ProviderRequest,
+)
 from fundlab.marketdata.sources import eastmoney_fund
 from fundlab.marketdata.sources.eastmoney_fund import EastmoneyEtfActionProvider
 
@@ -23,6 +28,37 @@ _PAGE = """
 </table>
 </body></html>
 """
+
+
+def test_etf_action_summary_normalizes_header_declared_distribution_units():
+    page = """
+    <table>
+      <tr><th>年份</th><th>权益登记日</th><th>除息日</th><th>每10份分红</th><th>分红发放日</th></tr>
+      <tr><td>2026年</td><td>2026-05-12</td><td>2026-05-13</td><td>0.0310元</td><td>2026-05-15</td></tr>
+    </table>
+    <table><tr><th>年份</th><th>拆分折算日</th><th>拆分类型</th><th>拆分折算比例</th></tr></table>
+    """
+
+    events = eastmoney_fund._summary_events(
+        page, start=date(2026, 1, 1), end=date(2026, 12, 31),
+    )
+
+    assert len(events) == 1
+    assert events[0].cash_per_share == pytest.approx(0.0031)
+
+
+def test_etf_action_summary_rejects_unknown_cash_schema_even_with_split_table():
+    page = """
+    <table>
+      <tr><th>年份</th><th>权益登记日</th><th>除息日</th><th>现金分配</th><th>分红发放日</th></tr>
+    </table>
+    <table><tr><th>年份</th><th>拆分折算日</th><th>拆分类型</th><th>拆分折算比例</th></tr></table>
+    """
+
+    with pytest.raises(ObservationError, match="cash distribution column"):
+        eastmoney_fund._summary_events(
+            page, start=date(2026, 1, 1), end=date(2026, 12, 31),
+        )
 
 
 class _Transport:
@@ -142,6 +178,61 @@ def test_etf_action_provider_recovers_cash_notice_when_archive_table_is_empty():
     assert action["cash_per_share"] == pytest.approx(0.002)
     assert json.loads(action["source_payload"])["economics_source"] == (
         "implementation_notice"
+    )
+
+
+def test_etf_action_provider_marks_in_scope_unreadable_notice_incomplete():
+    page = """
+    <html><head><title>测试ETF(159999)基金分红送配</title></head><body>
+    <table><tr><th>年份</th><th>权益登记日</th><th>除息日</th><th>每份分红</th><th>分红发放日</th></tr></table>
+    <table><tr><th>年份</th><th>拆分折算日</th><th>拆分类型</th><th>拆分折算比例</th></tr></table>
+    </body></html>
+    """
+
+    class UnreadableNoticeTransport:
+        def get_text(self, url, *, parameters, headers, timeout):
+            return page
+
+        def get_json(self, url, *, parameters, headers, timeout):
+            if url.endswith("/JJGG"):
+                return {
+                    "Data": [{
+                        "ID": "cash-unreadable",
+                        "TITLE": "测试ETF收益分配公告",
+                        "PUBLISHDATEDesc": "2024-08-09",
+                    }],
+                    "TotalCount": 1,
+                }
+            return {
+                "success": 1,
+                "data": {
+                    "art_code": "cash-unreadable",
+                    "notice_date": "2024-08-09",
+                    "notice_content": "本公告正文没有可解析的行动生命周期字段。",
+                },
+            }
+
+        def get_bytes(self, url, *, parameters, headers, timeout):
+            raise RuntimeError("announcement PDF unavailable")
+
+    payload = EastmoneyEtfActionProvider(
+        transport=UnreadableNoticeTransport()
+    ).observe(ProviderRequest(
+        ProviderCapability.CORPORATE_ACTIONS,
+        date(2024, 8, 1),
+        date(2024, 8, 31),
+        ("159999.SZ",),
+        {
+            "listed_dates": {"159999.SZ": "2020-01-02"},
+            "max_workers": 1,
+            "retries": 1,
+        },
+    ))
+
+    assert not payload.coverage[0].complete
+    assert payload.tables[MarketTable.CORPORATE_ACTIONS].empty
+    assert payload.source_metadata["invalid_lifecycle"]["159999.SZ"] == (
+        "announcement_content:cash-unreadable",
     )
 
 

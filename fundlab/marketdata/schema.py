@@ -12,6 +12,8 @@ from fundlab.marketdata.contracts import (
     AssetType,
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CorporateActionType,
+    DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
     MarketTable,
     ObservationError,
     PriceLimitState,
@@ -304,7 +306,13 @@ def validate_snapshot_tables(
         errors.append("missing_raw_bars")
     if (bars["price_mode"] == PriceMode.ADJUSTED.value).any():
         warnings.append("provider_adjusted_bars_are_audit_only")
-    active = raw.loc[~raw["suspended"].fillna(False)]
+    quarantine = raw["trade_rule_id"].astype(str).eq(DATA_GAP_QUARANTINE_RULE_ID)
+    execution_guard = raw["trade_rule_id"].astype(str).eq(
+        EXECUTION_EVIDENCE_GAP_RULE_ID
+    )
+    active = raw.loc[
+        ~raw["suspended"].fillna(False) & ~quarantine & ~execution_guard
+    ]
     if active[["open", "high", "low", "close"]].isna().any().any():
         errors.append("active_bar_missing_ohlc")
     if not active.empty:
@@ -315,6 +323,27 @@ def validate_snapshot_tables(
         )
         if invalid_ohlc.any():
             errors.append("invalid_ohlc")
+    guarded_prices = raw.loc[
+        execution_guard
+        & raw[["open", "high", "low", "close"]].notna().any(axis=1)
+    ]
+    if not guarded_prices.empty:
+        if guarded_prices[["open", "high", "low", "close"]].isna().any().any():
+            errors.append("execution_guard_bar_partial_ohlc")
+        else:
+            invalid_guarded_ohlc = (
+                (guarded_prices[["open", "high", "low", "close"]].min(axis=1) <= 0)
+                | (
+                    guarded_prices["high"]
+                    < guarded_prices[["open", "close", "low"]].max(axis=1)
+                )
+                | (
+                    guarded_prices["low"]
+                    > guarded_prices[["open", "close", "high"]].min(axis=1)
+                )
+            )
+            if invalid_guarded_ohlc.any():
+                errors.append("invalid_execution_guard_ohlc")
     if (raw["volume"] < 0).any():
         errors.append("negative_volume")
     if raw["amount"].isna().any():
@@ -335,15 +364,25 @@ def validate_snapshot_tables(
         open_days = set(calendar.loc[calendar["is_open"], "session_date"])
         if not set(raw["session_date"]) <= open_days:
             errors.append("bar_on_closed_or_unknown_session")
-        if raw["suspended"].isna().any():
+        if (raw["suspended"].isna() & ~quarantine & ~execution_guard).any():
             errors.append("missing_tradability_state")
         suspended = raw.loc[raw["suspended"].fillna(False)]
-        simulation_active = raw.loc[~raw["suspended"].fillna(False)]
+        simulation_active = raw.loc[
+            ~raw["suspended"].fillna(False) & ~quarantine & ~execution_guard
+        ]
+        quarantine_rows = raw.loc[quarantine]
         if not suspended.empty:
             if pd.to_numeric(suspended["volume"], errors="coerce").fillna(0).ne(0).any():
                 errors.append("suspended_bar_nonzero_volume")
             if suspended[["open", "high", "low", "close"]].notna().any().any():
                 errors.append("suspended_bar_has_ohlc")
+        if not quarantine_rows.empty:
+            if pd.to_numeric(
+                quarantine_rows["volume"], errors="coerce",
+            ).fillna(0).ne(0).any():
+                errors.append("quarantine_bar_nonzero_volume")
+            if quarantine_rows[["open", "high", "low", "close"]].notna().any().any():
+                errors.append("quarantine_bar_has_ohlc")
         if simulation_active["is_st"].isna().any():
             errors.append("missing_st_state")
         if raw["trade_rule_id"].isna().any() or raw["trade_rule_id"].str.strip().eq("").fillna(True).any():

@@ -40,7 +40,7 @@ _ANNOUNCEMENT_PDF = "https://pdf.dfcfw.com/pdf/H2_{report_id}_1.pdf"
 _ACTION_TITLE = re.compile(r"(?:分红|收益分配|利润分配|份额拆|份额折|份额合)")
 _DATE_TOKEN = r"(\d{4})年(\d{1,2})月(\d{1,2})日"
 _ISO_DATE_TOKEN = r"(\d{4})-(\d{1,2})-(\d{1,2})"
-EASTMONEY_ETF_ACTION_POLICY = "eastmoney-etf-actions-r2-v6"
+EASTMONEY_ETF_ACTION_POLICY = "eastmoney-etf-actions-r2-v7"
 
 
 @dataclass(frozen=True)
@@ -449,6 +449,10 @@ class EastmoneyEtfActionProvider:
                     document_transport=content_transports[report_id],
                     document_url=pdf_url,
                 )
+                if notice is None:
+                    raise ObservationError(
+                        "Eastmoney announcement PDF has no parseable action lifecycle"
+                    )
             except Exception as pdf_error:
                 try:
                     payload = self._retry_json(
@@ -468,6 +472,10 @@ class EastmoneyEtfActionProvider:
                         document_transport=content_transports[report_id],
                         document_url=_ANNOUNCEMENT_CONTENT,
                     )
+                    if notice is None:
+                        raise ObservationError(
+                            "Eastmoney announcement JSON has no parseable action lifecycle"
+                        )
                 except Exception as content_error:
                     content_errors[report_id] = (
                         f"PDF:{type(pdf_error).__name__}:{str(pdf_error)[:160]};"
@@ -537,7 +545,13 @@ class EastmoneyEtfActionProvider:
         summaries.sort(key=lambda item: (item.event_date, item.kind))
 
         rows: list[dict[str, Any]] = []
-        issues: list[str] = []
+        issues: list[str] = [
+            f"announcement_content:{report_id}"
+            for report_id in sorted(content_errors)
+            if _announcement_may_affect_scope(
+                candidates_by_id[report_id], start=start, end=end,
+            )
+        ]
         pending: list[Mapping[str, Any]] = []
         for event in summaries:
             if event.kind == "cash":
@@ -879,22 +893,39 @@ def _summary_events(text: str, *, start: date, end: date) -> list[_SummaryEvent]
         except ValueError as exc:
             raise ObservationError("Eastmoney fund archive contains no readable tables") from exc
     events: list[_SummaryEvent] = []
-    found_action_table = False
+    found_cash_table = False
     for frame in tables:
-        columns = set(map(str, frame.columns))
-        if {"权益登记日", "除息日", "每份分红", "分红发放日"} <= columns:
-            found_action_table = True
+        columns = {str(column): column for column in frame.columns}
+        cash_lifecycle = {"权益登记日", "除息日", "分红发放日"}
+        if cash_lifecycle <= set(columns):
+            cash_columns = [
+                (columns[label], units)
+                for label in columns
+                if (units := _cash_column_units(label)) is not None
+            ]
+            if len(cash_columns) != 1:
+                raise ObservationError(
+                    "Eastmoney fund archive has an unrecognized or ambiguous "
+                    "cash distribution column"
+                )
+            found_cash_table = True
+            cash_column, cash_units = cash_columns[0]
             for item in frame.to_dict("records"):
                 record = _date_value(item.get("权益登记日"))
                 ex_date = _date_value(item.get("除息日"))
                 pay = _date_value(item.get("分红发放日"))
-                cash = _cash_value(item.get("每份分红"))
                 if ex_date is None:
                     continue
-                if start <= ex_date <= end and record is not None and pay is not None and cash is not None:
-                    events.append(_SummaryEvent("cash", ex_date, cash, None, record, pay))
-        if {"拆分折算日", "拆分类型", "拆分折算比例"} <= columns:
-            found_action_table = True
+                if not start <= ex_date <= end:
+                    continue
+                cash = _cash_per_share_value(item.get(cash_column), cash_units)
+                if record is None or pay is None or cash is None:
+                    raise ObservationError(
+                        "Eastmoney fund archive has an invalid cash distribution row "
+                        f"for {ex_date.isoformat()}"
+                    )
+                events.append(_SummaryEvent("cash", ex_date, cash, None, record, pay))
+        if {"拆分折算日", "拆分类型", "拆分折算比例"} <= set(columns):
             for item in frame.to_dict("records"):
                 split_date = _date_value(item.get("拆分折算日"))
                 multiplier = _multiplier(item.get("拆分折算比例"))
@@ -902,8 +933,10 @@ def _summary_events(text: str, *, start: date, end: date) -> list[_SummaryEvent]
                     continue
                 if start <= split_date <= end and multiplier is not None and multiplier > 0:
                     events.append(_SummaryEvent("split", split_date, quantity_multiplier=multiplier))
-    if not found_action_table:
-        raise ObservationError("Eastmoney fund archive is missing action tables")
+    if not found_cash_table:
+        raise ObservationError(
+            "Eastmoney fund archive is missing the cash distribution table"
+        )
     return sorted(events, key=lambda item: (item.event_date, item.kind))
 
 
@@ -981,6 +1014,16 @@ def _notice(
         resume = _regex_date(compact, rf"{_DATE_TOKEN}[^0-9]{{0,8}}复牌")
     multiplier = _notice_multiplier(compact)
     cash_per_share = _notice_cash_per_share(compact)
+    if all(value is None for value in (
+        record,
+        ex_date,
+        pay,
+        split_date,
+        resume,
+        multiplier,
+        cash_per_share,
+    )):
+        return None
     return _Notice(
         str(item.get("ID") or data.get("art_code") or ""),
         str(item.get("TITLE") or data.get("notice_title") or ""),
@@ -1204,6 +1247,45 @@ def _date_value(value: Any) -> date | None:
 def _cash_value(value: Any) -> float | None:
     found = re.search(r"(?:派现金)?\s*([0-9]+(?:\.[0-9]+)?)\s*元", str(value))
     return None if found is None else float(found.group(1))
+
+
+def _cash_column_units(value: Any) -> float | None:
+    label = re.sub(r"\s+", "", str(value))
+    found = re.fullmatch(
+        r"每([0-9]+(?:\.[0-9]+)?)?份(?:现金)?分红(?:[（(]元[）)])?",
+        label,
+    )
+    if found is None:
+        return None
+    units = float(found.group(1) or 1.0)
+    if units <= 0:
+        raise ObservationError(
+            "Eastmoney fund archive declares non-positive cash distribution units"
+        )
+    return units
+
+
+def _cash_per_share_value(value: Any, header_units: float) -> float | None:
+    text = re.sub(r"\s+", "", str(value))
+    explicit = re.search(r"每([0-9]+(?:\.[0-9]+)?)?份", text)
+    if explicit is not None:
+        explicit_units = float(explicit.group(1) or 1.0)
+        if explicit_units <= 0 or abs(explicit_units - header_units) > 1e-12:
+            raise ObservationError(
+                "Eastmoney fund archive cash distribution units conflict "
+                "between the column and row"
+            )
+    cash = _cash_value(text)
+    if cash is None or cash <= 0:
+        return None
+    return cash / header_units
+
+
+def _announcement_may_affect_scope(
+    item: Mapping[str, Any], *, start: date, end: date,
+) -> bool:
+    known = _date_value(item.get("PUBLISHDATEDesc"))
+    return known is None or start - timedelta(days=31) <= known <= end
 
 
 def _multiplier(value: Any) -> float | None:

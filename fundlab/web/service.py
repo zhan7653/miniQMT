@@ -13,18 +13,115 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
-from fundlab.marketdata import MarketDataWarehouse
+from fundlab.agent.evaluations import (
+    AgentEvaluation,
+    AgentEvaluationError,
+    evaluation_root,
+    list_agent_evaluations,
+)
+from fundlab.agent.tools import AgentMemory, AgentMemoryError
+from fundlab.common.canonical import to_primitive
+from fundlab.common.dates import audit_now
+from fundlab.marketdata import MarketDataWarehouse, MarketTable
 from fundlab.settings import DailyAccountSettings, FoundationSettings
 from fundlab.strategies import AgentDecisionError, load_agent_decision, write_agent_decision
 from fundlab.trading import TradingRepository, build_simulation_feedback
 from fundlab.trading.repository import RunRecord
+from fundlab.web.snapshot_cache import InstrumentNameResolver
 
 _DECISION_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
 _REPORT_NAME = re.compile(r"^daily-[A-Za-z0-9-]+\.json$")
 _CHAIN_LIMIT = 20000
+
+_STRATEGY_PRESENTATION: dict[str, tuple[str, str, str, bool]] = {
+    "static": (
+        "静态股债配置",
+        "按固定目标权重持有并再平衡，不根据行情主动择时。",
+        "固定 ETF 配置",
+        False,
+    ),
+    "momentum-rotation": (
+        "动量轮动",
+        "比较风险资产的中期动量，趋势为正时持有风险资产，否则切到防守资产。",
+        "固定 ETF 轮动",
+        False,
+    ),
+    "dividend-value": (
+        "红利价值（LLM 复核）",
+        "先用财务与流动性规则筛选高股息股票，再由 LLM 做有边界、可审计的周度复核。",
+        "沪深 A 股动态选股",
+        True,
+    ),
+    "dividend-rules": (
+        "红利价值（纯规则）",
+        "按股息率、连续分红和流动性筛选股票，以等权方式低频调仓。",
+        "沪深 A 股动态选股",
+        False,
+    ),
+    "dual-momentum": (
+        "双动量轮动",
+        "同时使用绝对动量和相对动量，月末选择趋势更强的 ETF，弱势时转入防守资产。",
+        "固定 ETF 池",
+        False,
+    ),
+    "inverse-volatility": (
+        "逆波动率配置",
+        "月末按历史波动率的倒数分配权重，让低波动 ETF 获得更高权重。",
+        "固定 ETF 池",
+        False,
+    ),
+    "correlation-risk-parity": (
+        "相关性风险平价",
+        "根据波动率和资产相关性分配风险预算，控制单一资产对组合风险的贡献。",
+        "固定 ETF 池",
+        False,
+    ),
+    "trend-volatility-target": (
+        "趋势过滤＋波动率目标",
+        "月末先做趋势过滤，再按目标波动率控制风险仓位，未通过趋势时持有防守资产。",
+        "固定 ETF 池",
+        False,
+    ),
+    "low-beta-volatility": (
+        "低贝塔低波动",
+        "从 A 股中筛选相对基准贝塔较低、波动较小且流动性合格的股票，月度调仓。",
+        "沪深 A 股动态选股",
+        False,
+    ),
+    "st-removal-momentum": (
+        "摘帽动量",
+        "在近期摘帽股票中筛选流动性和动量较强的标的，未满足条件时持有防守资产。",
+        "近期摘帽股票动态选股",
+        False,
+    ),
+    "st-active-momentum": (
+        "ST 动量",
+        "在当前 ST 股票中筛选流动性和动量较强的标的，并用仓位上限控制风险。",
+        "当前 ST 股票动态选股",
+        False,
+    ),
+    "crisis-drawdown": (
+        "危机回撤策略",
+        "平时持有防守资产，只有深度回撤满足反转或阶梯条件时才分批建仓，恢复或止盈后退出。",
+        "固定 ETF 危机观察池",
+        False,
+    ),
+}
+
+_CRISIS_VARIANTS: dict[str, tuple[str, str]] = {
+    "paper-crash-global": ("全球宽基危机回撤", "覆盖 A 股、美股、港股、日本和德国等市场，等待全球宽基深跌后的反转机会。"),
+    "paper-crash-cn-small": ("A 股危机回撤（精简池）", "只观察少量 A 股宽基，减少信号分散并保持低频。"),
+    "paper-crash-cn-wide": ("A 股危机回撤（宽池）", "覆盖更多 A 股宽基与成长指数，在市场深跌后择优建仓。"),
+    "paper-crash-conservative": ("危机回撤（保守反转）", "要求更充分的回撤与反转确认，并使用更克制的风险仓位。"),
+    "paper-crash-aggressive": ("危机回撤（激进阶梯）", "按回撤加深程度分档买入，提高危机期间的建仓速度与仓位。"),
+    "paper-crash-vol-control": ("危机回撤（波动控制）", "触发危机建仓后再按目标波动率压缩或放大风险仓位。"),
+    "paper-crash-fast-profit": ("危机回撤（快速止盈）", "沿用深跌建仓条件，但采用更快的盈利退出规则。"),
+    "paper-crash-semiconductor": ("中韩半导体危机回撤", "专门等待中韩半导体 ETF 出现深度回撤后的低频反转机会。"),
+}
 
 
 class DashboardError(ValueError):
@@ -34,6 +131,7 @@ class DashboardError(ValueError):
 @dataclass(frozen=True)
 class DashboardService:
     settings: FoundationSettings
+    name_resolver: InstrumentNameResolver | None = None
 
     # ------------------------------------------------------------- helpers
 
@@ -45,6 +143,107 @@ class DashboardService:
             if item.account_id == account_id:
                 return item
         return None
+
+    def _instrument_names(self, instrument_ids: set[str] | tuple[str, ...] = ()) -> dict[str, str]:
+        if self.name_resolver is not None:
+            return self.name_resolver.lookup(instrument_ids)
+        try:
+            warehouse = MarketDataWarehouse(self.settings.paths.market_data)
+            snapshot_id = warehouse.current_snapshot_id()
+            return dict(_instrument_names_for_snapshot(
+                str(Path(self.settings.paths.market_data).resolve()),
+                snapshot_id,
+            ))
+        except Exception:
+            # A missing/unreadable market snapshot must not make account state
+            # disappear from the dashboard. The UI falls back to the code.
+            return {}
+
+    def _instrument_name_state(
+        self, instrument_ids: set[str],
+    ) -> tuple[dict[str, str], bool]:
+        if self.name_resolver is not None:
+            lookup_state = getattr(self.name_resolver, "lookup_state", None)
+            if callable(lookup_state):
+                names, pending = lookup_state(instrument_ids)
+                return dict(names), bool(pending)
+        return self._instrument_names(instrument_ids), False
+
+    def _strategy_instrument_ids(self, config: DailyAccountSettings) -> tuple[str, ...]:
+        policy = self.settings.agent.policies.get(config.account_id)
+        params: Mapping[str, Any] = {} if policy is None else policy.params
+        return tuple(
+            item["instrument_id"]
+            for item in _configured_instruments(config, params, {})
+        )
+
+    def _strategy_profile(
+        self,
+        config: DailyAccountSettings,
+        instrument_names: Mapping[str, str],
+    ) -> dict[str, Any]:
+        policy = self.settings.agent.policies.get(config.account_id)
+        kind = config.strategy if policy is None else policy.kind
+        title, description, universe, uses_llm = _STRATEGY_PRESENTATION.get(
+            kind,
+            (kind, "按配置中的策略规则生成目标仓位。", "配置驱动", False),
+        )
+        if kind == "crisis-drawdown" and config.account_id in _CRISIS_VARIANTS:
+            title, description = _CRISIS_VARIANTS[config.account_id]
+        params: Mapping[str, Any] = {} if policy is None else policy.params
+        return {
+            "strategy_kind": kind,
+            "strategy_name": title,
+            "strategy_description": description,
+            "strategy_universe": universe,
+            "strategy_uses_llm": uses_llm,
+            "strategy_instruments": _configured_instruments(
+                config,
+                params,
+                instrument_names,
+            ),
+        }
+
+    def _agent_benchmark_reviews(
+        self, account_id: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        policy = self.settings.agent.policies.get(account_id)
+        if policy is None or policy.kind != "dividend-value":
+            return None, []
+        try:
+            entries = AgentMemory(
+                self.settings.agent.memory.root, account_id,
+            ).entries()
+        except AgentMemoryError as exc:
+            return ({
+                "status": "unavailable",
+                "reason": f"AgentMemoryError: {exc}",
+            }, [])
+        latest: dict[str, Any] | None = None
+        history: list[dict[str, Any]] = []
+        for entry in entries:
+            raw = entry.get("benchmark")
+            if entry.get("event") != "review" or not isinstance(raw, Mapping) or not raw:
+                continue
+            benchmark = dict(raw)
+            latest = benchmark | {
+                "review_as_of": entry.get("as_of"),
+                "benchmark_assessment": entry.get("benchmark_assessment"),
+            }
+            if benchmark.get("status") != "ready":
+                continue
+            history.append({
+                "as_of": entry.get("as_of"),
+                "comparison_end": benchmark.get("comparison_end"),
+                "portfolio_nav": benchmark.get("portfolio_nav"),
+                "benchmark_nav": benchmark.get("benchmark_nav_on_portfolio_scale"),
+                "portfolio_return": benchmark.get("portfolio_return"),
+                "benchmark_total_return": benchmark.get("benchmark_total_return"),
+                "excess_return": benchmark.get("excess_return"),
+                "common_trading_sessions": benchmark.get("common_trading_sessions"),
+                "actionability": benchmark.get("actionability"),
+            })
+        return latest, history
 
     def _run_chain(self, repository: TradingRepository, head_run_id: str) -> list[RunRecord]:
         """Promoted history, oldest first."""
@@ -60,16 +259,15 @@ class DashboardService:
     # ------------------------------------------------------------ snapshot
 
     def market_summary(self) -> dict[str, Any]:
+        if self.name_resolver is not None:
+            return self.name_resolver.market_summary()
         try:
             warehouse = MarketDataWarehouse(self.settings.paths.market_data)
-            snapshot = warehouse.load_snapshot(warehouse.current_snapshot_id())
-            scope = snapshot.plan.universe_scope
-            return {
-                "snapshot_id": snapshot.snapshot_id,
-                "published_end": None if scope is None else scope.history_end.isoformat(),
-                "history_start": None if scope is None else scope.history_start.isoformat(),
-                "instruments": 0 if scope is None else len(scope.instrument_ids),
-            }
+            snapshot_id = warehouse.current_snapshot_id()
+            return dict(_market_summary_for_snapshot(
+                str(Path(self.settings.paths.market_data).resolve()),
+                snapshot_id,
+            ))
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -77,6 +275,12 @@ class DashboardService:
 
     def accounts(self) -> list[dict[str, Any]]:
         repository = self._repository()
+        instrument_ids = {
+            instrument_id
+            for config in self.settings.daily.accounts
+            for instrument_id in self._strategy_instrument_ids(config)
+        }
+        instrument_names = self._instrument_names(instrument_ids)
         found = []
         for config in self.settings.daily.accounts:
             entry: dict[str, Any] = {
@@ -86,6 +290,7 @@ class DashboardService:
                 "initial_cash": str(config.initial_cash),
                 "weights": {key: str(value) for key, value in config.weights.items()},
                 "exists": False,
+                **self._strategy_profile(config, instrument_names),
             }
             try:
                 account = repository.account(config.account_id)
@@ -118,12 +323,16 @@ class DashboardService:
         except KeyError as exc:
             if config is not None:
                 # Configured but not yet created: first daily run creates it.
+                instrument_names = self._instrument_names(
+                    self._strategy_instrument_ids(config),
+                )
                 return {
                     "account_id": account_id,
                     "name": config.name,
                     "exists": False,
                     "strategy": config.strategy,
                     "weights": {key: str(value) for key, value in config.weights.items()},
+                    **self._strategy_profile(config, instrument_names),
                     "cash": str(config.initial_cash),
                     "equity_curve": [],
                     "positions": [],
@@ -131,6 +340,9 @@ class DashboardService:
                     "recent_events": [],
                     "feedback": None,
                     "runs": [],
+                    "benchmark": None,
+                    "benchmark_history": [],
+                    "strategy_config_changes": [],
                 }
             raise DashboardError(f"账户不存在: {account_id}") from exc
         state, head_run_id = repository.selected_state(account_id)
@@ -165,13 +377,22 @@ class DashboardService:
                     break
                 events = repository.events(record.run_id)
                 for event in reversed(events):
+                    payload = event["payload"]
+                    if not _account_event_visible(event["event_type"], payload):
+                        continue
+                    instrument_id = (
+                        payload.get("instrument_id")
+                        if isinstance(payload, Mapping)
+                        else None
+                    )
                     recent_events.append({
                         "run_id": record.run_id,
                         "session_date": event["session_date"],
                         "event_type": event["event_type"],
                         "entity_type": event["entity_type"],
                         "entity_id": event["entity_id"],
-                        "payload": event["payload"],
+                        "payload": payload,
+                        "instrument_name": None,
                     })
                     if len(recent_events) >= events_limit:
                         break
@@ -230,6 +451,7 @@ class DashboardService:
             cost = item["cost_amount"]
             position_rows.append({
                 "instrument_id": item["instrument_id"],
+                "instrument_name": None,
                 "quantity": quantity,
                 "sellable_quantity": item["sellable_quantity"],
                 "cost_amount": str(cost),
@@ -242,6 +464,7 @@ class DashboardService:
         pending_orders = [{
             "order_id": order.order_id,
             "instrument_id": order.instrument_id,
+            "instrument_name": None,
             "side": order.side.value,
             "created_on": order.created_on.isoformat(),
             "execution_date": order.execution_date.isoformat(),
@@ -251,12 +474,54 @@ class DashboardService:
             "status": order.status.value,
         } for order in state.pending_orders]
 
+        instrument_ids = set() if config is None else set(
+            self._strategy_instrument_ids(config)
+        )
+        instrument_ids.update(positions)
+        instrument_ids.update(order.instrument_id for order in state.pending_orders)
+        instrument_ids.update(
+            str(item["payload"].get("instrument_id"))
+            for item in recent_events
+            if isinstance(item.get("payload"), Mapping)
+            and item["payload"].get("instrument_id") is not None
+        )
+        instrument_names, instrument_names_pending = self._instrument_name_state(instrument_ids)
+        for item in position_rows:
+            item["instrument_name"] = instrument_names.get(item["instrument_id"])
+        for item in pending_orders:
+            item["instrument_name"] = instrument_names.get(item["instrument_id"])
+        for item in recent_events:
+            payload = item.get("payload")
+            instrument_id = (
+                payload.get("instrument_id") if isinstance(payload, Mapping) else None
+            )
+            item["instrument_name"] = (
+                instrument_names.get(str(instrument_id))
+                if instrument_id is not None else None
+            )
+
+        benchmark, benchmark_history = self._agent_benchmark_reviews(account_id)
+        strategy_config_changes: list[dict[str, Any]] = []
+        policy = self.settings.agent.policies.get(account_id)
+        if policy is not None and policy.kind == "crisis-drawdown":
+            try:
+                strategy_config_changes = _configuration_changes(
+                    list_agent_evaluations(
+                        evaluation_root(self.settings.daily.agent_decision_root),
+                        account_id,
+                    )
+                )
+            except AgentEvaluationError:
+                # The dedicated monitor reports the evidence-store error.  The
+                # ordinary account page must still expose canonical holdings.
+                strategy_config_changes = []
         return {
             "account_id": account_id,
             "name": account.name,
             "exists": True,
             "status": account.status.value,
             "strategy": None if config is None else config.strategy,
+            **({} if config is None else self._strategy_profile(config, instrument_names)),
             "weights": {} if config is None else {
                 key: str(value) for key, value in config.weights.items()
             },
@@ -272,6 +537,10 @@ class DashboardService:
             "recent_events": recent_events,
             "feedback": feedback,
             "runs": runs_summary,
+            "benchmark": benchmark,
+            "benchmark_history": benchmark_history,
+            "strategy_config_changes": strategy_config_changes,
+            "instrument_names_pending": instrument_names_pending,
         }
 
     # -------------------------------------------------------- daily reports
@@ -280,39 +549,18 @@ class DashboardService:
         root = Path(self.settings.daily.report_root)
         if not root.is_dir():
             return []
-        entries = []
+        found_files: list[tuple[str, int, int]] = []
         for path in root.iterdir():
             if not path.is_file() or not _REPORT_NAME.match(path.name):
                 continue
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                stat = path.stat()
+            except OSError:
                 continue
-            stages = payload.get("stages") or []
-            entries.append({
-                "file": path.name,
-                "generated_at": payload.get("generated_at"),
-                "status": payload.get("status"),
-                "target_date": payload.get("target_date"),
-                "snapshot_id": payload.get("snapshot_id"),
-                "stage_names": [
-                    f"{item.get('name')}:{item.get('status')}" for item in stages
-                ],
-                "blocked_stage": next(
-                    (item.get("name") for item in stages if item.get("status") == "blocked"),
-                    None,
-                ),
-                "accounts": [
-                    {
-                        "account_id": item.get("account_id"),
-                        "status": item.get("status"),
-                        "equity": item.get("equity"),
-                    }
-                    for item in payload.get("accounts") or []
-                ],
-            })
-        entries.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
-        return entries[:limit]
+            found_files.append((path.name, stat.st_mtime_ns, stat.st_size))
+        files = tuple(sorted(found_files, key=lambda item: item[0]))
+        entries = _daily_report_summaries(str(root.resolve()), files)
+        return [dict(item) for item in entries[:limit]]
 
     def daily_report(self, file_name: str) -> dict[str, Any]:
         if (
@@ -329,14 +577,22 @@ class DashboardService:
 
     def agent_accounts(self) -> list[dict[str, Any]]:
         repository = self._repository()
+        agent_configs = tuple(
+            config for config in self.settings.daily.accounts
+            if config.strategy == "agent-file"
+        )
+        instrument_names = self._instrument_names({
+            instrument_id
+            for config in agent_configs
+            for instrument_id in self._strategy_instrument_ids(config)
+        })
         found = []
-        for config in self.settings.daily.accounts:
-            if config.strategy != "agent-file":
-                continue
+        for config in agent_configs:
             entry: dict[str, Any] = {
                 "account_id": config.account_id,
                 "name": config.name,
                 "head_date": None,
+                **self._strategy_profile(config, instrument_names),
             }
             try:
                 repository.account(config.account_id)
@@ -389,6 +645,218 @@ class DashboardService:
                 entry["error"] = str(exc)
             entries.append(entry)
         return entries
+
+    # ---------------------------------------------------- crisis monitoring
+
+    def crisis_monitor(self) -> dict[str, Any]:
+        """Aggregate the eight homogeneous crisis policies without recomputing signals."""
+
+        market = self.market_summary()
+        found: list[dict[str, Any]] = []
+        for config in self.settings.daily.accounts:
+            policy = self.settings.agent.policies.get(config.account_id)
+            if policy is None or policy.kind != "crisis-drawdown":
+                continue
+            found.append(self._crisis_monitor_account(config, policy, market))
+        return {
+            "generated_at": audit_now().isoformat(),
+            "market": market,
+            "accounts": found,
+            "summary": {
+                "configured": len(found),
+                "current": sum(item["evaluation_status"] == "current" for item in found),
+                "errors": sum(item["evaluation_status"] == "error" for item in found),
+                "triggered": sum(
+                    (item.get("evaluation") or {}).get("action")
+                    in {"enter", "add_tranche", "exit"}
+                    for item in found
+                ),
+                "manual": sum(bool(item.get("manual_intervention")) for item in found),
+            },
+        }
+
+    def crisis_evaluations(
+        self, account_id: str, *, limit: int = 90,
+    ) -> dict[str, Any]:
+        config = self._account_config(account_id)
+        policy = self.settings.agent.policies.get(account_id)
+        if config is None or policy is None or policy.kind != "crisis-drawdown":
+            raise DashboardError(f"不是危机策略账户: {account_id}")
+        market = self.market_summary()
+        try:
+            records = list_agent_evaluations(
+                evaluation_root(self.settings.daily.agent_decision_root),
+                account_id,
+                limit_dates=max(1, min(limit, 2000)),
+            )
+        except AgentEvaluationError as exc:
+            raise DashboardError(f"评估证据损坏: {exc}") from exc
+        latest_by_date = _latest_by_evidence_date(records)
+        latest_ids = {item.revision_id for item in latest_by_date}
+        current_snapshot = market.get("snapshot_id")
+        current_end = market.get("published_end")
+        return {
+            "account_id": account_id,
+            "name": config.name,
+            "market": market,
+            "configuration_changes": _configuration_changes(records),
+            "records": [
+                _evaluation_view(
+                    item,
+                    is_latest_for_date=item.revision_id in latest_ids,
+                    is_current=(
+                        item.status == "ready"
+                        and item.as_of is not None
+                        and item.as_of.isoformat() == current_end
+                        and item.snapshot_id == current_snapshot
+                        and item.revision_id == (
+                            latest_by_date[0].revision_id if latest_by_date else None
+                        )
+                    ),
+                )
+                for item in records
+            ],
+        }
+
+    def _crisis_monitor_account(self, config, policy, market) -> dict[str, Any]:
+        root = evaluation_root(self.settings.daily.agent_decision_root)
+        evidence_error = None
+        try:
+            records = list_agent_evaluations(root, config.account_id)
+        except AgentEvaluationError as exc:
+            records = ()
+            evidence_error = str(exc)
+        latest = records[0] if records else None
+        last_ready = next((item for item in records if item.status == "ready"), None)
+        current_end = market.get("published_end")
+        current_snapshot = market.get("snapshot_id")
+        if evidence_error is not None:
+            evaluation_status = "error"
+            stale_reason = f"评估证据损坏: {evidence_error}"
+        elif latest is None:
+            evaluation_status = "missing"
+            stale_reason = "尚无正式评估记录"
+        elif latest.status == "error":
+            evaluation_status = "error"
+            stale_reason = latest.error or "最近一次正式评估失败"
+        elif (
+            latest.as_of is not None
+            and latest.as_of.isoformat() == current_end
+            and latest.snapshot_id == current_snapshot
+        ):
+            evaluation_status = "current"
+            stale_reason = None
+        else:
+            evaluation_status = "stale"
+            stale_reason = "最近成功评估未绑定当前 canonical 快照"
+
+        detail = self.account_detail(config.account_id)
+        head_date = None
+        if detail.get("head_run_id"):
+            runs = detail.get("runs") or []
+            head_date = runs[-1]["end_date"] if runs else None
+        decision = self._crisis_decision_status(
+            config.account_id,
+            last_ready,
+            head_date=head_date,
+        )
+        manual = self._manual_intervention(config.account_id)
+        performance = _crisis_performance(detail, records)
+        positions = detail.get("positions") or []
+        pending_orders = detail.get("pending_orders") or []
+        total_equity = (detail.get("feedback") or {}).get("final_equity")
+        signal_ids = set()
+        if last_ready is not None:
+            signals = last_ready.audit.get("signals")
+            if isinstance(signals, Mapping):
+                signal_ids.update(map(str, signals))
+        signal_ids.update(self._strategy_instrument_ids(config))
+        instrument_names = self._instrument_names(signal_ids)
+        return {
+            "account_id": config.account_id,
+            "name": config.name,
+            **self._strategy_profile(config, instrument_names),
+            "parameters": to_primitive(policy.params),
+            "evaluation_status": evaluation_status,
+            "stale_reason": stale_reason,
+            "evidence_error": evidence_error,
+            "evaluation": None if latest is None else _evaluation_view(latest),
+            "last_success": (
+                None
+                if last_ready is None or last_ready is latest
+                else _evaluation_view(last_ready)
+            ),
+            "nearest_signal": (
+                None
+                if last_ready is None
+                else _nearest_signal(last_ready, instrument_names)
+            ),
+            "decision": decision,
+            "execution": {
+                "head_date": head_date,
+                "cash": detail.get("cash"),
+                "total_equity": total_equity,
+                "positions": positions,
+                "pending_orders": pending_orders,
+            },
+            "performance": performance,
+            "manual_intervention": manual,
+        }
+
+    def _crisis_decision_status(
+        self,
+        account_id: str,
+        evaluation: AgentEvaluation | None,
+        *,
+        head_date: str | None,
+    ) -> dict[str, Any]:
+        if evaluation is None or evaluation.decision_date is None:
+            return {"status": "none"}
+        decision_date = evaluation.decision_date
+        try:
+            decision = load_agent_decision(
+                self.settings.daily.agent_decision_root,
+                account_id,
+                decision_date,
+            )
+        except AgentDecisionError as exc:
+            return {
+                "status": "invalid",
+                "decision_date": decision_date.isoformat(),
+                "error": str(exc),
+            }
+        if decision is None:
+            return {
+                "status": "hold" if evaluation.hold else "missing",
+                "decision_date": decision_date.isoformat(),
+            }
+        consumed = head_date is not None and decision_date <= date.fromisoformat(head_date)
+        return {
+            "status": "consumed" if consumed else "queued",
+            "decision_date": decision_date.isoformat(),
+            "agent_id": decision.agent_id,
+            "target_weights": {
+                key: str(value) for key, value in decision.target_weights.items()
+            },
+            "reason": decision.reason,
+            "content_hash": decision.content_hash,
+        }
+
+    def _manual_intervention(self, account_id: str) -> dict[str, Any] | None:
+        decisions = self.agent_decisions(account_id)
+        manual = [
+            item for item in decisions
+            if item.get("valid")
+            and not str(item.get("agent_id") or "").startswith("crisis-drawdown-v")
+        ]
+        if not manual:
+            return None
+        first = min(manual, key=lambda item: item["decision_date"])
+        return {
+            "since": first["decision_date"],
+            "agent_id": first.get("agent_id"),
+            "detail": "该账户收益路径包含人工或非危机策略决策",
+        }
 
     def submit_agent_decision(
         self,
@@ -499,3 +967,279 @@ class DashboardService:
             )
         except (AgentServiceError, AgentPolicyError, AgentDecisionError) as exc:
             raise DashboardError(str(exc)) from exc
+
+
+def _evaluation_view(
+    evaluation: AgentEvaluation,
+    *,
+    is_latest_for_date: bool | None = None,
+    is_current: bool | None = None,
+) -> dict[str, Any]:
+    payload = evaluation.to_dict()
+    payload.pop("source_path", None)
+    if is_latest_for_date is not None:
+        payload["is_latest_for_date"] = is_latest_for_date
+    if is_current is not None:
+        payload["is_current"] = is_current
+    return payload
+
+
+def _latest_by_evidence_date(
+    records: tuple[AgentEvaluation, ...],
+) -> tuple[AgentEvaluation, ...]:
+    found: dict[date, AgentEvaluation] = {}
+    for item in records:
+        found.setdefault(item.evidence_date, item)
+    return tuple(found[key] for key in sorted(found, reverse=True))
+
+
+def _configuration_changes(
+    records: tuple[AgentEvaluation, ...],
+) -> list[dict[str, Any]]:
+    ready = [
+        item for item in reversed(_latest_by_evidence_date(records))
+        if item.status == "ready" and item.as_of is not None
+    ]
+    changes: list[dict[str, Any]] = []
+    previous = None
+    for item in ready:
+        if item.config_hash == previous:
+            continue
+        changes.append({
+            "as_of": item.as_of.isoformat(),
+            "decision_date": (
+                None if item.decision_date is None else item.decision_date.isoformat()
+            ),
+            "config_hash": item.config_hash,
+            "revision_id": item.revision_id,
+            "initial": previous is None,
+        })
+        previous = item.config_hash
+    return changes
+
+
+def _crisis_performance(
+    detail: Mapping[str, Any],
+    records: tuple[AgentEvaluation, ...],
+) -> dict[str, Any]:
+    feedback = detail.get("feedback") or {}
+    curve = detail.get("equity_curve") or []
+    actual_return = feedback.get("overall_return")
+    if actual_return is None and curve:
+        actual_return = str(Decimal(str(curve[-1]["nav"])) - Decimal("1"))
+
+    ready = [
+        item for item in reversed(_latest_by_evidence_date(records))
+        if item.status == "ready" and item.as_of is not None
+    ]
+    version_start = None
+    version_return = None
+    config_hash = None
+    if ready:
+        config_hash = ready[-1].config_hash
+        segment = [ready[-1]]
+        for item in reversed(ready[:-1]):
+            if item.config_hash != config_hash:
+                break
+            segment.append(item)
+        version_start = min(item.as_of for item in segment if item.as_of is not None)
+        if curve:
+            base = [
+                item for item in curve
+                if str(item.get("session_date") or "") <= version_start.isoformat()
+            ]
+            if base:
+                base_nav = Decimal(str(base[-1]["nav"]))
+                current_nav = Decimal(str(curve[-1]["nav"]))
+                if base_nav > 0:
+                    version_return = str(current_nav / base_nav - Decimal("1"))
+    return {
+        "actual_return": actual_return,
+        "max_drawdown": feedback.get("max_drawdown"),
+        "current_config_hash": config_hash,
+        "current_config_start": None if version_start is None else version_start.isoformat(),
+        "current_config_return": version_return,
+    }
+
+
+def _nearest_signal(
+    evaluation: AgentEvaluation,
+    instrument_names: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    signals = evaluation.audit.get("signals")
+    if not isinstance(signals, Mapping) or not signals:
+        return None
+    params = evaluation.parameters
+    mode = str(params.get("entry_mode") or "reversal")
+    minimum = _decimal_or_none(params.get("minimum_drawdown"))
+    rebound_needed = _decimal_or_none(params.get("rebound_threshold"))
+    ranked: list[tuple[Decimal, str, Mapping[str, Any]]] = []
+    for instrument_id, raw in signals.items():
+        if not isinstance(raw, Mapping):
+            continue
+        drawdown_key = "current_drawdown" if mode == "ladder" else "event_drawdown"
+        drawdown = _decimal_or_none(raw.get(drawdown_key))
+        rebound = _decimal_or_none(raw.get("rebound_from_low"))
+        if drawdown is None or minimum in {None, Decimal("0")}:
+            continue
+        drawdown_progress = abs(drawdown) / minimum
+        if mode == "ladder" or rebound_needed in {None, Decimal("0")}:
+            progress = drawdown_progress
+        else:
+            rebound_progress = Decimal("0") if rebound is None else rebound / rebound_needed
+            average_progress = (
+                Decimal("1") if raw.get("above_confirmation_average") is True else Decimal("0")
+            )
+            progress = min(drawdown_progress, rebound_progress, average_progress)
+        ranked.append((progress, str(instrument_id), raw))
+    if not ranked:
+        return None
+    progress, instrument_id, raw = max(ranked, key=lambda item: (item[0], item[1]))
+    return {
+        "instrument_id": instrument_id,
+        "instrument_name": (instrument_names or {}).get(instrument_id),
+        "trigger_progress": str(progress),
+        "minimum_drawdown": None if minimum is None else str(minimum),
+        "rebound_threshold": None if rebound_needed is None else str(rebound_needed),
+        **{str(key): to_primitive(value) for key, value in raw.items()},
+    }
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _account_event_visible(event_type: str, payload: Any) -> bool:
+    """Hide market-wide corporate-action notices with no account impact."""
+    if event_type == "corporate_action_ex_date":
+        # Economic account effects have their own explicit events (cash paid,
+        # shares listed, split applied).  A bare market ex-date is not an
+        # account event and previously flooded every account's recent history.
+        return False
+    if not isinstance(payload, Mapping):
+        return True
+    quantity_key = {
+        "corporate_action_entitlement": "quantity",
+        "cash_dividend_paid": "entitled_quantity",
+        "rights_issue_declined": "entitled_quantity",
+        "share_distribution_listed": "entitled_quantity",
+        "share_cost_basis_adjusted": "entitled_quantity",
+        "split_applied": "pre_event_quantity",
+    }.get(event_type)
+    if quantity_key is None or payload.get(quantity_key) is None:
+        return True
+    quantity = _decimal_or_none(payload.get(quantity_key))
+    return quantity is None or quantity > 0
+
+
+def _configured_instruments(
+    config: DailyAccountSettings,
+    params: Mapping[str, Any],
+    instrument_names: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Return the fixed part of a strategy universe with human-readable roles."""
+
+    roles: dict[str, list[str]] = {}
+
+    def add(raw: Any, role: str) -> None:
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        instrument_id = raw.strip()
+        found = roles.setdefault(instrument_id, [])
+        if role not in found:
+            found.append(role)
+
+    if config.strategy == "static":
+        for instrument_id in config.weights:
+            add(instrument_id, "目标配置")
+    for instrument_id in params.get("risk_instruments") or ():
+        add(instrument_id, "风险池")
+    for instrument_id in params.get("instruments") or ():
+        add(instrument_id, "配置池")
+    add(params.get("risk_instrument"), "风险资产")
+    add(params.get("defensive_instrument"), "防守资产")
+    add(params.get("benchmark_instrument"), "业绩基准")
+
+    return [
+        {
+            "instrument_id": instrument_id,
+            "instrument_name": instrument_names.get(instrument_id),
+            "role": "／".join(item_roles),
+        }
+        for instrument_id, item_roles in roles.items()
+    ]
+
+
+@lru_cache(maxsize=8)
+def _daily_report_summaries(
+    root: str,
+    files: tuple[tuple[str, int, int], ...],
+) -> tuple[dict[str, Any], ...]:
+    """Cache report summaries until a report file identity changes."""
+
+    entries: list[dict[str, Any]] = []
+    directory = Path(root)
+    for file_name, _, _ in files:
+        try:
+            payload = json.loads((directory / file_name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        stages = payload.get("stages") or []
+        entries.append({
+            "file": file_name,
+            "generated_at": payload.get("generated_at"),
+            "status": payload.get("status"),
+            "target_date": payload.get("target_date"),
+            "snapshot_id": payload.get("snapshot_id"),
+            "stage_names": [
+                f"{item.get('name')}:{item.get('status')}" for item in stages
+            ],
+            "blocked_stage": next(
+                (item.get("name") for item in stages if item.get("status") == "blocked"),
+                None,
+            ),
+            "accounts": [
+                {
+                    "account_id": item.get("account_id"),
+                    "status": item.get("status"),
+                    "equity": item.get("equity"),
+                }
+                for item in payload.get("accounts") or []
+            ],
+        })
+    entries.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
+    return tuple(entries)
+
+
+@lru_cache(maxsize=8)
+def _market_summary_for_snapshot(root: str, snapshot_id: str) -> dict[str, Any]:
+    """Cache immutable snapshot metadata while the canonical pointer is unchanged."""
+
+    snapshot = MarketDataWarehouse(root).load_snapshot(snapshot_id)
+    scope = snapshot.plan.universe_scope
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "published_end": None if scope is None else scope.history_end.isoformat(),
+        "history_start": None if scope is None else scope.history_start.isoformat(),
+        "instruments": 0 if scope is None else len(scope.instrument_ids),
+    }
+
+
+@lru_cache(maxsize=8)
+def _instrument_names_for_snapshot(root: str, snapshot_id: str) -> dict[str, str]:
+    """Cache immutable canonical instrument names for the active snapshot."""
+
+    warehouse = MarketDataWarehouse(root)
+    snapshot = warehouse.load_snapshot(snapshot_id)
+    frame = warehouse.query_loaded_snapshot_table(snapshot, MarketTable.INSTRUMENTS)
+    return {
+        str(row.instrument_id): str(row.name)
+        for row in frame[["instrument_id", "name"]].itertuples(index=False)
+        if row.name is not None and str(row.name).strip()
+    }

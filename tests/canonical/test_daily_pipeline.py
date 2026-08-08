@@ -13,6 +13,7 @@ import pytest
 
 from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata import (
+    CanonicalMarketData,
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CoverageClaim,
     MarketDataWarehouse,
@@ -36,7 +37,6 @@ from fundlab.marketdata.sources.cninfo import (
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from fundlab.pipeline import DailyPipeline
 from fundlab.pipeline.daily import (
-    DIRECT_LIMIT_PROVIDERS,
     DailyPipelineBlocked,
     DailyRunResult,
 )
@@ -57,21 +57,9 @@ from tests.canonical.fixtures import (
 from tests.canonical.test_trading_kernel import fees, policies
 
 
-def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive():
+def test_degraded_daily_result_is_success_without_instrument_count_cutoff():
     result = DailyRunResult("degraded", None, None, [], [], None)
     assert result.exit_code == 0
-
-    DailyPipeline._require_quarantine_within_daily_limit(
-        {str(index): () for index in range(200)},
-        universe_size=10_000,
-        stage="fixture",
-    )
-    with pytest.raises(DailyPipelineBlocked, match="degraded-run boundary"):
-        DailyPipeline._require_quarantine_within_daily_limit(
-            {str(index): () for index in range(201)},
-            universe_size=10_000,
-            stage="fixture",
-        )
 
     transient_action_gap = (
         "batch:SnapshotNotReadyError:etf-actions evidence remains unresolved: "
@@ -125,15 +113,74 @@ def test_degraded_daily_result_is_success_and_quarantine_boundary_is_conjunctive
             "510050.SH": ("evidence:etf-actions:timeout",),
         },
     }) == {"510050.SH"}
-    with pytest.raises(DailyPipelineBlocked, match="degraded-run boundary"):
-        DailyPipeline._require_quarantine_within_daily_limit(
-            {str(index): () for index in range(4)},
-            universe_size=100,
-            stage="fixture",
-        )
 
 
-def test_quarantine_allows_five_consecutive_sessions_and_blocks_the_sixth():
+def test_no_trade_active_source_conflict_becomes_bounded_quarantine(monkeypatch):
+    import fundlab.marketdata.history as history_module
+    import fundlab.pipeline.daily as daily_module
+
+    target = ("510050.SH", "600000.SH")
+    pipeline = object.__new__(DailyPipeline)
+    pipeline.warehouse = SimpleNamespace()
+    pipeline.ingestion = SimpleNamespace(
+        capture_resumable=lambda provider, request: (
+            SimpleNamespace(observation_id=f"obs-{provider}"), False,
+        ),
+    )
+    monkeypatch.setattr(
+        daily_module, "find_no_trade_research_partition", lambda *args, **kwargs: None,
+    )
+    calls = []
+
+    def record_partition(warehouse, **kwargs):
+        calls.append(kwargs)
+        if kwargs["instrument_ids"] == target:
+            raise history_module.NoTradeSourceActiveError({
+                "510050.SH": ("obs-baostock",),
+            })
+        assert kwargs["instrument_ids"] == ("600000.SH",)
+        return SimpleNamespace(observation_id="obs-confirmed-no-trade")
+
+    monkeypatch.setattr(
+        daily_module, "record_no_trade_research_partition", record_partition,
+    )
+    reasons = {}
+
+    resolution = pipeline._record_no_trade(
+        predecessor_snapshot_id="snap-predecessor",
+        universe_observation_id="obs-universe",
+        calendar_observation_id="obs-calendar",
+        start=FUTURE_DAYS[0],
+        end=FUTURE_DAYS[0],
+        instrument_ids=target,
+        quarantine_reasons=reasons,
+        universe_size=100,
+    )
+
+    assert resolution.observation_id == "obs-confirmed-no-trade"
+    assert resolution.confirmed_instrument_ids == ("600000.SH",)
+    assert resolution.active_conflicts == {
+        "510050.SH": ("obs-baostock",),
+    }
+    assert "obs-baostock" in reasons["510050.SH"][0]
+    assert [item["instrument_ids"] for item in calls] == [
+        target, ("600000.SH",),
+    ]
+
+    repeated = pipeline._record_no_trade(
+        predecessor_snapshot_id="snap-predecessor",
+        universe_observation_id="obs-universe",
+        calendar_observation_id="obs-calendar",
+        start=FUTURE_DAYS[0],
+        end=FUTURE_DAYS[0],
+        instrument_ids=target,
+        quarantine_reasons={},
+        universe_size=1,
+    )
+    assert repeated.confirmed_instrument_ids == ("600000.SH",)
+
+
+def test_quarantine_remains_non_blocking_after_six_consecutive_sessions():
     from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
 
     instrument_id = "600000.SH"
@@ -185,8 +232,9 @@ def test_quarantine_allows_five_consecutive_sessions_and_blocks_the_sixth():
         "session_date": "2026-07-23",
         "trade_rule_id": DATA_GAP_QUARANTINE_RULE_ID,
     }
-    with pytest.raises(DailyPipelineBlocked, match="consecutive-session boundary"):
-        pipeline._finalize_quarantine(**kwargs)
+    detail = pipeline._finalize_quarantine(**kwargs)
+    assert detail["consecutive_sessions"][instrument_id] == 6
+    assert detail["blocking_thresholds_enforced"] is False
 
 
 def test_persistent_quarantine_uses_current_contiguous_tail_not_historical_max():
@@ -1203,23 +1251,26 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
 
     first = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
 
-    assert first.status == "ok", [
+    assert first.status == "degraded", [
         (stage.name, stage.status, stage.detail) for stage in first.stages
     ]
+    limit_stage = next(stage for stage in first.stages if stage.name == "limits")
+    assert limit_stage.detail["execution_guard_sample"] == ("688825.SH",)
     assert first.snapshot_id is not None
     by_name = {stage.name: stage for stage in first.stages}
     assert by_name["bars"].detail["included"] == len(_DAILY_BASE_IDS)
     assert by_name["bars"].detail["excluded"] == 1
     assert by_name["new_instruments"].detail["instrument_ids"] == (_DAILY_NEW_ID,)
     for stage in (
-        "research", "status", "limits", "evidence", "factor_reconciliation",
+        "research", "status", "evidence", "factor_reconciliation",
         "candidate", "validate", "extend",
     ):
         assert by_name[stage].status == "ok"
+    assert by_name["limits"].status == "degraded"
 
     second = pipeline.run(target_date=FUTURE_DAYS[1], skip_accounts=True)
 
-    assert second.status == "ok", [
+    assert second.status == "degraded", [
         (stage.name, stage.status, stage.detail) for stage in second.stages
     ]
     assert second.snapshot_id is not None and second.snapshot_id != first.snapshot_id
@@ -1269,12 +1320,12 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
     assert set(map(str, increment_bars["instrument_id"])) == set(scope.instrument_ids)
 
 
-def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
+def test_daily_preserves_price_and_disables_execution_for_evidence_gap(
     tmp_path, monkeypatch,
 ):
     import fundlab.marketdata.simulation_data as simulation_data_module
     import fundlab.pipeline.daily as daily_module
-    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
 
     class EtfDetailClient:
@@ -1300,7 +1351,6 @@ def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
             report_root, client=EtfDetailClient(),
         ),
     )
-    monkeypatch.setattr(daily_module, "MAX_DEGRADED_FRACTION", 1.0)
     real_collector = daily_module.SimulationEvidenceCollector
 
     class OneInstrumentGapCollector:
@@ -1335,12 +1385,28 @@ def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
 
     result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
 
-    assert result.status == "degraded"
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages[-3:]
+    ]
     assert result.exit_code == 0
-    quarantine_stage = next(stage for stage in result.stages if stage.name == "quarantine")
-    assert quarantine_stage.detail["instrument_ids"] == ("600000.SH",)
-    assert quarantine_stage.detail["consecutive_sessions"]["600000.SH"] == 1
+    evidence_stage = next(stage for stage in result.stages if stage.name == "evidence")
+    assert evidence_stage.status == "degraded"
+    candidate_id = next(
+        stage for stage in result.stages if stage.name == "candidate"
+    ).detail["observation_id"]
+    candidate = pipeline.warehouse.load_observation(candidate_id)
+    incomplete_event_claims = [
+        claim for claim in candidate.coverage
+        if claim.table in {
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        }
+        and not claim.complete
+    ]
+    assert incomplete_event_claims
+    assert all("600000.SH" in claim.instrument_ids for claim in incomplete_event_claims)
     snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert snapshot.plan.require_complete_coverage is False
     rows = pipeline.warehouse.query_loaded_snapshot_table(
         snapshot,
         MarketTable.DAILY_BARS,
@@ -1350,22 +1416,384 @@ def test_daily_publishes_bounded_instrument_gap_as_degraded_quarantine(
         price_mode="raw",
     )
     assert len(rows) == 1
-    assert rows.iloc[0]["trade_rule_id"] == DATA_GAP_QUARANTINE_RULE_ID
-    assert bool(rows.iloc[0]["suspended"])
-    assert pd.isna(rows.iloc[0]["close"])
+    assert rows.iloc[0]["trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert pd.isna(rows.iloc[0]["suspended"])
+    assert not pd.isna(rows.iloc[0]["close"])
+    market = CanonicalMarketData.open(
+        pipeline.settings.paths.market_data,
+        snapshot_id=result.snapshot_id,
+    )
+    guarded_bar = market.session(FUTURE_DAYS[0]).bars["600000.SH"]
+    assert guarded_bar.suspended is False
+    assert guarded_bar.trade_rule_id == EXECUTION_EVIDENCE_GAP_RULE_ID
 
-    repeated = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
-    assert repeated.status == "degraded"
-    assert any(
-        stage.name == "data" and stage.status == "up_to_date"
-        for stage in repeated.stages
+
+def test_daily_factor_failure_guards_only_named_instrument(tmp_path, monkeypatch):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
     )
-    persistent = next(
-        stage for stage in repeated.stages if stage.name == "quarantine"
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
     )
-    assert persistent.status == "degraded"
-    assert persistent.detail["persistent"] is True
-    assert persistent.detail["instrument_ids"] == ("600000.SH",)
+    real_reconcile = pipeline._reconcile_action_factor_evidence
+    failed = False
+
+    def fail_one_instrument(**kwargs):
+        nonlocal failed
+        ids = set(map(str, kwargs["instruments"]["instrument_id"]))
+        if not failed and "600000.SH" in ids:
+            failed = True
+            raise SnapshotNotReadyError(
+                "factor evidence unavailable: 600000.SH/2026-07-17"
+            )
+        return real_reconcile(**kwargs)
+
+    monkeypatch.setattr(
+        pipeline, "_reconcile_action_factor_evidence", fail_one_instrument,
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded"
+    factor = next(
+        stage for stage in result.stages if stage.name == "factor_reconciliation"
+    )
+    assert factor.status == "degraded"
+    assert factor.detail["failures"][0]["instrument_ids"] == ("600000.SH",)
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    guarded = rows.loc[
+        rows["trade_rule_id"].astype(str).eq(EXECUTION_EVIDENCE_GAP_RULE_ID),
+        "instrument_id",
+    ]
+    assert set(guarded) == {"600000.SH", _DAILY_NEW_ID}
+
+
+def test_daily_publishes_prices_with_execution_guard_when_direct_limits_are_missing(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[1]),
+    )
+
+    def no_direct_limits(*, provider, target, instrument_ids):
+        return {
+            "observation_ids": (),
+            "covered_instruments": 0,
+            "unresolved_instrument_ids": instrument_ids,
+            "request_errors": (),
+            "provider_errors": (f"{provider}:target_unavailable:{target}",),
+            "_covered_instrument_ids": (),
+            "_errors_by_instrument": {},
+        }
+
+    monkeypatch.setattr(
+        pipeline, "_collect_direct_limit_observations", no_direct_limits,
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[1], skip_accounts=True)
+
+    assert result.status == "degraded"
+    assert result.snapshot_id is not None
+    limits = next(stage for stage in result.stages if stage.name == "limits")
+    assert limits.status == "degraded"
+    assert limits.detail["execution_guard_instruments"] == len(
+        pipeline.warehouse.load_snapshot(result.snapshot_id).plan.universe_scope.instrument_ids
+    )
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    candidate_id = next(
+        stage for stage in result.stages if stage.name == "candidate"
+    ).detail["observation_id"]
+    assert pipeline.warehouse.load_observation(candidate_id).source_metadata[
+        "degraded_auxiliary_evidence"
+    ] is None
+    validated_id = next(
+        stage for stage in result.stages if stage.name == "validate"
+    ).detail["observation_id"]
+    validated_report = pipeline.warehouse.load_observation(validated_id).source_metadata[
+        "report"
+    ]
+    assert "auxiliary_event_evidence_incomplete" not in validated_report[
+        "non_blocking_degradations"
+    ]
+    target_rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[1],
+        end_date=FUTURE_DAYS[1],
+        price_mode="raw",
+    )
+    prior_rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert target_rows[["open", "high", "low", "close"]].notna().all().all()
+    assert set(target_rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+    assert EXECUTION_EVIDENCE_GAP_RULE_ID not in set(prior_rows["trade_rule_id"])
+
+
+def test_daily_status_provider_failure_preserves_prices_and_publishes(tmp_path, monkeypatch):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    real_collector = daily_module.SimulationStatusCollector
+
+    class FailingXtquantStatusCollector:
+        def __init__(self, *args, **kwargs):
+            self.delegate = real_collector(*args, **kwargs)
+
+        def collect(self, spec):
+            if spec.provider_name == "xtquant":
+                raise RuntimeError("MiniQMT status endpoint unavailable")
+            return self.delegate.collect(spec)
+
+    monkeypatch.setattr(
+        daily_module, "SimulationStatusCollector", FailingXtquantStatusCollector,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded"
+    status = next(stage for stage in result.stages if stage.name == "status")
+    assert status.status == "degraded"
+    assert "MiniQMT status endpoint unavailable" in status.detail["xtquant"][
+        "blockers"
+    ][0]
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert rows[["open", "high", "low", "close"]].notna().all().all()
+    assert set(rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+
+
+def test_daily_etf_rule_detail_failure_guards_only_affected_etf(tmp_path, monkeypatch):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class PartialEtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            if instrument_id == "510050.SH":
+                return {}
+            assert instrument_id == "159001.SZ"
+            return {
+                "OpenDate": "20060221",
+                "secuCategory": 3203072,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=PartialEtfDetailClient(),
+        ),
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages[-3:]
+    ]
+    validate = next(stage for stage in result.stages if stage.name == "validate")
+    assert validate.status == "degraded"
+    assert tuple(validate.detail["validator_added_execution_guard"]) == (
+        "510050.SH",
+    )
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        instrument_ids=("159001.SZ", "510050.SH"),
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    ).set_index("instrument_id")
+    assert rows[["open", "high", "low", "close"]].notna().all().all()
+    assert rows.loc["510050.SH", "trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert rows.loc["159001.SZ", "trade_rule_id"] != EXECUTION_EVIDENCE_GAP_RULE_ID
+
+
+def test_daily_carries_last_trusted_universe_when_official_endpoint_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata import MarketIngestionService, ObservationError
+    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened,
+                "secuCategory": category,
+                "PreClose": 10.0,
+                "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0,
+                "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(
+            report_root, client=EtfDetailClient(),
+        ),
+    )
+    real_capture = MarketIngestionService.capture_resumable
+
+    def capture_with_missing_official(self, provider_name, request, *, refresh=False):
+        if provider_name == "exchange-public":
+            raise ObservationError("official endpoint returned no rows")
+        return real_capture(self, provider_name, request, refresh=refresh)
+
+    monkeypatch.setattr(
+        MarketIngestionService, "capture_resumable", capture_with_missing_official,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()),
+        registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded"
+    assert result.snapshot_id is not None
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert universe.status == "degraded"
+    assert universe.detail["reason"] == "official_universe_unavailable"
+    assert universe.detail["carried_instruments"] == len(_DAILY_BASE_IDS)
+    published = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert set(published.plan.universe_scope.instrument_ids) == set(_DAILY_BASE_IDS)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        published,
+        MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert rows[["open", "high", "low", "close"]].notna().all().all()
+    assert set(rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+
 
 def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monkeypatch):
     import fundlab.pipeline.daily as daily_module
@@ -1457,7 +1885,7 @@ def test_daily_adjusted_price_factor_audit_only_fills_unmatched_candidates():
         )
 
 
-def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
+def test_daily_healthy_increment_retains_prior_incomplete_coverage_marker(
     tmp_path, monkeypatch,
 ):
     import fundlab.marketdata.simulation_data as simulation_data_module
@@ -1517,32 +1945,23 @@ def test_daily_retry_pins_fresh_historical_master_and_resumes_builds(
     )
 
     first = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
-    second = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+    second = pipeline.run(target_date=FUTURE_DAYS[1], skip_accounts=True)
 
-    assert first.status == "blocked"
-    assert first.stages[-1].name == "evidence"
-    assert second.status == "ok", [
+    assert first.status == "degraded"
+    assert next(stage for stage in first.stages if stage.name == "evidence").status == (
+        "degraded"
+    )
+    assert second.status == "degraded", [
         (stage.name, stage.status, stage.detail) for stage in second.stages
     ]
-    first_bars = next(stage for stage in first.stages if stage.name == "bars")
-    second_bars = next(stage for stage in second.stages if stage.name == "bars")
-    assert first_bars.detail["historical_universe_refreshed"] is True
-    assert second_bars.detail["historical_universe_refreshed"] is False
-    assert first_bars.detail["historical_universe_observation_id"] == (
-        second_bars.detail["historical_universe_observation_id"]
+    assert next(stage for stage in second.stages if stage.name == "evidence").status == (
+        "ok"
     )
-    assert first_bars.detail["build_id"] == second_bars.detail["build_id"]
-    first_research = next(stage for stage in first.stages if stage.name == "research")
-    second_research = next(stage for stage in second.stages if stage.name == "research")
-    assert first_research.detail["snapshot_id"] == second_research.detail["snapshot_id"]
-    first_limits = next(stage for stage in first.stages if stage.name == "limits")
-    second_limits = next(stage for stage in second.stages if stage.name == "limits")
-    for provider in DIRECT_LIMIT_PROVIDERS:
-        assert first_limits.detail[provider]["observation_ids"] == (
-            second_limits.detail[provider]["observation_ids"]
-        )
+    second_snapshot = pipeline.warehouse.load_snapshot(second.snapshot_id)
+    assert second_snapshot.plan.require_complete_coverage is False
+    assert "degraded_auxiliary_evidence_coverage" in second_snapshot.quality.warnings
     baostock = registry.provider("baostock")
     assert sum(
         request.capability is ProviderCapability.INSTRUMENTS
         for request in baostock.calls
-    ) == 1
+    ) == 2

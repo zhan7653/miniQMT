@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from itertools import combinations
 import json
 import os
@@ -49,6 +49,24 @@ NO_TRADE_RESEARCH_PROVIDER = "canonical-no-trade-reconciler-r2-v1"
 NO_TRADE_RESEARCH_VALIDATOR_VERSION = "no-trade-research-r2-v1"
 _HELD_BUILD_LOCKS: set[Path] = set()
 _HELD_BUILD_LOCKS_GUARD = Lock()
+
+
+class NoTradeSourceActiveError(ValueError):
+    """A no-trade candidate has active evidence from one or more source observations."""
+
+    def __init__(self, active_observation_ids: Mapping[str, tuple[str, ...]]) -> None:
+        normalized = {
+            str(instrument_id): tuple(sorted(set(map(str, observation_ids))))
+            for instrument_id, observation_ids in active_observation_ids.items()
+            if observation_ids
+        }
+        if not normalized:
+            raise ValueError("No-trade active-source error requires observation evidence")
+        self.active_observation_ids = dict(sorted(normalized.items()))
+        super().__init__(
+            "No-trade source contains active rows: "
+            + canonical_json(self.active_observation_ids)
+        )
 
 
 @dataclass(frozen=True)
@@ -281,6 +299,7 @@ def record_no_trade_research_partition(
         warehouse.load_observation(item)
         for item in sorted(set(source_observation_ids))
     )
+    active_observation_ids: dict[str, list[str]] = {}
     for manifest in manifests:
         if (
             manifest.request.capability is not ProviderCapability.DAILY_BARS_RAW
@@ -302,9 +321,9 @@ def record_no_trade_research_partition(
             start_date=start_date,
             end_date=end_date,
         )
-        if active:
-            raise ValueError(
-                f"No-trade source contains active rows: {manifest.observation_id}/{sorted(active)}"
+        for instrument_id in active:
+            active_observation_ids.setdefault(instrument_id, []).append(
+                manifest.observation_id
             )
         backend = str(manifest.source_metadata.get("backend_group", manifest.provider))
         for instrument_id in applicable:
@@ -314,6 +333,11 @@ def record_no_trade_research_partition(
                     f"Duplicate no-trade backend evidence: {instrument_id}/{backend}"
                 )
             evidence[instrument_id][backend] = manifest.observation_id
+    if active_observation_ids:
+        raise NoTradeSourceActiveError({
+            instrument_id: tuple(observation_ids)
+            for instrument_id, observation_ids in active_observation_ids.items()
+        })
     insufficient = {
         instrument_id: tuple(sorted(backends))
         for instrument_id, backends in evidence.items()
@@ -443,6 +467,7 @@ class HistoryDatabaseBuilder:
             raise ValueError("History adjudicator must be distinct from both baseline providers")
         self.adjudicator_provider = adjudicator_provider
         self.policy = policy or default_reconciliation_policy(ReadinessProfile.RESEARCH_PRICE)
+        self._range_observations: dict[str, tuple[ObservationManifest, ...]] = {}
 
     def build(
         self,
@@ -1480,10 +1505,147 @@ class HistoryDatabaseBuilder:
     ) -> tuple[ObservationManifest, bool]:
         if not refresh:
             matches = self.warehouse.matching_observations(provider=provider, request=request)
-            if matches:
-                return matches[-1], True
+            if request.capability is not ProviderCapability.DAILY_BARS_RAW:
+                if matches:
+                    return matches[-1], True
+            else:
+                complete_matches = tuple(
+                    manifest for manifest in matches
+                    if self._has_complete_daily_prefix_claim(manifest, request)
+                )
+                if complete_matches:
+                    return complete_matches[-1], True
+            prefix = self._longest_reusable_prefix(provider, request)
+            if prefix is not None:
+                suffix_request = ProviderRequest(
+                    request.capability,
+                    prefix.request.end_date + timedelta(days=1),
+                    request.end_date,
+                    request.instrument_ids,
+                    request.parameters,
+                )
+                suffix_payload = self.registry.observe(provider, suffix_request)
+                suffix = self.warehouse.record_observation(suffix_payload)
+                combined = self._record_combined_range(provider, request, prefix, suffix)
+                self._range_observations.pop(provider, None)
+                return combined, False
         payload = self.registry.observe(provider, request)
-        return self.warehouse.record_observation(payload), False
+        recorded = self.warehouse.record_observation(payload)
+        self._range_observations.pop(provider, None)
+        return recorded, False
+
+    def _longest_reusable_prefix(
+        self,
+        provider: str,
+        request: ProviderRequest,
+    ) -> ObservationManifest | None:
+        if (
+            request.capability is not ProviderCapability.DAILY_BARS_RAW
+            or request.start_date is None
+            or request.end_date is None
+            or request.start_date == request.end_date
+        ):
+            return None
+        candidates = self._range_observations.get(provider)
+        if candidates is None:
+            candidates = self.warehouse.observations_for_capability(
+                provider=provider,
+                capability=request.capability,
+            )
+            self._range_observations[provider] = candidates
+        compatible = tuple(
+            manifest
+            for manifest in candidates
+            if manifest.request.start_date == request.start_date
+            and manifest.request.end_date is not None
+            and manifest.request.end_date < request.end_date
+            and manifest.request.instrument_ids == request.instrument_ids
+            and manifest.request.parameters == request.parameters
+            and any(item.table is MarketTable.DAILY_BARS for item in manifest.files)
+            and self._has_complete_daily_prefix_claim(manifest, request)
+        )
+        if not compatible:
+            return None
+        return max(
+            compatible,
+            key=lambda item: (item.request.end_date, item.observed_at, item.observation_id),
+        )
+
+    @staticmethod
+    def _has_complete_daily_prefix_claim(
+        manifest: ObservationManifest,
+        request: ProviderRequest,
+    ) -> bool:
+        requested_ids = set(request.instrument_ids)
+        for claim in manifest.coverage:
+            if claim.table is not MarketTable.DAILY_BARS or not claim.complete:
+                continue
+            if claim.start_date is None or claim.end_date is None:
+                continue
+            if claim.start_date > request.start_date:
+                continue
+            if claim.end_date < manifest.request.end_date:
+                continue
+            if claim.instrument_ids and not requested_ids <= set(claim.instrument_ids):
+                continue
+            return True
+        return False
+
+    def _record_combined_range(
+        self,
+        provider: str,
+        request: ProviderRequest,
+        prefix: ObservationManifest,
+        suffix: ObservationManifest,
+    ) -> ObservationManifest:
+        prefix_backend = str(prefix.source_metadata.get("backend_group", provider))
+        suffix_backend = str(suffix.source_metadata.get("backend_group", provider))
+        if prefix_backend != suffix_backend:
+            raise ValueError(
+                f"Cannot combine {provider} range observations across backend groups"
+            )
+        pieces = [
+            self.warehouse.read_observation_table(item.observation_id, MarketTable.DAILY_BARS)
+            for item in (prefix, suffix)
+        ]
+        bars = pd.concat(pieces, ignore_index=True).sort_values(
+            ["instrument_id", "session_date", "price_mode"], kind="stable",
+        ).reset_index(drop=True)
+        keys = ["instrument_id", "session_date", "price_mode"]
+        if bars.duplicated(keys).any():
+            raise ValueError(f"Combined {provider} range observation has duplicate bar keys")
+        claims = [
+            claim
+            for manifest in (prefix, suffix)
+            for claim in manifest.coverage
+            if claim.table is MarketTable.DAILY_BARS
+        ]
+        complete = bool(claims) and all(claim.complete for claim in claims)
+        payload = ObservationPayload(
+            provider,
+            max(prefix.observed_at, suffix.observed_at),
+            request,
+            {MarketTable.DAILY_BARS: bars},
+            (CoverageClaim(
+                MarketTable.DAILY_BARS,
+                complete,
+                request.start_date,
+                request.end_date,
+                request.instrument_ids,
+                "Durable verified prefix plus newly captured suffix",
+            ),),
+            {
+                **dict(suffix.source_metadata),
+                "backend_group": suffix_backend,
+                "range_composition": {
+                    "prefix_observation_id": prefix.observation_id,
+                    "suffix_observation_id": suffix.observation_id,
+                    "prefix_end": prefix.request.end_date,
+                    "suffix_start": suffix.request.start_date,
+                },
+            },
+        )
+        return self.warehouse.record_observation(payload)
 
     def _restore_batch(self, payload: Any) -> HistoryBatchResult | None:
         if not isinstance(payload, Mapping):

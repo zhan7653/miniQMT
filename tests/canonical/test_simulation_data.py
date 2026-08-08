@@ -32,7 +32,10 @@ from fundlab.marketdata import (
     reconcile_corporate_action_factors,
     reconcile_simulation_status,
 )
-from fundlab.marketdata.simulation_data import _collapse_same_lifecycle_cash_components
+from fundlab.marketdata.simulation_data import (
+    _action_observation_policy_is_current,
+    _collapse_same_lifecycle_cash_components,
+)
 from fundlab.marketdata.sources.cninfo import (
     CninfoAnnouncementPageEvidence,
     CninfoAnnouncementRecord,
@@ -40,6 +43,15 @@ from fundlab.marketdata.sources.cninfo import (
 )
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
 from tests.canonical.fixtures import DAYS, market_frames
+
+
+def test_legacy_etf_action_observation_is_never_reused_as_exhaustive():
+    assert not _action_observation_policy_is_current(
+        "etf-actions", {"parser_policy": "eastmoney-etf-actions-r2-v6"},
+    )
+    assert _action_observation_policy_is_current(
+        "etf-actions", {"parser_policy": EASTMONEY_ETF_ACTION_POLICY},
+    )
 
 
 def test_same_lifecycle_cash_components_are_summed_with_conservative_known_date():
@@ -405,7 +417,7 @@ def test_baostock_suspension_removes_only_zero_volume_price_placeholder():
     assert positive_volume["volume"] > 0
 
 
-def test_status_collection_is_shardable_validated_and_resumable(tmp_path):
+def test_status_collection_is_shardable_validated_and_resumable(tmp_path, monkeypatch):
     frames = market_frames()
     observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
     warehouse = MarketDataWarehouse(tmp_path / "market")
@@ -492,6 +504,14 @@ def test_status_collection_is_shardable_validated_and_resumable(tmp_path):
     provider = StatusProvider()
     registry = ProviderRegistry()
     registry.register(provider)
+    real_query = warehouse.query_loaded_snapshot_table
+    queried_tables: list[MarketTable] = []
+
+    def counted_query(manifest, table, **kwargs):
+        queried_tables.append(table)
+        return real_query(manifest, table, **kwargs)
+
+    monkeypatch.setattr(warehouse, "query_loaded_snapshot_table", counted_query)
     collector = SimulationStatusCollector(
         warehouse, tmp_path / "reports", registry=registry,
     )
@@ -504,6 +524,8 @@ def test_status_collection_is_shardable_validated_and_resumable(tmp_path):
     assert first.completed_instruments == 1
     assert first.observation_ids == second.observation_ids
     assert provider.calls == 1
+    assert queried_tables.count(MarketTable.INSTRUMENTS) == 1
+    assert queried_tables.count(MarketTable.DAILY_BARS) == 1
     assert first.checkpoint.is_file() and first.report.is_file()
 
 

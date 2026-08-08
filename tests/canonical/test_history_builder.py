@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
 import sys
 from threading import Barrier, Event, Lock
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -28,6 +29,7 @@ from fundlab.marketdata import (
     ProviderRegistry,
     ProviderRequest,
     ReadinessProfile,
+    UniverseScope,
     compose_history_snapshot,
     derive_current_research_snapshot,
 )
@@ -239,6 +241,326 @@ class _AllTickProvider(_TickProvider):
             ),),
             {"backend_group": self.backend_group},
         )
+
+
+def test_history_source_capture_reuses_verified_date_prefix(tmp_path):
+    class RangeProvider:
+        name = "range-source"
+        backend_group = "range-source"
+        capabilities = frozenset({ProviderCapability.DAILY_BARS_RAW})
+
+        def __init__(self):
+            self.calls = []
+
+        def observe(self, request):
+            self.calls.append(request)
+            rows = []
+            current = request.start_date
+            while current <= request.end_date:
+                rows.append({
+                    "instrument_id": "600000.SH",
+                    "session_date": current.isoformat(),
+                    "price_mode": "raw",
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.8,
+                    "close": 10.0,
+                    "volume": 1_000_000,
+                })
+                current += timedelta(days=1)
+            return ObservationPayload(
+                self.name,
+                datetime(2026, 7, 18, tzinfo=timezone.utc),
+                request,
+                {MarketTable.DAILY_BARS: pd.DataFrame(rows)},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    True,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.backend_group},
+            )
+
+    provider = RangeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    builder = HistoryDatabaseBuilder(
+        warehouse,
+        tmp_path / "reports",
+        registry=registry,
+        source_pair=("range-source", "unused-source"),
+    )
+    parameters = {"batch_size": 1, "count": 10000}
+    prefix_request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW,
+        START,
+        END,
+        ("600000.SH",),
+        parameters,
+    )
+    prefix, reused = builder._capture_exact(
+        "range-source", prefix_request, refresh=False,
+    )
+    assert reused is False
+
+    extended_end = END + timedelta(days=1)
+    extended_request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW,
+        START,
+        extended_end,
+        ("600000.SH",),
+        parameters,
+    )
+    combined, reused = builder._capture_exact(
+        "range-source", extended_request, refresh=False,
+    )
+
+    assert reused is False
+    assert [(item.start_date, item.end_date) for item in provider.calls] == [
+        (START, END),
+        (extended_end, extended_end),
+    ]
+    bars = warehouse.read_observation_table(
+        combined.observation_id, MarketTable.DAILY_BARS,
+    )
+    assert tuple(bars["session_date"].astype(str)) == (
+        START.isoformat(), END.isoformat(), extended_end.isoformat(),
+    )
+    assert combined.source_metadata["range_composition"] == {
+        "prefix_observation_id": prefix.observation_id,
+        "suffix_observation_id": combined.source_metadata["range_composition"][
+            "suffix_observation_id"
+        ],
+        "prefix_end": END.isoformat(),
+        "suffix_start": extended_end.isoformat(),
+    }
+
+
+def test_history_source_capture_never_reuses_an_incomplete_prefix(tmp_path):
+    class PartialThenCompleteProvider:
+        name = "range-source"
+        backend_group = "range-source"
+        capabilities = frozenset({ProviderCapability.DAILY_BARS_RAW})
+
+        def __init__(self):
+            self.calls = []
+
+        def observe(self, request):
+            self.calls.append(request)
+            rows = []
+            current = request.start_date
+            while current <= request.end_date:
+                rows.append({
+                    "instrument_id": "600000.SH",
+                    "session_date": current.isoformat(),
+                    "price_mode": "raw",
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.8,
+                    "close": 10.0,
+                    "volume": 1_000_000,
+                })
+                current += timedelta(days=1)
+            return ObservationPayload(
+                self.name,
+                datetime(2026, 7, 18, tzinfo=timezone.utc),
+                request,
+                {MarketTable.DAILY_BARS: pd.DataFrame(rows)},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    len(self.calls) > 1,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.backend_group},
+            )
+
+    provider = PartialThenCompleteProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    builder = HistoryDatabaseBuilder(
+        warehouse,
+        tmp_path / "reports",
+        registry=registry,
+        source_pair=("range-source", "unused-source"),
+    )
+    parameters = {"batch_size": 1, "count": 10000}
+    builder._capture_exact(
+        "range-source",
+        ProviderRequest(
+            ProviderCapability.DAILY_BARS_RAW,
+            START,
+            END,
+            ("600000.SH",),
+            parameters,
+        ),
+        refresh=False,
+    )
+    extended_end = END + timedelta(days=1)
+    builder._capture_exact(
+        "range-source",
+        ProviderRequest(
+            ProviderCapability.DAILY_BARS_RAW,
+            START,
+            extended_end,
+            ("600000.SH",),
+            parameters,
+        ),
+        refresh=False,
+    )
+
+    assert [(item.start_date, item.end_date) for item in provider.calls] == [
+        (START, END),
+        (START, extended_end),
+    ]
+
+
+def test_history_source_capture_retries_incomplete_exact_suffix(tmp_path):
+    class IncompleteSuffixProvider:
+        name = "range-source"
+        backend_group = "range-source"
+        capabilities = frozenset({ProviderCapability.DAILY_BARS_RAW})
+
+        def __init__(self):
+            self.calls = []
+
+        def observe(self, request):
+            self.calls.append(request)
+            rows = []
+            current = request.start_date
+            while current <= request.end_date:
+                rows.append({
+                    "instrument_id": "600000.SH",
+                    "session_date": current.isoformat(),
+                    "price_mode": "raw",
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.8,
+                    "close": 10.0,
+                    "volume": 1_000_000,
+                })
+                current += timedelta(days=1)
+            complete = len(self.calls) != 2
+            return ObservationPayload(
+                self.name,
+                datetime(2026, 7, 18, tzinfo=timezone.utc),
+                request,
+                {MarketTable.DAILY_BARS: pd.DataFrame(rows)},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    complete,
+                    request.start_date,
+                    request.end_date,
+                    request.instrument_ids,
+                ),),
+                {"backend_group": self.backend_group},
+            )
+
+    provider = IncompleteSuffixProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    builder = HistoryDatabaseBuilder(
+        warehouse,
+        tmp_path / "reports",
+        registry=registry,
+        source_pair=("range-source", "unused-source"),
+    )
+    parameters = {"batch_size": 1, "count": 10000}
+    prefix_request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW,
+        START,
+        END,
+        ("600000.SH",),
+        parameters,
+    )
+    builder._capture_exact("range-source", prefix_request, refresh=False)
+    extended_end = END + timedelta(days=1)
+    extended_request = ProviderRequest(
+        ProviderCapability.DAILY_BARS_RAW,
+        START,
+        extended_end,
+        ("600000.SH",),
+        parameters,
+    )
+    first, _ = builder._capture_exact(
+        "range-source", extended_request, refresh=False,
+    )
+    assert not next(
+        claim for claim in first.coverage if claim.table is MarketTable.DAILY_BARS
+    ).complete
+
+    recovered, reused = builder._capture_exact(
+        "range-source", extended_request, refresh=False,
+    )
+
+    assert reused is False
+    assert [(item.start_date, item.end_date) for item in provider.calls] == [
+        (START, END),
+        (extended_end, extended_end),
+        (extended_end, extended_end),
+    ]
+    assert next(
+        claim for claim in recovered.coverage if claim.table is MarketTable.DAILY_BARS
+    ).complete
+
+
+def test_history_source_capture_reuses_exact_universe_when_provider_later_fails(tmp_path):
+    class OneShotUniverseProvider:
+        name = "universe-source"
+        capabilities = frozenset({ProviderCapability.INSTRUMENTS})
+
+        def __init__(self):
+            self.calls = 0
+
+        def observe(self, request):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("universe endpoint unavailable")
+            frame = _master()
+            ids = tuple(sorted(map(str, frame["instrument_id"])))
+            return ObservationPayload(
+                self.name,
+                datetime(2026, 7, 18, tzinfo=timezone.utc),
+                request,
+                {MarketTable.INSTRUMENTS: frame},
+                (CoverageClaim(
+                    MarketTable.INSTRUMENTS,
+                    True,
+                    instrument_ids=ids,
+                ),),
+            )
+
+    provider = OneShotUniverseProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    builder = HistoryDatabaseBuilder(
+        MarketDataWarehouse(tmp_path / "market"),
+        tmp_path / "reports",
+        registry=registry,
+        source_pair=("unused-a", "unused-b"),
+    )
+    request = ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": END.isoformat()},
+    )
+
+    first, first_reused = builder._capture_exact(
+        provider.name, request, refresh=False,
+    )
+    second, second_reused = builder._capture_exact(
+        provider.name, request, refresh=False,
+    )
+
+    assert first_reused is False
+    assert second_reused is True
+    assert second.observation_id == first.observation_id
+    assert provider.calls == 1
 
 
 def test_history_builder_publishes_only_exact_two_source_scope_and_resumes(tmp_path):
@@ -895,6 +1217,84 @@ def test_no_trade_check_rejects_active_or_ambiguous_rows(field, value):
         start_date=START,
         end_date=END,
     ) == {"600000.SH"}
+
+
+def test_no_trade_partition_reports_active_evidence_per_instrument():
+    target = ("510050.SH", "600000.SH")
+    predecessor = SimpleNamespace(plan=SimpleNamespace(universe_scope=UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        START - timedelta(days=1),
+        date(2026, 1, 1),
+        START - timedelta(days=1),
+        survivorship_bias=True,
+        instrument_ids=target,
+    )))
+    universe = SimpleNamespace(
+        provider="exchange-public",
+        source_metadata={"as_of_date": END.isoformat()},
+        observed_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    calendar = SimpleNamespace(
+        source_metadata={"calendar_quality": {
+            "validated": True,
+            "start_date": START.isoformat(),
+            "end_date": END.isoformat(),
+        }},
+        observed_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    manifests = {
+        f"obs-{provider}": SimpleNamespace(
+            observation_id=f"obs-{provider}",
+            provider=provider,
+            request=ProviderRequest(
+                ProviderCapability.DAILY_BARS_RAW, START, END, target,
+            ),
+            source_metadata={"backend_group": provider},
+            observed_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        )
+        for provider in ("tickflow", "xtquant", "baostock")
+    }
+    empty = _bars("baostock", target).iloc[0:0].copy()
+    active = _bars("baostock", target).loc[
+        lambda frame: frame["instrument_id"].eq("510050.SH")
+    ].copy()
+
+    class Warehouse:
+        def load_snapshot(self, snapshot_id):
+            assert snapshot_id == "snap-predecessor"
+            return predecessor
+
+        def load_observation(self, observation_id):
+            if observation_id == "obs-universe":
+                return universe
+            if observation_id == "obs-calendar":
+                return calendar
+            return manifests[observation_id]
+
+        def read_observation_table(self, observation_id, table):
+            assert table in {MarketTable.INSTRUMENTS, MarketTable.DAILY_BARS}
+            if observation_id == "obs-universe":
+                return _master()
+            if observation_id == "obs-baostock":
+                return active
+            return empty
+
+    with pytest.raises(history_module.NoTradeSourceActiveError) as caught:
+        history_module.record_no_trade_research_partition(
+            Warehouse(),
+            predecessor_snapshot_id="snap-predecessor",
+            universe_observation_id="obs-universe",
+            calendar_observation_id="obs-calendar",
+            source_observation_ids=tuple(manifests),
+            start_date=START,
+            end_date=END,
+            instrument_ids=target,
+        )
+
+    assert caught.value.active_observation_ids == {
+        "510050.SH": ("obs-baostock",),
+    }
+    assert "510050.SH" in str(caught.value)
 
 
 def test_no_trade_partition_reuse_requires_the_exact_validated_boundary(tmp_path):

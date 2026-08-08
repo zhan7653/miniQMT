@@ -8,6 +8,7 @@ import fundlab.marketdata.warehouse as warehouse_module
 from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata import (
     CanonicalMarketData,
+    IntegrityError,
     MarketIngestionService,
     MarketDataWarehouse,
     MarketTable,
@@ -304,3 +305,79 @@ def test_exact_complete_collection_scope_is_resumable_without_another_source_cal
     assert not first_reused and second_reused
     assert first.observation_id == second.observation_id
     assert provider.calls == 1
+
+
+def test_observation_header_index_parses_each_committed_manifest_once_and_sees_new_rows(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "market"
+    warehouse = MarketDataWarehouse(root)
+    first = warehouse.record_observation(observation(provider="first"))
+    original_read_json = warehouse_module._read_json
+    header_reads: list[str] = []
+
+    def count_manifest_headers(path):
+        if path.name == "manifest.json" and path.parent.name.startswith("obs-"):
+            header_reads.append(path.parent.name)
+        return original_read_json(path)
+
+    monkeypatch.setattr(warehouse_module, "_read_json", count_manifest_headers)
+
+    assert tuple(
+        item.observation_id
+        for _, item in warehouse._indexed_observation_headers()
+    ) == (
+        first.observation_id,
+    )
+    assert tuple(
+        item.observation_id
+        for _, item in warehouse._indexed_observation_headers()
+    ) == (
+        first.observation_id,
+    )
+    assert header_reads == [first.observation_id]
+
+    second = MarketDataWarehouse(root).record_observation(
+        observation(provider="second", observed_second=1),
+    )
+    header_reads.clear()
+    assert set(
+        item.observation_id
+        for _, item in warehouse._indexed_observation_headers()
+    ) == {first.observation_id, second.observation_id}
+    assert header_reads == [second.observation_id]
+
+
+def test_observation_header_index_never_bypasses_selected_payload_verification(tmp_path):
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    observed = warehouse.record_observation(observation(provider="indexed"))
+    request = observed.request
+    assert warehouse.matching_observations(provider="indexed", request=request)
+
+    manifest_path = warehouse.observation_path(observed.observation_id) / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["provider"] = "tampered"
+    manifest_path.write_text(
+        canonical_json(payload), encoding="utf-8", newline="\n",
+    )
+
+    with pytest.raises(IntegrityError, match="content identity mismatch"):
+        warehouse.matching_observations(provider="indexed", request=request)
+
+
+def test_observation_header_index_fails_closed_when_directory_impersonates_another_id(
+    tmp_path,
+):
+    root = tmp_path / "market"
+    writer = MarketDataWarehouse(root)
+    first = writer.record_observation(observation(provider="first"))
+    second = writer.record_observation(
+        observation(provider="second", observed_second=1),
+    )
+    first_manifest = writer.observation_path(first.observation_id) / "manifest.json"
+    second_manifest = writer.observation_path(second.observation_id) / "manifest.json"
+    first_manifest.write_bytes(second_manifest.read_bytes())
+
+    reader = MarketDataWarehouse(root)
+    with pytest.raises(IntegrityError, match="manifest identity mismatch"):
+        reader.observations()

@@ -6,6 +6,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ from fundlab.marketdata.contracts import (
     CorporateActionType,
     CoverageClaim,
     DATA_GAP_QUARANTINE_RULE_ID,
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
     MarketTable,
     ObservationManifest,
     ObservationPayload,
@@ -141,6 +143,94 @@ class _ActionBatchCollectionResult:
     blocker: str | None = None
 
 
+@dataclass(frozen=True)
+class _SimulationSourceContext:
+    snapshot: SnapshotManifest
+    scope: UniverseScope
+    instruments: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class _StatusSourceContext:
+    source: _SimulationSourceContext
+    calendar_manifest: ObservationManifest
+    calendar: pd.DataFrame
+    research_bars: pd.DataFrame
+
+
+def _cached_simulation_source_context(
+    warehouse: MarketDataWarehouse,
+    snapshot_id: str,
+    *,
+    loaded_snapshot: SnapshotManifest | None = None,
+) -> _SimulationSourceContext:
+    cache = getattr(warehouse, "_simulation_source_context_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(warehouse, "_simulation_source_context_cache", cache)
+    cached = cache.get(snapshot_id)
+    if cached is not None:
+        if loaded_snapshot is not None and loaded_snapshot.snapshot_id != snapshot_id:
+            raise ValueError("Loaded simulation snapshot does not match the requested context")
+        return cached
+    snapshot = loaded_snapshot or warehouse.load_snapshot(snapshot_id)
+    if snapshot.snapshot_id != snapshot_id:
+        raise ValueError("Loaded simulation snapshot does not match the requested context")
+    if snapshot.plan.readiness is not ReadinessProfile.RESEARCH_PRICE:
+        raise ValueError("Simulation collection requires a research_price source snapshot")
+    scope = snapshot.plan.universe_scope
+    if scope is None or scope.definition != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE:
+        raise ValueError("Simulation collection requires an exact revision-2 universe scope")
+    instruments = warehouse.query_loaded_snapshot_table(
+        snapshot, MarketTable.INSTRUMENTS,
+    ).sort_values("instrument_id", kind="stable").reset_index(drop=True)
+    if set(map(str, instruments["instrument_id"])) != set(scope.instrument_ids):
+        raise ValueError("Simulation source snapshot does not match its pinned universe")
+    context = _SimulationSourceContext(snapshot, scope, instruments)
+    cache[snapshot_id] = context
+    return context
+
+
+def _cached_status_source_context(
+    warehouse: MarketDataWarehouse,
+    spec: StatusCollectionSpec,
+    *,
+    loaded_snapshot: SnapshotManifest | None = None,
+) -> _StatusSourceContext:
+    cache = getattr(warehouse, "_status_source_context_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(warehouse, "_status_source_context_cache", cache)
+    key = (spec.source_snapshot_id, spec.calendar_observation_id)
+    cached = cache.get(key)
+    if cached is not None:
+        if loaded_snapshot is not None and loaded_snapshot.snapshot_id != spec.source_snapshot_id:
+            raise ValueError("Loaded status snapshot does not match the collection spec")
+        return cached
+    source = _cached_simulation_source_context(
+        warehouse, spec.source_snapshot_id, loaded_snapshot=loaded_snapshot,
+    )
+    calendar_manifest = warehouse.load_observation(spec.calendar_observation_id)
+    calendar_quality = calendar_manifest.source_metadata.get("calendar_quality")
+    if not isinstance(calendar_quality, Mapping) or not calendar_quality.get("validated"):
+        raise ValueError("Status collection requires a validated canonical calendar")
+    calendar = warehouse.read_observation_table(
+        spec.calendar_observation_id, MarketTable.CALENDAR,
+    )
+    research_bars = warehouse.query_loaded_snapshot_table(
+        source.snapshot,
+        MarketTable.DAILY_BARS,
+        start_date=source.scope.history_start,
+        end_date=source.scope.history_end,
+        price_mode="raw",
+    )
+    context = _StatusSourceContext(
+        source, calendar_manifest, calendar, research_bars,
+    )
+    cache[key] = context
+    return context
+
+
 class SimulationEvidenceCollector:
     """Resumably collect action/factor evidence in immutable recovery batches."""
 
@@ -175,19 +265,14 @@ class SimulationEvidenceCollector:
         *,
         loaded_snapshot: SnapshotManifest | None,
     ) -> EvidenceCollectionResult:
-        snapshot = loaded_snapshot or self.warehouse.load_snapshot(spec.source_snapshot_id)
-        if snapshot.snapshot_id != spec.source_snapshot_id:
-            raise ValueError("Loaded evidence snapshot does not match the collection spec")
-        if snapshot.plan.readiness is not ReadinessProfile.RESEARCH_PRICE:
-            raise ValueError("Evidence collection requires a research_price source snapshot")
-        scope = snapshot.plan.universe_scope
-        if scope is None or scope.definition != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE:
-            raise ValueError("Evidence collection requires an exact revision-2 universe scope")
-        instruments = self.warehouse.query_loaded_snapshot_table(
-            snapshot, MarketTable.INSTRUMENTS,
-        ).sort_values("instrument_id", kind="stable").reset_index(drop=True)
-        if set(map(str, instruments["instrument_id"])) != set(scope.instrument_ids):
-            raise ValueError("Evidence source snapshot does not match its pinned universe")
+        context = _cached_simulation_source_context(
+            self.warehouse,
+            spec.source_snapshot_id,
+            loaded_snapshot=loaded_snapshot,
+        )
+        snapshot = context.snapshot
+        scope = context.scope
+        instruments = context.instruments
         if spec.kind == "stock-actions":
             return self._collect_incremental_stock_actions(
                 spec=spec,
@@ -239,14 +324,31 @@ class SimulationEvidenceCollector:
         blockers: list[str] = []
 
         indexed = instruments.set_index("instrument_id", drop=False)
-        action_raw_observations: list[ObservationManifest] = []
-        action_canonical_observations: list[ObservationManifest] = []
-        if spec.kind.endswith("-actions"):
+        action_raw_by_instrument: dict[str, list[ObservationManifest]] = {}
+        action_raw_order: dict[str, int] = {}
+        action_canonical_by_request: dict[str, list[ObservationManifest]] = {}
+        if spec.kind.endswith("-actions") and not spec.refresh:
             canonical_provider = _action_canonical_provider(spec.kind)
-            action_raw_observations.extend(self.warehouse.observations(provider=provider))
-            action_canonical_observations.extend(
-                self.warehouse.observations(provider=canonical_provider)
-            )
+            for ordinal, item in enumerate(
+                self.warehouse.observations(provider=provider)
+            ):
+                action_raw_order[item.observation_id] = ordinal
+                if (
+                    item.request.capability is capability
+                    and item.request.start_date == scope.history_start
+                    and item.request.end_date == scope.history_end
+                    and _action_observation_policy_is_current(
+                        spec.kind, item.source_metadata,
+                    )
+                ):
+                    for instrument_id in item.request.instrument_ids:
+                        action_raw_by_instrument.setdefault(
+                            str(instrument_id), [],
+                        ).append(item)
+            for item in self.warehouse.observations(provider=canonical_provider):
+                action_canonical_by_request.setdefault(
+                    stable_digest(item.request), [],
+                ).append(item)
         for batch in batches:
             batch_id = "batch-" + stable_digest(batch)[:16]
             parameters = _evidence_parameters(spec.kind, batch, indexed)
@@ -275,7 +377,9 @@ class SimulationEvidenceCollector:
                 if spec.kind.endswith("-actions"):
                     expected_request = _action_canonical_request(spec, scope, batch)
                     matches = tuple(
-                        item for item in action_canonical_observations
+                        item for item in action_canonical_by_request.get(
+                            stable_digest(expected_request), (),
+                        )
                         if item.request == expected_request
                     )
                 else:
@@ -292,6 +396,13 @@ class SimulationEvidenceCollector:
             if manifest is None:
                 try:
                     if spec.kind.endswith("-actions"):
+                        raw_observations = {
+                            item.observation_id: item
+                            for instrument_id in batch
+                            for item in action_raw_by_instrument.get(
+                                instrument_id, (),
+                            )
+                        }
                         action_batch = _collect_action_batch(
                             warehouse=self.warehouse,
                             registry=self.registry,
@@ -299,12 +410,17 @@ class SimulationEvidenceCollector:
                             scope=scope,
                             batch=batch,
                             instruments=indexed,
-                            raw_observations=action_raw_observations,
+                            raw_observations=sorted(
+                                raw_observations.values(),
+                                key=lambda item: action_raw_order[item.observation_id],
+                            ),
                             reuse_existing=not spec.refresh,
                         )
                         candidate = action_batch.manifest
                         if candidate is not None:
-                            action_canonical_observations.append(candidate)
+                            action_canonical_by_request.setdefault(
+                                stable_digest(candidate.request), [],
+                            ).append(candidate)
                             observation_ids.append(candidate.observation_id)
                         if action_batch.blocker is not None:
                             blockers.append(f"{batch_id}:{action_batch.blocker}")
@@ -1070,7 +1186,29 @@ class SimulationStatusCollector:
         if spec.provider_name == "baostock":
             lock = self.warehouse.root / "builds" / ".locks" / "baostock-status.lock"
             with _exclusive_build_lock(lock):
-                return self._collect_locked(spec, loaded_snapshot=loaded_snapshot)
+                provider = self.registry.resolve(
+                    spec.provider_name, ProviderCapability.DAILY_STATUS,
+                )
+                session_factory = getattr(provider, "session", None)
+                if not callable(session_factory):
+                    return self._collect_locked(
+                        spec, loaded_snapshot=loaded_snapshot,
+                    )
+                session = session_factory()
+                try:
+                    session.__enter__()
+                except Exception:
+                    # A shared-session startup failure must retain the original
+                    # per-request login path and its batch-level isolation.
+                    return self._collect_locked(
+                        spec, loaded_snapshot=loaded_snapshot,
+                    )
+                try:
+                    return self._collect_locked(
+                        spec, loaded_snapshot=loaded_snapshot,
+                    )
+                finally:
+                    session.__exit__(None, None, None)
         lock = self.warehouse.root / "builds" / ".locks" / (
             "status-" + stable_digest(spec)[:24] + ".lock"
         )
@@ -1083,33 +1221,17 @@ class SimulationStatusCollector:
         *,
         loaded_snapshot: SnapshotManifest | None,
     ) -> StatusCollectionResult:
-        snapshot = loaded_snapshot or self.warehouse.load_snapshot(spec.source_snapshot_id)
-        if snapshot.snapshot_id != spec.source_snapshot_id:
-            raise ValueError("Loaded status snapshot does not match the collection spec")
-        if snapshot.plan.readiness is not ReadinessProfile.RESEARCH_PRICE:
-            raise ValueError("Status collection requires a research_price source snapshot")
-        scope = snapshot.plan.universe_scope
-        if (
-            scope is None
-            or scope.definition != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE
-            or set(scope.instrument_ids) == set()
-        ):
-            raise ValueError("Status collection requires an exact revision-2 universe scope")
-        calendar_manifest = self.warehouse.load_observation(spec.calendar_observation_id)
-        calendar_quality = calendar_manifest.source_metadata.get("calendar_quality")
-        if not isinstance(calendar_quality, Mapping) or not calendar_quality.get("validated"):
-            raise ValueError("Status collection requires a validated canonical calendar")
-        calendar = self.warehouse.read_observation_table(
-            spec.calendar_observation_id, MarketTable.CALENDAR,
+        context = _cached_status_source_context(
+            self.warehouse,
+            spec,
+            loaded_snapshot=loaded_snapshot,
         )
-        instruments = self.warehouse.query_loaded_snapshot_table(
-            snapshot, MarketTable.INSTRUMENTS,
-        )
-        instruments = instruments.loc[
-            instruments["instrument_id"].astype(str).isin(scope.instrument_ids)
-        ].sort_values("instrument_id", kind="stable").reset_index(drop=True)
-        if set(map(str, instruments["instrument_id"])) != set(scope.instrument_ids):
-            raise ValueError("Research snapshot instrument rows do not match its universe scope")
+        scope = context.source.scope
+        calendar_manifest = context.calendar_manifest
+        calendar = context.calendar
+        instruments = context.source.instruments
+        if not scope.instrument_ids:
+            raise ValueError("Status collection requires a non-empty universe scope")
         if spec.provider_name == "baostock":
             # ETFs never carry stock ST designations; BaoStock is used only for
             # stock ST while xtquant supplies dense suspension state for all assets.
@@ -1234,14 +1356,9 @@ class SimulationStatusCollector:
                 frame = self.warehouse.read_observation_table(
                     source_manifest.observation_id, MarketTable.DAILY_BARS,
                 )
-                research = self.warehouse.query_loaded_snapshot_table(
-                    snapshot,
-                    MarketTable.DAILY_BARS,
-                    instrument_ids=batch,
-                    start_date=scope.history_start,
-                    end_date=scope.history_end,
-                    price_mode="raw",
-                )
+                research = context.research_bars.loc[
+                    context.research_bars["instrument_id"].astype(str).isin(batch)
+                ].copy()
                 _validate_status_scope(
                     instruments.loc[instruments["instrument_id"].isin(batch)],
                     frame,
@@ -1939,25 +2056,100 @@ class SimulationIncrementValidator:
             raise SnapshotNotReadyError(
                 "Routine simulation increment contains rows outside its exact raw date scope"
             )
-        etf_rules = None
-        if instruments["asset_type"].astype(str).eq("etf").any():
-            etf_rules = EtfRuleEvidenceBuilder(self.report_root).build(
-                instruments,
-                universe_as_of=universe_scope.as_of_date,
-                universe_observation_id=candidate_observation_id,
-            ).rules
-        bars = materialize_daily_trade_rules(
-            bars, instruments, rule_calendar, etf_rules=etf_rules,
-        )
         quarantine_mask = bars["field_lineage"].astype(str).str.contains(
             "daily_instrument_data_gap_quarantine_v1",
             regex=False,
             na=False,
         )
+        execution_guard_mask = bars["field_lineage"].astype(str).str.contains(
+            "daily_execution_evidence_gap_guard_v1",
+            regex=False,
+            na=False,
+        )
+        validator_execution_guard: dict[str, tuple[str, ...]] = {}
+        etf_rules = None
+        etf_ids = set(map(str, instruments.loc[
+            instruments["asset_type"].astype(str).eq("etf"), "instrument_id",
+        ]))
+        fully_guarded_etfs = {
+            instrument_id for instrument_id in etf_ids
+            if (
+                bars["instrument_id"].astype(str).eq(instrument_id).any()
+                and execution_guard_mask.loc[
+                    bars["instrument_id"].astype(str).eq(instrument_id)
+                ].all()
+            )
+        }
+        eligible_etfs = etf_ids - fully_guarded_etfs
+        while eligible_etfs:
+            rule_instruments = instruments.loc[
+                instruments["instrument_id"].astype(str).isin(eligible_etfs)
+            ].reset_index(drop=True)
+            try:
+                etf_rules = EtfRuleEvidenceBuilder(self.report_root).build(
+                    rule_instruments,
+                    universe_as_of=universe_scope.as_of_date,
+                    universe_observation_id=candidate_observation_id,
+                ).rules
+                break
+            except Exception as exc:
+                error = f"{type(exc).__name__}:{str(exc)[:1000]}"
+                mentioned = set(re.findall(r"\b\d{6}\.(?:SH|SZ)\b", error))
+                affected = mentioned & eligible_etfs
+                if not affected:
+                    affected = set(eligible_etfs)
+                for instrument_id in affected:
+                    validator_execution_guard[instrument_id] = (
+                        f"etf_rules:{error}",
+                    )
+                affected_mask = bars["instrument_id"].astype(str).isin(affected)
+                for index in bars.index[affected_mask]:
+                    value = bars.at[index, "field_lineage"]
+                    try:
+                        lineage = json.loads(str(value)) if str(value).strip() else {}
+                    except json.JSONDecodeError:
+                        lineage = {"upstream_lineage": str(value)}
+                    instrument_id = str(bars.at[index, "instrument_id"])
+                    lineage["daily_execution_evidence_gap_guard_v1"] = {
+                        "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                        "reasons": validator_execution_guard[instrument_id],
+                        "execution": "prohibited_and_deferred",
+                    }
+                    bars.at[index, "field_lineage"] = canonical_json(lineage)
+                execution_guard_mask |= affected_mask
+                eligible_etfs.difference_update(affected)
+        rule_input = bars.copy(deep=True)
+        # Rule materialization needs a non-active placeholder while quarantine
+        # rows deliberately keep tradability unknown.  Restore the unknown
+        # state immediately after deriving all other daily rule attributes.
+        non_execution_mask = quarantine_mask | execution_guard_mask
+        guarded_prices = bars.loc[
+            execution_guard_mask,
+            ["open", "high", "low", "close", "volume", "amount"],
+        ].copy()
+        rule_input.loc[non_execution_mask, "suspended"] = True
+        rule_input.loc[non_execution_mask, "is_st"] = pd.NA
+        bars = materialize_daily_trade_rules(
+            rule_input, instruments, rule_calendar, etf_rules=etf_rules,
+        )
         if quarantine_mask.any():
+            bars.loc[quarantine_mask, "suspended"] = pd.NA
             bars.loc[quarantine_mask, "trade_rule_id"] = DATA_GAP_QUARANTINE_RULE_ID
             bars.loc[quarantine_mask, "trade_rule_known_date"] = bars.loc[
                 quarantine_mask, "session_date"
+            ]
+        if execution_guard_mask.any():
+            bars.loc[
+                execution_guard_mask,
+                ["open", "high", "low", "close", "volume", "amount"],
+            ] = guarded_prices
+            bars.loc[execution_guard_mask, "suspended"] = pd.NA
+            bars.loc[execution_guard_mask, "is_st"] = pd.NA
+            bars.loc[execution_guard_mask, "trade_rule_id"] = (
+                EXECUTION_EVIDENCE_GAP_RULE_ID
+            )
+            bars.loc[execution_guard_mask, "trade_rule_known_date"] = bars.loc[
+                execution_guard_mask, "session_date"
             ]
 
         provider_bars, upstream_manifests = self._provider_audit_bars(
@@ -1971,6 +2163,13 @@ class SimulationIncrementValidator:
             provider_bars,
             protected_dates=(universe_scope.history_end,),
         )
+        if execution_guard_mask.any():
+            bars.loc[execution_guard_mask, "trade_rule_id"] = (
+                EXECUTION_EVIDENCE_GAP_RULE_ID
+            )
+            bars.loc[execution_guard_mask, "trade_rule_known_date"] = bars.loc[
+                execution_guard_mask, "session_date"
+            ]
         latest_historical_exception = bars.loc[
             bars["session_date"].astype(str).eq(universe_scope.history_end.isoformat())
             & bars["trade_rule_id"].astype(str).eq(
@@ -1982,7 +2181,7 @@ class SimulationIncrementValidator:
                 "Latest EOD rules cannot use a historical price-limit exception"
             )
         price_limit_audit = audit_provider_price_limits(
-            bars,
+            bars.loc[~execution_guard_mask].reset_index(drop=True),
             provider_bars,
             required_direct_limit_date=universe_scope.history_end,
         )
@@ -2035,27 +2234,55 @@ class SimulationIncrementValidator:
             "degraded_quarantine": candidate.source_metadata.get(
                 "degraded_quarantine"
             ),
+            "execution_evidence_guard": {
+                "candidate": candidate.source_metadata.get(
+                    "execution_evidence_guard"
+                ),
+                "validator_added_reasons": dict(sorted(
+                    validator_execution_guard.items()
+                )),
+            },
+            "degraded_auxiliary_evidence": candidate.source_metadata.get(
+                "degraded_auxiliary_evidence"
+            ),
         }
         observed_at = max(
             candidate.observed_at,
             calendar_manifest.observed_at,
             *(item.observed_at for item in upstream_manifests),
         )
-        claims = tuple(
+        claims = (
             CoverageClaim(
-                table,
+                MarketTable.INSTRUMENTS,
                 True,
-                None if table is MarketTable.INSTRUMENTS else universe_scope.history_start,
-                None if table is MarketTable.INSTRUMENTS else universe_scope.history_end,
+                instrument_ids=instrument_ids,
+                detail=f"Validated by {SIMULATION_PARTITION_VALIDATOR_VERSION}",
+            ),
+            CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                universe_scope.history_start,
+                universe_scope.history_end,
                 instrument_ids,
                 f"Validated by {SIMULATION_PARTITION_VALIDATOR_VERSION}",
-            )
-            for table in (
-                MarketTable.INSTRUMENTS,
-                MarketTable.DAILY_BARS,
-                MarketTable.CORPORATE_ACTIONS,
-                MarketTable.ADJUSTMENT_FACTORS,
-            )
+            ),
+            *(
+                CoverageClaim(
+                    claim.table,
+                    claim.complete,
+                    claim.start_date,
+                    claim.end_date,
+                    claim.instrument_ids,
+                    (
+                        f"Validated safe event representation; upstream: {claim.detail}"
+                    ),
+                )
+                for claim in candidate.coverage
+                if claim.table in {
+                    MarketTable.CORPORATE_ACTIONS,
+                    MarketTable.ADJUSTMENT_FACTORS,
+                }
+            ),
         )
         payload = ObservationPayload(
             f"canonical-{SIMULATION_PARTITION_VALIDATOR_VERSION}",
@@ -2098,10 +2325,28 @@ class SimulationIncrementValidator:
                     "degraded_quarantine": candidate.source_metadata.get(
                         "degraded_quarantine"
                     ),
+                    "execution_evidence_guard": partition_quality[
+                        "execution_evidence_guard"
+                    ],
+                    "degraded_auxiliary_evidence": partition_quality[
+                        "degraded_auxiliary_evidence"
+                    ],
+                    "non_blocking_degradations": tuple(filter(None, (
+                        "execution_evidence_guard"
+                        if execution_guard_mask.any() else None,
+                        "auxiliary_event_evidence_incomplete"
+                        if partition_quality["degraded_auxiliary_evidence"] else None,
+                    ))),
                 },
                 "degraded_quarantine": candidate.source_metadata.get(
                     "degraded_quarantine"
                 ),
+                "execution_evidence_guard": partition_quality[
+                    "execution_evidence_guard"
+                ],
+                "degraded_auxiliary_evidence": partition_quality[
+                    "degraded_auxiliary_evidence"
+                ],
             },
         )
         validated = self.warehouse.record_observation(payload)
@@ -2636,27 +2881,12 @@ def _collect_action_batch(
         invalid = metadata.get("invalid_lifecycle")
         if not isinstance(hashes, Mapping):
             return
-        legacy_incompatible_action_ids: set[str] = set()
-        if (
-            spec.kind == "etf-actions"
-            and metadata.get("parser_policy") != EASTMONEY_ETF_ACTION_POLICY
-        ):
-            # V6 discovers distribution notices even when the older per-fund
-            # archive table has no row.  An old positive observation remains
-            # replayable; an old negative is no longer exhaustive and must be
-            # fetched again under the current policy.
-            try:
-                legacy_actions = warehouse.read_observation_table(
-                    manifest.observation_id, MarketTable.CORPORATE_ACTIONS,
-                )
-            except Exception:
-                return
-            legacy_positive_ids = set(map(str, legacy_actions.get(
-                "instrument_id", pd.Series(dtype="string"),
-            )))
-            legacy_incompatible_action_ids = (
-                set(manifest.request.instrument_ids) - legacy_positive_ids
-            )
+        if not _action_observation_policy_is_current(spec.kind, metadata):
+            # A pre-v7 observation can contain split rows while silently
+            # omitting every cash row under a changed `每 N 份分红` header.
+            # Positive and negative legacy observations must both be fetched
+            # again before they can establish exhaustive ETF action coverage.
+            return
         error_ids = set(errors) if isinstance(errors, Mapping) else set()
         invalid_ids = set(invalid) if isinstance(invalid, Mapping) else set()
         for instrument_id in manifest.request.instrument_ids:
@@ -2664,7 +2894,6 @@ def _collect_action_batch(
                 instrument_id in hashes
                 and instrument_id not in error_ids
                 and instrument_id not in invalid_ids
-                and instrument_id not in legacy_incompatible_action_ids
                 and instrument_id in batch
             ):
                 previous = selected.get(instrument_id)
@@ -2809,6 +3038,15 @@ def _collect_action_batch(
             f"request_errors={';'.join(recovery_errors[-3:])[:500]}"
         )
     return _ActionBatchCollectionResult(manifest, unresolved, blocker)
+
+
+def _action_observation_policy_is_current(
+    kind: str, metadata: Mapping[str, Any],
+) -> bool:
+    return (
+        kind != "etf-actions"
+        or metadata.get("parser_policy") == EASTMONEY_ETF_ACTION_POLICY
+    )
 
 
 def _require_complete_status_claim(
