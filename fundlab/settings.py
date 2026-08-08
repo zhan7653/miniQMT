@@ -28,12 +28,15 @@ class DailyAccountSettings:
     initial_cash: Decimal
     strategy: str
     weights: Mapping[str, Decimal] = field(default_factory=dict)
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.strategy not in {"static", "agent-file", "moving-average-grid"}:
             raise ValueError(f"Unknown daily strategy: {self.strategy}")
         if self.strategy == "static" and not self.weights:
             raise ValueError(f"Static daily account needs weights: {self.account_id}")
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"Daily account enabled must be true or false: {self.account_id}")
 
 
 @dataclass(frozen=True)
@@ -319,14 +322,18 @@ def _daily_settings(raw: Any, base: Path) -> DailySettings:
         if not isinstance(item, dict):
             raise ValueError("Daily account entries must be mappings")
         accounts.append(DailyAccountSettings(
-            str(item["account_id"]),
-            str(item.get("name", item["account_id"])),
-            Decimal(str(item.get("initial_cash", "1000000"))),
-            str(item.get("strategy", "static")),
-            {
+            account_id=str(item["account_id"]),
+            name=str(item.get("name", item["account_id"])),
+            initial_cash=Decimal(str(item.get("initial_cash", "1000000"))),
+            strategy=str(item.get("strategy", "static")),
+            weights={
                 str(symbol): Decimal(str(weight))
                 for symbol, weight in (item.get("weights") or {}).items()
             },
+            enabled=_strict_bool(
+                item.get("enabled", True),
+                f"daily.accounts.{item['account_id']}.enabled",
+            ),
         ))
     def _path(key: str, default: str) -> Path:
         value = Path(str(raw.get(key, default)))

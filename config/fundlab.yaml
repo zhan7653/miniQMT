@@ -48,18 +48,22 @@ daily:
       name: "Paper MA Grid 510050"
       initial_cash: "1000000"
       strategy: moving-average-grid
+      enabled: false
     - account_id: paper-ma-grid-510300
       name: "Paper MA Grid 510300"
       initial_cash: "1000000"
       strategy: moving-average-grid
+      enabled: false
     - account_id: paper-ma-grid-510500
       name: "Paper MA Grid 510500"
       initial_cash: "1000000"
       strategy: moving-average-grid
+      enabled: false
     - account_id: paper-ma-grid-511380
       name: "Paper MA Grid 511380"
       initial_cash: "1000000"
       strategy: moving-average-grid
+      enabled: false
     - account_id: paper-inverse-vol
       name: "Paper Inverse Volatility"
       initial_cash: "1000000"

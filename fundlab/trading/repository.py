@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -230,6 +230,46 @@ class TradingRepository:
             connection.execute(
                 "UPDATE trading_accounts SET status=?, updated_at=? WHERE account_id=?",
                 (status.value, _now(), account_id),
+            )
+        return self.account(account_id)
+
+    def abandon_pending_only_head(
+        self,
+        account_id: str,
+        expected_run_id: str,
+    ) -> AccountRecord:
+        """Move an account head behind an unfilled-only run without deleting history.
+
+        This is deliberately narrower than a general rollback: the selected run
+        must start without pending orders, end with at least one, and have no
+        other state change once pending orders and the close-price cache are
+        removed. The immutable run remains available for audit or recovery.
+        """
+
+        account = self.account(account_id)
+        if account.selected_run_id != expected_run_id:
+            raise ValueError("Trading account head changed before pending-order abandonment")
+        run = self.run(expected_run_id)
+        if run.binding.account_id != account_id or run.status is not RunStatus.COMPLETE:
+            raise ValueError("Pending-order abandonment requires the completed selected run")
+        initial = self.initial_state(expected_run_id)
+        final = self.final_state(expected_run_id)
+        if initial.pending_orders or not final.pending_orders:
+            raise ValueError("Selected run is not a new-pending-orders-only head")
+        normalized_initial = replace(initial, pending_orders=(), last_prices={})
+        normalized_final = replace(final, pending_orders=(), last_prices={})
+        if normalized_initial != normalized_final:
+            raise ValueError("Selected run contains state changes beyond unfilled orders")
+        with self.transaction() as connection:
+            current = connection.execute(
+                "SELECT selected_run_id FROM trading_accounts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if current is None or current["selected_run_id"] != expected_run_id:
+                raise ValueError("Trading account head changed before pending-order abandonment")
+            connection.execute(
+                "UPDATE trading_accounts SET selected_run_id=?,updated_at=? WHERE account_id=?",
+                (run.binding.parent_run_id, _now(), account_id),
             )
         return self.account(account_id)
 

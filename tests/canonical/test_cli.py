@@ -161,6 +161,15 @@ def test_committed_simulation_fee_schedule_has_dated_public_boundaries():
             "paper-ma-grid-511380",
         )
     } == {"moving-average-grid"}
+    assert not any(
+        daily_accounts[account_id].enabled
+        for account_id in (
+            "paper-ma-grid-510050",
+            "paper-ma-grid-510300",
+            "paper-ma-grid-510500",
+            "paper-ma-grid-511380",
+        )
+    )
     assert build_policy(
         settings.agent.policies["paper-inverse-vol"].kind,
         settings.agent.policies["paper-inverse-vol"].params,

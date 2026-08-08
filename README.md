@@ -150,6 +150,12 @@ distributions remain explicitly incomplete until an investor-tax identity is mod
 `510500.SH` interval also reports an unmodeled fractional split. The kernel retains those quality
 flags instead of silently treating gross distributions as final after-tax cash.
 
+MA-grid v1 failed its 2026-08-08 research hurdle: annualized returns remained below both the
+fixed-neutral exposure baseline and an acceptable cash-management hurdle because the strategy
+spent too much time uninvested. The four account declarations are retained for audit and research
+but have `enabled: false`; their persistent paper accounts are paused. Do not resume this version
+without a new strategy version and a prospective approval after it beats the declared baselines.
+
 The rules-only
 dividend account is a direct comparison baseline: it requires a current trailing cash payment and
 a completed fiscal dividend no more than two years old, then ranks the eligible stocks by

@@ -72,6 +72,7 @@ from fundlab.strategies import (
 )
 from fundlab.strategies.moving_average_grid import moving_average_grid_config
 from fundlab.trading import (
+    AccountStatus,
     PortfolioState,
     SimulationService,
     TradingRepository,
@@ -2995,14 +2996,43 @@ class DailyPipeline:
         published_end: date,
     ) -> dict[str, Any]:
         try:
+            if not account.enabled:
+                try:
+                    _, selected_run_id = repository.selected_state(account.account_id)
+                except KeyError:
+                    selected_run_id = None
+                return {
+                    "account_id": account.account_id,
+                    "status": "disabled",
+                    "strategy": account.strategy,
+                    "sessions_advanced": 0,
+                    "head": (
+                        None
+                        if selected_run_id is None
+                        else repository.run(selected_run_id).binding.end_date.isoformat()
+                    ),
+                }
             try:
-                repository.account(account.account_id)
+                account_record = repository.account(account.account_id)
             except Exception:
-                repository.create_account(
+                account_record = repository.create_account(
                     account.account_id,
                     account.name,
                     PortfolioState.with_cash(account.initial_cash),
                 )
+            if account_record.status is not AccountStatus.ACTIVE:
+                _, selected_run_id = repository.selected_state(account.account_id)
+                return {
+                    "account_id": account.account_id,
+                    "status": account_record.status.value,
+                    "strategy": account.strategy,
+                    "sessions_advanced": 0,
+                    "head": (
+                        None
+                        if selected_run_id is None
+                        else repository.run(selected_run_id).binding.end_date.isoformat()
+                    ),
+                }
             _, selected_parent = repository.selected_state(account.account_id)
             if selected_parent is None:
                 sessions = (published_end,)

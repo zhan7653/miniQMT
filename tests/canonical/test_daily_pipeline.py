@@ -49,7 +49,7 @@ from fundlab.settings import (
     FoundationPaths,
     FoundationSettings,
 )
-from fundlab.trading import TradingRepository
+from fundlab.trading import AccountStatus, PortfolioState, TradingRepository
 from tests.canonical.fixtures import (
     DAYS,
     FUTURE_DAYS,
@@ -406,6 +406,66 @@ def test_daily_run_is_idempotent_and_advances_static_account(tmp_path):
     second = pipeline.run()
     assert second.status == "ok"
     assert second.accounts[0]["sessions_advanced"] == 0
+
+
+def test_daily_run_skips_disabled_account_without_creating_it(tmp_path):
+    ready_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "disabled-paper",
+        "Disabled Paper",
+        Decimal("100000"),
+        "static",
+        {"600000.SH": Decimal("0.5")},
+        enabled=False,
+    )
+    settings = build_settings(tmp_path, (account,))
+
+    result = DailyPipeline(
+        settings,
+        registry=registry_with_calendars(),
+        now_fn=lambda: evening_of(DAYS[-1]),
+    ).run()
+
+    assert result.status == "ok"
+    assert result.accounts == [{
+        "account_id": account.account_id,
+        "status": "disabled",
+        "strategy": "static",
+        "sessions_advanced": 0,
+        "head": None,
+    }]
+    with pytest.raises(KeyError, match="Unknown trading account"):
+        TradingRepository(settings.paths.trading_database).account(account.account_id)
+
+
+def test_daily_run_skips_persistently_paused_account(tmp_path):
+    ready_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "paused-paper",
+        "Paused Paper",
+        Decimal("100000"),
+        "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+    settings = build_settings(tmp_path, (account,))
+    repository = TradingRepository(settings.paths.trading_database)
+    repository.create_account(
+        account.account_id,
+        account.name,
+        PortfolioState.with_cash(account.initial_cash),
+    )
+    repository.set_account_status(account.account_id, AccountStatus.PAUSED)
+
+    result = DailyPipeline(
+        settings,
+        registry=registry_with_calendars(),
+        now_fn=lambda: evening_of(DAYS[-1]),
+    ).run()
+
+    assert result.status == "ok"
+    assert result.accounts[0]["status"] == "paused"
+    assert result.accounts[0]["sessions_advanced"] == 0
+    assert repository.account(account.account_id).selected_run_id is None
 
 
 def test_daily_ma_grid_close_signal_schedules_the_next_session_without_file_lag(

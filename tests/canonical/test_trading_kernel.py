@@ -14,6 +14,7 @@ from fundlab.marketdata.contracts import (
     PriceLimitState,
 )
 from fundlab.trading import (
+    AccountStatus,
     Entitlement,
     ExecutionPolicy,
     FeeRule,
@@ -105,6 +106,45 @@ def test_historical_and_daily_clocks_share_exact_economic_kernel(tmp_path):
 
     reused = service.run_historical("shared", DAYS[0], DAYS[-1], source)
     assert reused.reused and reused.run.run_id == historical.run.run_id
+
+
+def test_pending_only_account_head_can_be_abandoned_without_deleting_history(tmp_path):
+    market = ready_market(tmp_path / "market")
+    repository = TradingRepository(tmp_path / "trading.sqlite3")
+    repository.create_account(
+        "cancel-paper",
+        "Cancel Paper",
+        PortfolioState.with_cash(100_000),
+    )
+    execution, risk = policies()
+    outcome = SimulationService(
+        market_data=market,
+        repository=repository,
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    ).run_daily(
+        "cancel-paper",
+        DAYS[0],
+        StaticAllocationSource({"600000.SH": Decimal("0.50")}),
+    )
+
+    assert outcome.final_state.pending_orders
+    original_chain_head = repository.verify_run(outcome.run.run_id)
+    account = repository.abandon_pending_only_head(
+        "cancel-paper",
+        outcome.run.run_id,
+    )
+
+    assert account.status is AccountStatus.ACTIVE
+    assert account.selected_run_id is None
+    state, selected_run_id = repository.selected_state("cancel-paper")
+    assert selected_run_id is None
+    assert not state.pending_orders and state.cash == Decimal("100000.00")
+    assert repository.verify_run(outcome.run.run_id) == original_chain_head
+    assert repository.final_state(outcome.run.run_id).pending_orders
+    with pytest.raises(ValueError, match="head changed"):
+        repository.abandon_pending_only_head("cancel-paper", outcome.run.run_id)
 
 
 def test_next_open_fill_uses_close_sized_order_real_fees_and_partial_expiry(tmp_path):
