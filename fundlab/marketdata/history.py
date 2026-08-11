@@ -2752,6 +2752,8 @@ def _validate_daily_partial_official_input(
     claims = tuple(claim for claim in raw.coverage if claim.table is MarketTable.INSTRUMENTS)
     unavailable = raw.source_metadata.get("unavailable_components")
     pending = raw.source_metadata.get("pending_onboarding")
+    requested_scope = raw.source_metadata.get("requested_scope")
+    response_counts = raw.source_metadata.get("endpoint_response_counts")
     if (
         len(claims) != 1
         or claims[0].complete
@@ -2759,6 +2761,13 @@ def _validate_daily_partial_official_input(
         or not isinstance(unavailable, Mapping)
         or not isinstance(pending, Mapping)
         or not (unavailable or pending)
+        or not isinstance(requested_scope, Mapping)
+        or set(requested_scope) != {"exchanges", "asset_types"}
+        or not isinstance(response_counts, Mapping)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in response_counts.values()
+        )
     ):
         raise ValueError("Daily carried universe raw input must be an exact incomplete observation")
 

@@ -698,6 +698,22 @@ def test_explicit_history_propagates_exchange_component_closure_failures(tmp_pat
             trusted_predecessor_snapshot_id=None,
         )
 
+
+def test_daily_partial_official_input_requires_positive_successful_response_count(tmp_path):
+    warehouse, canonical, _ = _daily_partial_carry_universe(tmp_path)
+    raw_id = canonical.request.parameters["official_observation_ids"][0]
+    raw = warehouse.load_observation(raw_id)
+    raw_frame = warehouse.read_observation_table(raw_id, MarketTable.INSTRUMENTS)
+    metadata = deepcopy(dict(raw.source_metadata))
+    metadata["endpoint_response_counts"]["sse-star-stock-list"] = 0
+
+    with pytest.raises(ValueError, match="exact incomplete observation"):
+        history_module._validate_daily_partial_official_input(
+            replace(raw, source_metadata=metadata),
+            raw_frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+        )
+
 def test_history_source_capture_reuses_verified_date_prefix(tmp_path):
     class RangeProvider:
         name = "range-source"

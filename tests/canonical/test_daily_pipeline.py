@@ -3212,6 +3212,32 @@ def test_daily_tampered_official_endpoint_evidence_blocks_without_state_change(
     assert repository.selected_state(account.account_id)[1] == head_before
 
 
+def test_daily_rejects_component_closure_for_narrower_requested_scope():
+    frame = pd.DataFrame([{"instrument_id": "600000.SH"}])
+    observed = SimpleNamespace(
+        source_metadata={
+            "requested_scope": {
+                "exchanges": ("SH",),
+                "asset_types": ("stock", "etf"),
+            },
+            "unavailable_components": {},
+        },
+        coverage=(CoverageClaim(
+            MarketTable.INSTRUMENTS,
+            True,
+            instrument_ids=("600000.SH",),
+        ),),
+    )
+
+    with pytest.raises(DailyPipelineBlocked, match="requested scope is malformed"):
+        DailyPipeline._official_unavailable_components(
+            observed,
+            frame,
+            pending_onboarding=False,
+            component_closure_validated=True,
+        )
+
+
 def test_daily_tampered_partial_official_frame_lineage_blocks_without_state_change(
     tmp_path, monkeypatch,
 ):

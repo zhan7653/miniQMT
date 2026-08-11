@@ -1341,6 +1341,18 @@ class DailyPipeline:
             )
         normalized = {str(component): dict(detail) for component, detail in raw.items()}
 
+        requested_scope = observed.source_metadata.get("requested_scope")
+        if (
+            not isinstance(requested_scope, Mapping)
+            or set(requested_scope) != {"exchanges", "asset_types"}
+            or not isinstance(requested_scope["exchanges"], (list, tuple))
+            or not isinstance(requested_scope["asset_types"], (list, tuple))
+            or set(requested_scope["exchanges"]) != {"SH", "SZ"}
+            or set(requested_scope["asset_types"]) != {"stock", "etf"}
+        ):
+            raise DailyPipelineBlocked(
+                "universe", "official universe requested scope is malformed"
+            )
         if "instrument_id" not in frame.columns:
             raise DailyPipelineBlocked(
                 "universe", "official universe frame lacks instrument identity"
@@ -1364,14 +1376,9 @@ class DailyPipeline:
                 },
             )
         if not component_closure_validated:
-            requested_scope = observed.source_metadata.get("requested_scope")
             required_columns = {"instrument_id", "exchange", "asset_type", "board"}
             if (
-                not isinstance(requested_scope, Mapping)
-                or set(requested_scope) != {"exchanges", "asset_types"}
-                or set(requested_scope.get("exchanges", ())) != {"SH", "SZ"}
-                or set(requested_scope.get("asset_types", ())) != {"stock", "etf"}
-                or not required_columns <= set(frame.columns)
+                not required_columns <= set(frame.columns)
             ):
                 raise DailyPipelineBlocked(
                     "universe", "legacy official universe scope is malformed"
