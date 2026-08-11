@@ -24,12 +24,12 @@ from fundlab.marketdata import (
     ProviderRegistry,
     ProviderRequest,
     SnapshotPlan,
-    SnapshotNotReadyError,
     SourceSlice,
     TradeRuleError,
     UniverseScope,
 )
 from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
+from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
 from fundlab.marketdata.schema import empty_table
 from fundlab.marketdata.sources.cninfo import (
     CninfoAnnouncementPageEvidence,
@@ -40,6 +40,8 @@ from fundlab.pipeline import DailyPipeline
 from fundlab.pipeline.daily import (
     DailyPipelineBlocked,
     DailyRunResult,
+    DailyStage,
+    PIPELINE_VERSION,
 )
 from fundlab.settings import (
     AgentPolicySettings,
@@ -118,17 +120,295 @@ def test_degraded_daily_result_is_success_without_instrument_count_cutoff():
     }) == {"510050.SH"}
 
 
+def test_daily_report_half_publish_recovers_then_runs_requested_business(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    stage = DailyStage("accounts", "skipped", {"reason": "test"})
+    real_publish = daily_module.publish_immutable_bytes
+    fail_json = True
+
+    def publish(path, payload):
+        if fail_json and path.suffix == ".json":
+            raise OSError("simulated JSON commit failure")
+        real_publish(path, payload)
+
+    monkeypatch.setattr(daily_module, "publish_immutable_bytes", publish)
+    with pytest.raises(OSError, match="JSON commit failure"):
+        pipeline._write_report("ok", FUTURE_DAYS[0], "snap-test", [stage], [])
+
+    assert not list(pipeline.daily_report_root.glob("daily-*.json"))
+    pending_name = next(
+        (pipeline.daily_report_root / ".pending").glob("daily-*.json")
+    ).name
+    fail_json = False
+    advanced = []
+    monkeypatch.setattr(
+        pipeline, "_advance_accounts", lambda stages: advanced.append(stages) or [],
+    )
+    result = pipeline.run(target_date=FUTURE_DAYS[1], skip_data=True)
+
+    old_report = pipeline.daily_report_root / pending_name
+    assert old_report.exists()
+    assert result.status == "ok"
+    assert result.target_date == FUTURE_DAYS[1]
+    assert result.report_path is not None and result.report_path != old_report
+    assert len(advanced) == 1
+    assert not list((pipeline.daily_report_root / ".pending").glob("daily-*"))
+
+
+def test_daily_report_missing_pending_markdown_recovers_without_public_json(
+    tmp_path, monkeypatch,
+):
+    import fundlab.pipeline.daily as daily_module
+
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    real_stage = daily_module.atomic_replace_bytes
+    fail_markdown = True
+
+    def stage(path, payload):
+        if fail_markdown and path.suffix == ".md":
+            raise OSError("simulated pending markdown failure")
+        real_stage(path, payload)
+
+    monkeypatch.setattr(daily_module, "atomic_replace_bytes", stage)
+    with pytest.raises(OSError, match="pending markdown failure"):
+        pipeline._write_report("ok", FUTURE_DAYS[0], "snap-test", [], [])
+
+    assert not list(pipeline.daily_report_root.glob("daily-*.json"))
+    assert list((pipeline.daily_report_root / ".pending").glob("daily-*.json"))
+    fail_markdown = False
+    result = pipeline.run(target_date=FUTURE_DAYS[1], skip_data=True, skip_accounts=True)
+
+    assert result.target_date == FUTURE_DAYS[1]
+    assert result.report_path is not None and result.report_path.exists()
+
+
+def test_daily_run_finalizes_all_verified_pending_reports_then_continues(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    real_publish = daily_module.publish_immutable_bytes
+    fail_json = True
+
+    def publish(path, payload):
+        if fail_json and path.suffix == ".json":
+            raise OSError("simulated JSON commit failure")
+        real_publish(path, payload)
+
+    monkeypatch.setattr(daily_module, "publish_immutable_bytes", publish)
+    for target in FUTURE_DAYS[:2]:
+        with pytest.raises(OSError, match="JSON commit failure"):
+            pipeline._write_report("ok", target, "snap-test", [], [])
+    pending_names = {
+        path.name for path in (pipeline.daily_report_root / ".pending").glob("daily-*.json")
+    }
+    assert len(pending_names) == 2
+
+    fail_json = False
+    advanced = []
+    monkeypatch.setattr(
+        pipeline, "_advance_accounts", lambda stages: advanced.append(stages) or [],
+    )
+    result = pipeline.run(target_date=FUTURE_DAYS[-1], skip_data=True)
+
+    assert result.target_date == FUTURE_DAYS[-1]
+    assert len(advanced) == 1
+    assert not list((pipeline.daily_report_root / ".pending").glob("daily-*"))
+    assert pending_names <= {
+        path.name for path in pipeline.daily_report_root.glob("daily-*.json")
+    }
+
+
+def test_daily_run_repairs_missing_or_corrupt_markdown_from_json(tmp_path):
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    path = pipeline._write_report("ok", None, "snap-test", [], [])
+    markdown = path.with_suffix(".md")
+    markdown.write_bytes(b"corrupt")
+
+    pipeline.run(skip_data=True, skip_accounts=True)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert markdown.read_text(encoding="utf-8") == pipeline._markdown_summary(payload)
+
+
+def test_daily_run_repairs_pending_current_report_markdown_after_json_commit(tmp_path):
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    committed_json = pipeline._write_report("ok", FUTURE_DAYS[0], "snap-test", [], [])
+    committed_markdown = committed_json.with_suffix(".md")
+    pending_json = pipeline.daily_report_root / ".pending" / committed_json.name
+    pending_json.parent.mkdir(parents=True, exist_ok=True)
+    pending_json.write_bytes(committed_json.read_bytes())
+    committed_markdown.write_bytes(b"corrupt")
+
+    result = pipeline.run(target_date=FUTURE_DAYS[1], skip_data=True, skip_accounts=True)
+
+    payload = json.loads(committed_json.read_text(encoding="utf-8"))
+    assert result.target_date == FUTURE_DAYS[1]
+    assert committed_markdown.read_text(encoding="utf-8") == pipeline._markdown_summary(payload)
+    assert not pending_json.exists()
+
+
+def test_daily_run_accepts_v1_published_report_and_writes_current_report(tmp_path):
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    legacy_payload = {
+        "pipeline": "daily-pipeline-v1",
+        "generated_at": evening_of(FUTURE_DAYS[0]).isoformat(),
+        "status": "ok",
+        "target_date": FUTURE_DAYS[0].isoformat(),
+        "snapshot_id": "snap-legacy",
+        "stages": [{"name": "data", "status": "up_to_date", "detail": {}}],
+        "accounts": [],
+    }
+    json_name, markdown_name = pipeline._report_filename(legacy_payload)
+    legacy_json = pipeline.daily_report_root / json_name
+    legacy_json.parent.mkdir(parents=True)
+    legacy_json.write_bytes((canonical_json(legacy_payload) + "\n").encode("utf-8"))
+    legacy_markdown = pipeline.daily_report_root / markdown_name
+    legacy_markdown.write_bytes(b"corrupt")
+
+    result = pipeline.run(target_date=FUTURE_DAYS[1], skip_data=True, skip_accounts=True)
+
+    assert result.target_date == FUTURE_DAYS[1]
+    assert json.loads(result.report_path.read_text(encoding="utf-8"))["pipeline"] == PIPELINE_VERSION
+    assert legacy_markdown.read_text(encoding="utf-8") == pipeline._markdown_summary(legacy_payload)
+
+
+def test_daily_run_rejects_corrupt_current_published_report(tmp_path):
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    path = pipeline._write_report("ok", None, "snap-test", [], [])
+    corrupt = json.loads(path.read_text(encoding="utf-8"))
+    corrupt["status"] = "blocked"
+    path.write_text(canonical_json(corrupt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="filename or payload verification failed"):
+        pipeline.run(target_date=FUTURE_DAYS[1], skip_data=True, skip_accounts=True)
+
+
+def test_daily_run_rejects_unverified_pending_report(tmp_path):
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    pending = pipeline.daily_report_root / ".pending"
+    pending.mkdir(parents=True)
+    (pending / "daily-unknown-0000000000.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid daily report payload"):
+        pipeline.run(skip_data=True, skip_accounts=True)
+
+
+def test_daily_unexpected_business_exception_writes_blocked_report(tmp_path, monkeypatch):
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    monkeypatch.setattr(
+        pipeline, "_validated_calendar",
+        lambda _start: (_ for _ in ()).throw(RuntimeError("unexpected provider bug")),
+    )
+
+    result = pipeline.run(skip_accounts=True)
+
+    assert result.status == "blocked" and result.exit_code == 2
+    assert result.stages[-1].name == "run"
+    assert result.stages[-1].detail["error_type"] == "RuntimeError"
+    assert result.report_path is not None
+    assert json.loads(result.report_path.read_text(encoding="utf-8"))["status"] == "blocked"
+
+
+def test_daily_report_commit_failure_does_not_return_success_result(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    real_publish = daily_module.publish_immutable_bytes
+
+    def fail_json(path, payload):
+        if path.suffix == ".json":
+            raise OSError("cannot commit report JSON")
+        real_publish(path, payload)
+
+    monkeypatch.setattr(daily_module, "publish_immutable_bytes", fail_json)
+    with pytest.raises(OSError, match="cannot commit report JSON"):
+        pipeline.run(skip_data=True, skip_accounts=True)
+    assert not list(pipeline.daily_report_root.glob("daily-*.json"))
+
+
+def test_daily_report_repeated_content_is_immutable_and_idempotent(tmp_path):
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    stage = DailyStage("accounts", "skipped", {"reason": "test"})
+
+    first = pipeline._write_report("ok", FUTURE_DAYS[0], "snap-test", [stage], [])
+    second = pipeline._write_report("ok", FUTURE_DAYS[0], "snap-test", [stage], [])
+
+    assert first == second
+    assert len(list(pipeline.daily_report_root.glob("daily-*.json"))) == 1
+    assert len(list(pipeline.daily_report_root.glob("daily-*.md"))) == 1
+
+
+def test_daily_run_recovers_eod_receipts_even_when_data_is_up_to_date(
+    tmp_path, monkeypatch,
+):
+    import fundlab.pipeline.daily as daily_module
+
+    ready_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    recovered: list[Path] = []
+
+    def recover(builder):
+        recovered.append(builder.report_root)
+
+    monkeypatch.setattr(
+        daily_module.SimulationSnapshotBuilder, "recover_pending_reports", recover,
+    )
+
+    result = pipeline.run(skip_data=True, skip_accounts=True)
+
+    assert result.exit_code == 0
+    assert recovered == [pipeline.report_root]
+
+
 def test_no_trade_active_source_conflict_becomes_bounded_quarantine(monkeypatch):
     import fundlab.marketdata.history as history_module
     import fundlab.pipeline.daily as daily_module
 
     target = ("510050.SH", "600000.SH")
     pipeline = object.__new__(DailyPipeline)
-    pipeline.warehouse = SimpleNamespace()
-    pipeline.ingestion = SimpleNamespace(
-        capture_resumable=lambda provider, request: (
-            SimpleNamespace(observation_id=f"obs-{provider}"), False,
+    pipeline.warehouse = SimpleNamespace(
+        matching_observations=lambda **kwargs: (),
+        record_observation=lambda payload: SimpleNamespace(
+            observation_id=f"obs-{payload['provider']}"
         ),
+    )
+    pipeline.registry = SimpleNamespace(
+        observe=lambda provider, request: {"provider": provider, "request": request},
     )
     monkeypatch.setattr(
         daily_module, "find_no_trade_research_partition", lambda *args, **kwargs: None,
@@ -468,6 +748,273 @@ def test_daily_run_skips_persistently_paused_account(tmp_path):
     assert repository.account(account.account_id).selected_run_id is None
 
 
+@pytest.mark.parametrize("statuses", [
+    ("ok", "blocked"),
+    ("blocked", "ok"),
+])
+def test_accounts_stage_degrades_when_one_real_account_commits_and_one_blocks(
+    tmp_path, monkeypatch, statuses,
+):
+    import fundlab.pipeline.daily as daily_module
+
+    accounts = tuple(
+        DailyAccountSettings(
+            f"paper-{index}", f"Paper {index}", Decimal("100000"), "static",
+            {"600000.SH": Decimal("0.5")},
+        )
+        for index in range(2)
+    )
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE, DAYS[-1], DAYS[0], DAYS[-1],
+        instrument_ids=_DAILY_BASE_IDS,
+    )
+    market = SimpleNamespace(
+        snapshot_id="snapshot-published",
+        manifest=SimpleNamespace(plan=SimpleNamespace(universe_scope=scope)),
+    )
+    monkeypatch.setattr(daily_module.CanonicalMarketData, "open", lambda path: market)
+    monkeypatch.setattr(daily_module, "TradingRepository", lambda path: object())
+    monkeypatch.setattr(daily_module, "SimulationService", lambda **kwargs: object())
+    pipeline = DailyPipeline(build_settings(tmp_path, accounts))
+    responses = [
+        {
+            "account_id": account.account_id,
+            "status": status,
+            "head": DAYS[-1].isoformat() if status == "ok" else None,
+            "sessions_advanced": 1 if status == "ok" else 0,
+        }
+        for account, status in zip(accounts, statuses, strict=True)
+    ]
+    monkeypatch.setattr(pipeline, "_advance_one_account", lambda *args: responses.pop(0))
+
+    stages: list[DailyStage] = []
+    result = pipeline._advance_accounts(stages)
+
+    assert [item["status"] for item in result] == list(statuses)
+    assert stages[-1].status == "degraded"
+    assert stages[-1].detail["advanced"] == 1
+    assert len(stages[-1].detail["blocked"]) == 1
+    assert next(item for item in result if item["status"] == "ok")["head"] == DAYS[-1].isoformat()
+
+
+def test_accounts_stage_blocks_when_up_to_date_account_has_no_new_commit_and_peer_blocks(
+    tmp_path, monkeypatch,
+):
+    import fundlab.pipeline.daily as daily_module
+
+    accounts = tuple(
+        DailyAccountSettings(
+            f"paper-{index}", f"Paper {index}", Decimal("100000"), "static",
+            {"600000.SH": Decimal("0.5")},
+        )
+        for index in range(2)
+    )
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE, DAYS[-1], DAYS[0], DAYS[-1],
+        instrument_ids=_DAILY_BASE_IDS,
+    )
+    market = SimpleNamespace(
+        snapshot_id="snapshot-published",
+        manifest=SimpleNamespace(plan=SimpleNamespace(universe_scope=scope)),
+    )
+    monkeypatch.setattr(daily_module.CanonicalMarketData, "open", lambda path: market)
+    monkeypatch.setattr(daily_module, "TradingRepository", lambda path: object())
+    monkeypatch.setattr(daily_module, "SimulationService", lambda **kwargs: object())
+    pipeline = DailyPipeline(build_settings(tmp_path, accounts))
+    responses = [
+        {"account_id": accounts[0].account_id, "status": "ok", "sessions_advanced": 0},
+        {"account_id": accounts[1].account_id, "status": "blocked", "sessions_advanced": 0},
+    ]
+    monkeypatch.setattr(pipeline, "_advance_one_account", lambda *args: responses.pop(0))
+
+    stages: list[DailyStage] = []
+    pipeline._advance_accounts(stages)
+
+    assert stages[-1].status == "blocked"
+    assert stages[-1].detail["advanced"] == 0
+
+
+def test_accounts_stage_blocks_only_when_every_attempted_account_blocks(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    accounts = tuple(
+        DailyAccountSettings(
+            f"paper-{index}", f"Paper {index}", Decimal("100000"), "static",
+            {"600000.SH": Decimal("0.5")},
+        )
+        for index in range(2)
+    )
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE, DAYS[-1], DAYS[0], DAYS[-1],
+        instrument_ids=_DAILY_BASE_IDS,
+    )
+    market = SimpleNamespace(
+        snapshot_id="snapshot-published",
+        manifest=SimpleNamespace(plan=SimpleNamespace(universe_scope=scope)),
+    )
+    monkeypatch.setattr(daily_module.CanonicalMarketData, "open", lambda path: market)
+    monkeypatch.setattr(daily_module, "TradingRepository", lambda path: object())
+    monkeypatch.setattr(daily_module, "SimulationService", lambda **kwargs: object())
+    pipeline = DailyPipeline(build_settings(tmp_path, accounts))
+    monkeypatch.setattr(
+        pipeline, "_advance_one_account",
+        lambda account, *args: {"account_id": account.account_id, "status": "blocked"},
+    )
+
+    stages: list[DailyStage] = []
+    pipeline._advance_accounts(stages)
+
+    assert stages[-1].status == "blocked"
+    assert stages[-1].detail["advanced"] == 0
+
+
+def test_account_partial_sessions_and_feedback_failure_are_degraded(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    account = DailyAccountSettings(
+        "paper-partial", "Paper Partial", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+
+    class Repository:
+        def __init__(self, selected_run_id="prior"):
+            self.selected_run_id = selected_run_id
+            self.dates = {"prior": DAYS[-1]}
+
+        def account(self, account_id):
+            return SimpleNamespace(status=AccountStatus.ACTIVE)
+
+        def create_account(self, *args):  # pragma: no cover - active fixture
+            raise AssertionError("existing account must be used")
+
+        def selected_state(self, account_id):
+            return None, self.selected_run_id
+
+        def run(self, run_id):
+            return SimpleNamespace(binding=SimpleNamespace(end_date=self.dates[run_id]))
+
+    class Market:
+        def trading_days(self, start, end):
+            return (FUTURE_DAYS[0], FUTURE_DAYS[1])
+
+    class PartialService:
+        def __init__(self, repository):
+            self.repository = repository
+            self.calls = 0
+
+        def run_daily(self, account_id, session, source):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second session failed")
+            self.repository.dates["committed"] = session
+            self.repository.selected_run_id = "committed"
+            return SimpleNamespace(run=SimpleNamespace(run_id="committed"))
+
+    pipeline = DailyPipeline(build_settings(tmp_path, (account,)))
+    repository = Repository()
+    partial = pipeline._advance_one_account(
+        account, Market(), repository, PartialService(repository), FUTURE_DAYS[1],
+    )
+    assert partial["status"] == "degraded"
+    assert partial["sessions_advanced"] == 1
+    assert partial["head"] == FUTURE_DAYS[0].isoformat()
+
+    class PostCommitFailureService:
+        def __init__(self, repository):
+            self.repository = repository
+
+        def run_daily(self, account_id, session, source):
+            # Mirrors SimulationService's COMPLETE/head transaction followed
+            # by a failing verify_run call.
+            self.repository.dates["committed-after-error"] = session
+            self.repository.selected_run_id = "committed-after-error"
+            raise RuntimeError("post-promotion verification failed")
+
+    post_commit_repository = Repository()
+    post_commit = pipeline._advance_one_account(
+        account,
+        Market(),
+        post_commit_repository,
+        PostCommitFailureService(post_commit_repository),
+        FUTURE_DAYS[1],
+    )
+    assert post_commit["status"] == "degraded"
+    assert post_commit["sessions_advanced"] == 1
+    assert post_commit["head"] == FUTURE_DAYS[0].isoformat()
+    assert "post-promotion verification failed" in post_commit["error"]
+
+    class OneSessionMarket:
+        def trading_days(self, start, end):
+            return (FUTURE_DAYS[1],)
+
+    feedback_repository = Repository()
+    feedback_service = PartialService(feedback_repository)
+    monkeypatch.setattr(
+        daily_module, "build_simulation_feedback",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("feedback unavailable")),
+    )
+    feedback = pipeline._advance_one_account(
+        account, OneSessionMarket(), feedback_repository, feedback_service, FUTURE_DAYS[1],
+    )
+    assert feedback["status"] == "degraded"
+    assert feedback["sessions_advanced"] == 1
+    assert feedback["head"] == FUTURE_DAYS[1].isoformat()
+
+
+def test_account_repository_failure_does_not_create_a_replacement_account(tmp_path):
+    account = DailyAccountSettings(
+        "paper-repository", "Paper Repository", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+
+    class Repository:
+        def account(self, account_id):
+            raise RuntimeError("trading database unavailable")
+
+        def create_account(self, *args):  # pragma: no cover - must not run
+            raise AssertionError("repository fault must not create a replacement account")
+
+    pipeline = DailyPipeline(build_settings(tmp_path, (account,)))
+    result = pipeline._advance_one_account(
+        account, SimpleNamespace(), Repository(), SimpleNamespace(), FUTURE_DAYS[0],
+    )
+
+    assert result["status"] == "blocked"
+    assert result["error_type"] == "RuntimeError"
+
+
+def test_account_completed_run_without_selected_head_promotion_is_blocked(tmp_path):
+    account = DailyAccountSettings(
+        "paper-unpromoted", "Paper Unpromoted", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+
+    class Repository:
+        def account(self, account_id):
+            return SimpleNamespace(status=AccountStatus.ACTIVE)
+
+        def selected_state(self, account_id):
+            return None, "prior"
+
+        def run(self, run_id):
+            return SimpleNamespace(binding=SimpleNamespace(end_date=DAYS[-1]))
+
+    class Market:
+        def trading_days(self, start, end):
+            return (FUTURE_DAYS[0],)
+
+    class UnpromotedService:
+        def run_daily(self, account_id, session, source):
+            return SimpleNamespace(run=SimpleNamespace(run_id="complete-not-selected"))
+
+    result = DailyPipeline(build_settings(tmp_path, (account,)))._advance_one_account(
+        account, Market(), Repository(), UnpromotedService(), FUTURE_DAYS[0],
+    )
+
+    assert result["status"] == "blocked"
+    assert "without promoting" in result["error"]
+
+
 def test_daily_ma_grid_close_signal_schedules_the_next_session_without_file_lag(
     tmp_path,
 ):
@@ -516,7 +1063,21 @@ def test_daily_ma_grid_close_signal_schedules_the_next_session_without_file_lag(
 
 def test_daily_run_blocks_when_calendar_sources_disagree(tmp_path):
     ready_market(tmp_path / "market")
-    settings = build_settings(tmp_path, ())
+    account = DailyAccountSettings(
+        "paper-calendar", "Paper Calendar", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+    settings = build_settings(tmp_path, (account,))
+    healthy = DailyPipeline(
+        settings,
+        registry=registry_with_calendars(),
+        now_fn=lambda: evening_of(DAYS[-1]),
+    )
+    assert healthy.run(skip_data=True).status == "ok"
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    snapshot_before = warehouse.current_snapshot_id()
+    repository = TradingRepository(settings.paths.trading_database)
+    _, head_before = repository.selected_state(account.account_id)
     pipeline = DailyPipeline(
         settings,
         registry=registry_with_calendars(calendar_frame(extra_open=date(2026, 7, 21))),
@@ -530,6 +1091,8 @@ def test_daily_run_blocks_when_calendar_sources_disagree(tmp_path):
     assert blocked and blocked[0].detail["reason"] == "calendar sources disagree"
     assert result.report_path is not None
     assert result.snapshot_id is None
+    assert warehouse.current_snapshot_id() == snapshot_before
+    assert repository.selected_state(account.account_id)[1] == head_before
 
 
 def test_daily_run_agent_account_holds_without_decision_and_executes_with_one(tmp_path):
@@ -956,9 +1519,13 @@ class _DailyFixtureProvider:
                     },
                     "endpoint_counts": _DAILY_ENDPOINT_COUNTS,
                     "response_sha256": {
-                        endpoint: f"sha256-{endpoint}"
+                        endpoint: stable_digest({"endpoint": endpoint})
                         for endpoint in _DAILY_ENDPOINT_COUNTS
                     },
+                    "endpoint_response_counts": _DAILY_ENDPOINT_COUNTS,
+                    "unavailable_components": {},
+                    "pending_onboarding": {},
+                    "as_of_excluded_future_instrument_ids": {},
                 })
             return ObservationPayload(
                 self.name,
@@ -1119,6 +1686,271 @@ def _daily_extension_registry() -> ProviderRegistry:
     ):
         registry.register(_DailyFixtureProvider(name, capabilities))
     return registry
+
+
+_OFFICIAL_COMPONENT_SCOPES = {
+    "sh-stock-main": {"exchange": "SH", "asset_type": "stock", "board": "main"},
+    "sh-stock-star": {"exchange": "SH", "asset_type": "stock", "board": "star"},
+    "sz-stock": {"exchange": "SZ", "asset_type": "stock"},
+    "sh-etf": {"exchange": "SH", "asset_type": "etf"},
+    "sz-etf": {"exchange": "SZ", "asset_type": "etf"},
+}
+_OFFICIAL_COMPONENT_ENDPOINTS = {
+    "sh-stock-main": ("sse-main-stock-list",),
+    "sh-stock-star": ("sse-star-stock-list",),
+    "sz-stock": ("szse-a-stock-list",),
+    "sh-etf": ("sse-etf-scale-list", "sse-current-full-etf-list"),
+    "sz-etf": ("szse-etf-scale-daily", "szse-current-etf-list"),
+}
+
+
+def _daily_component_for_row(row: dict[str, object]) -> str:
+    exchange = str(row["exchange"])
+    asset_type = str(row["asset_type"])
+    if exchange == "SH" and asset_type == "stock":
+        return f"sh-stock-{row['board']}"
+    if exchange == "SZ" and asset_type == "stock":
+        return "sz-stock"
+    if exchange == "SH" and asset_type == "etf":
+        return "sh-etf"
+    if exchange == "SZ" and asset_type == "etf":
+        return "sz-etf"
+    raise AssertionError(f"unexpected fixture component row: {row}")
+
+
+def _fixture_component_closure(
+    frame: pd.DataFrame,
+    metadata: dict[str, object],
+    unavailable_components: tuple[str, ...],
+) -> pd.DataFrame:
+    """Build a contract-valid closure for the small daily exchange fixture."""
+
+    frame = frame.copy()
+    successful = tuple(
+        component for component in _OFFICIAL_COMPONENT_SCOPES
+        if component not in unavailable_components
+    )
+    admitted_by_component = {
+        component: tuple(sorted(map(
+            str,
+            frame.loc[frame.apply(
+                lambda row: _daily_component_for_row(row.to_dict()) == component,
+                axis=1,
+            ), "instrument_id"],
+        )))
+        for component in successful
+    }
+    authoritative_endpoint = {
+        "sh-stock-main": "sse-main-stock-list",
+        "sh-stock-star": "sse-star-stock-list",
+        "sz-stock": "szse-a-stock-list",
+        "sh-etf": "sse-current-full-etf-list",
+        "sz-etf": "szse-etf-scale-daily",
+    }
+    response_hashes = metadata["response_sha256"]
+    endpoint_counts = metadata["endpoint_counts"]
+    response_counts = metadata["endpoint_response_counts"]
+    assert isinstance(response_hashes, dict)
+    assert isinstance(endpoint_counts, dict)
+    assert isinstance(response_counts, dict)
+    for index, row in frame.iterrows():
+        component = _daily_component_for_row(row.to_dict())
+        endpoint = authoritative_endpoint[component]
+        frame.at[index, "field_lineage"] = canonical_json({
+            "endpoint": endpoint,
+            "upstream": "exchange-public",
+            "response_sha256": response_hashes[endpoint],
+        })
+    closure: dict[str, object] = {}
+    partition_names = (
+        "admitted", "pending_onboarding", "future_as_of", "duplicate_identity",
+        "membership_conflict", "intentionally_out_of_component",
+    )
+    for component in successful:
+        admitted_ids = admitted_by_component[component]
+        endpoints = _OFFICIAL_COMPONENT_ENDPOINTS[component]
+        membership: dict[str, object] = {}
+        for endpoint in endpoints:
+            partitions = {
+                name: [] for name in partition_names
+            }
+            partitions["admitted"] = list(admitted_ids)
+            product_values = (
+                {instrument_id: "03" for instrument_id in admitted_ids}
+                if endpoint == "sse-current-full-etf-list" else
+                {instrument_id: "ETF" for instrument_id in admitted_ids}
+                if endpoint == "szse-current-etf-list" else {}
+            )
+            membership[endpoint] = {
+                "response_sha256": response_hashes[endpoint],
+                "raw_row_count": response_counts[endpoint],
+                "effective_row_count": endpoint_counts[endpoint],
+                "raw_ids": list(admitted_ids),
+                "duplicate_row_count": 0,
+                "duplicate_occurrences": {},
+                "authoritative_for_master": endpoint == authoritative_endpoint[component],
+                "comparison_product_class_filtered_ids": [],
+                "comparison_product_class_values": product_values,
+                "admission_partitions": partitions,
+            }
+        closure[component] = {
+            "component": component,
+            "scope": _OFFICIAL_COMPONENT_SCOPES[component],
+            "endpoints": list(endpoints),
+            "admitted_ids": list(admitted_ids),
+            "endpoint_membership": membership,
+        }
+        if component in {"sh-etf", "sz-etf"}:
+            left, right = endpoints
+            comparable = list(admitted_ids)
+            closure[component]["intersection"] = {
+                "left_endpoint": left,
+                "right_endpoint": right,
+                "left_comparable_ids": comparable,
+                "right_comparable_ids": comparable,
+                "intersection_ids": comparable,
+                "membership_conflict_ids": [],
+            }
+    metadata["component_closure"] = closure
+    return frame
+
+
+def _install_official_component_outage(monkeypatch, registry, components: tuple[str, ...]):
+    provider = registry.provider("exchange-public")
+    original_observe = provider.observe
+
+    def partial_observe(request: ProviderRequest) -> ObservationPayload:
+        payload = original_observe(request)
+        if request.capability is not ProviderCapability.INSTRUMENTS:
+            return payload
+        frame = payload.tables[MarketTable.INSTRUMENTS]
+        filtered = frame.loc[
+            ~frame.apply(
+                lambda row: _daily_component_for_row(row.to_dict()) in components,
+                axis=1,
+            )
+        ].copy().reset_index(drop=True)
+        metadata = dict(payload.source_metadata)
+        metadata["unavailable_components"] = {
+            component: {
+                "component": component,
+                "scope": _OFFICIAL_COMPONENT_SCOPES[component],
+                "endpoints": list(_OFFICIAL_COMPONENT_ENDPOINTS[component]),
+                "failed_endpoint": _OFFICIAL_COMPONENT_ENDPOINTS[component][0],
+                "error_type": "ProviderUnavailableError",
+                "message": f"fixture unavailable: {component}",
+            }
+            for component in components
+        }
+        unavailable_endpoints = {
+            endpoint
+            for component in components
+            for endpoint in _OFFICIAL_COMPONENT_ENDPOINTS[component]
+        }
+        for evidence_key in (
+            "response_sha256", "endpoint_counts", "endpoint_response_counts",
+        ):
+            metadata[evidence_key] = {
+                endpoint: value
+                for endpoint, value in metadata[evidence_key].items()
+                if endpoint not in unavailable_endpoints
+            }
+        filtered = _fixture_component_closure(filtered, metadata, components)
+        coverage = tuple(
+            CoverageClaim(
+                claim.table,
+                False if claim.table is MarketTable.INSTRUMENTS else claim.complete,
+                claim.start_date,
+                claim.end_date,
+                tuple(map(str, filtered["instrument_id"])),
+                claim.detail,
+            ) if claim.table is MarketTable.INSTRUMENTS else claim
+            for claim in payload.coverage
+        )
+        return ObservationPayload(
+            payload.provider,
+            payload.observed_at,
+            payload.request,
+            {MarketTable.INSTRUMENTS: filtered},
+            coverage,
+            metadata,
+        )
+
+    monkeypatch.setattr(provider, "observe", partial_observe)
+
+
+def _install_daily_etf_detail_client(monkeypatch) -> None:
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened, "secuCategory": category,
+                "PreClose": 10.0, "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0, "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module,
+        "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(report_root, client=EtfDetailClient()),
+    )
+
+
+def _install_new_stock_direct_limit_evidence(monkeypatch, registry) -> None:
+    """Keep the component-outage test focused on universe scope, not limits."""
+
+    for provider_name in ("xtquant", "eastmoney-efinance"):
+        provider = registry.provider(provider_name)
+        original_observe = provider.observe
+
+        def observe(request: ProviderRequest, *, original_observe=original_observe):
+            payload = original_observe(request)
+            if (
+                request.capability is not ProviderCapability.DAILY_STATUS
+                or not request.parameters.get("instrument_limit_snapshot")
+                or _DAILY_NEW_ID not in request.instrument_ids
+            ):
+                return payload
+            frame = payload.tables[MarketTable.DAILY_BARS].copy()
+            new_rows = frame["instrument_id"].astype(str).eq(_DAILY_NEW_ID)
+            previous = frame.loc[new_rows, "previous_close"]
+            frame.loc[new_rows, "limit_up"] = previous * 1.10
+            frame.loc[new_rows, "limit_down"] = previous * 0.90
+            metadata = dict(payload.source_metadata)
+            hashes = dict(metadata.get("response_sha256", {}))
+            hashes[_DAILY_NEW_ID] = f"sha256-limit-{_DAILY_NEW_ID}"
+            metadata["response_sha256"] = hashes
+            errors = dict(metadata.get("request_errors", {}))
+            errors.pop(_DAILY_NEW_ID, None)
+            metadata["request_errors"] = errors
+            coverage = tuple(
+                CoverageClaim(
+                    claim.table,
+                    True,
+                    claim.start_date,
+                    claim.end_date,
+                    claim.instrument_ids,
+                    claim.detail,
+                ) if claim.table is MarketTable.DAILY_BARS else claim
+                for claim in payload.coverage
+            )
+            return ObservationPayload(
+                payload.provider,
+                payload.observed_at,
+                payload.request,
+                {MarketTable.DAILY_BARS: frame},
+                coverage,
+                metadata,
+            )
+
+        monkeypatch.setattr(provider, "observe", observe)
 
 
 def _ready_multi_asset_market(path) -> None:
@@ -1310,7 +2142,7 @@ def test_daily_new_listing_supplement_fails_closed_without_two_source_evidence(t
         build_settings(tmp_path, ()), registry=registry_with_calendars(),
     )
 
-    with pytest.raises(DailyPipelineBlocked, match="exact reconciled partition"):
+    with pytest.raises(TradeRuleError, match="exact reconciled partition") as exc_info:
         pipeline._build_new_instrument_supplement(
             builder=Builder(),
             universe_observation_id="obs-exchange-official",
@@ -1319,6 +2151,422 @@ def test_daily_new_listing_supplement_fails_closed_without_two_source_evidence(t
             start=FUTURE_DAYS[0],
             end=FUTURE_DAYS[0],
         )
+    assert exc_info.value.instrument_ids == ("688825.SH",)
+
+
+def test_daily_incomplete_new_listing_supplement_is_exactly_quarantined(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened, "secuCategory": category,
+                "PreClose": 10.0, "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0, "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module, "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(report_root, client=EtfDetailClient()),
+    )
+    report = tmp_path / "incomplete-new-listing.json"
+    report.write_text(json.dumps({
+        "included_instrument_ids": [],
+        "excluded": {_DAILY_NEW_ID: ["missing_source:xtquant"]},
+        "canonical_observation_ids": [],
+    }), encoding="utf-8")
+    real_build = daily_module.HistoryDatabaseBuilder.build
+
+    def incomplete_supplement(self, spec, **kwargs):
+        if spec.instrument_ids == (_DAILY_NEW_ID,):
+            return SimpleNamespace(
+                report=report,
+                snapshot_id=None,
+                blockers=("excluded_instruments:1",),
+                build_id="incomplete-new-listing",
+            )
+        return real_build(self, spec, **kwargs)
+
+    monkeypatch.setattr(daily_module.HistoryDatabaseBuilder, "build", incomplete_supplement)
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded"
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        instrument_ids=(_DAILY_NEW_ID,),
+        table=MarketTable.DAILY_BARS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert rows.iloc[0]["trade_rule_id"] == DATA_GAP_QUARANTINE_RULE_ID
+
+
+def test_daily_new_listing_supplement_persistence_failure_remains_globally_blocked(
+    tmp_path, monkeypatch,
+):
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata import IntegrityError
+
+    _install_daily_etf_detail_client(monkeypatch)
+    real_build = daily_module.HistoryDatabaseBuilder.build
+
+    def persistence_failure(self, spec, **kwargs):
+        if spec.instrument_ids == (_DAILY_NEW_ID,):
+            raise IntegrityError("canonical supplement observation write failed")
+        return real_build(self, spec, **kwargs)
+
+    monkeypatch.setattr(
+        daily_module.HistoryDatabaseBuilder, "build", persistence_failure,
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    before = pipeline.warehouse.current_snapshot_id()
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    blocked = next(stage for stage in result.stages if stage.name == "new_instruments")
+    assert blocked.detail["error_type"] == "IntegrityError"
+    assert pipeline.warehouse.current_snapshot_id() == before
+
+
+def test_daily_all_exact_history_exclusions_publish_data_gap_quarantine(tmp_path, monkeypatch):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.contracts import DATA_GAP_QUARANTINE_RULE_ID
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened, "secuCategory": category,
+                "PreClose": 10.0, "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0, "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module, "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(report_root, client=EtfDetailClient()),
+    )
+    report = tmp_path / "all-excluded-history.json"
+    report.write_text(json.dumps({
+        "included_instrument_ids": [],
+        "excluded": {
+            instrument_id: ["provider_unavailable:bounded"]
+            for instrument_id in (*_DAILY_BASE_IDS, _DAILY_NEW_ID)
+        },
+        "canonical_observation_ids": [],
+    }), encoding="utf-8")
+
+    def all_excluded(self, spec, **kwargs):
+        return SimpleNamespace(
+            report=report, snapshot_id=None, blockers=("all sources unavailable",),
+            build_id="all-excluded-history",
+        )
+
+    monkeypatch.setattr(daily_module.HistoryDatabaseBuilder, "build", all_excluded)
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded" and result.exit_code == 0, [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    assert result.snapshot_id is not None
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot, MarketTable.DAILY_BARS, start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0], price_mode="raw",
+    )
+    assert set(rows["instrument_id"].astype(str)) == {*_DAILY_BASE_IDS, _DAILY_NEW_ID}
+    assert set(rows["trade_rule_id"].astype(str)) == {DATA_GAP_QUARANTINE_RULE_ID}
+
+
+def test_daily_malformed_history_exclusion_scope_remains_blocked(tmp_path, monkeypatch):
+    import fundlab.pipeline.daily as daily_module
+
+    report = tmp_path / "malformed-history.json"
+    report.write_text(json.dumps({
+        "included_instrument_ids": [],
+        "excluded": {"600000.SH": ["provider_unavailable:bounded"]},
+        "canonical_observation_ids": [],
+    }), encoding="utf-8")
+
+    def malformed(self, spec, **kwargs):
+        return SimpleNamespace(
+            report=report, snapshot_id=None, blockers=("bad report",),
+            build_id="malformed-history",
+        )
+
+    monkeypatch.setattr(daily_module.HistoryDatabaseBuilder, "build", malformed)
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    before = pipeline.warehouse.current_snapshot_id()
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    assert next(stage for stage in result.stages if stage.name == "bars").status == "blocked"
+    assert pipeline.warehouse.current_snapshot_id() == before
+
+
+def test_daily_new_listing_without_trusted_metadata_stays_pending_onboarding(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened, "secuCategory": category,
+                "PreClose": 10.0, "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0, "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module, "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(report_root, client=EtfDetailClient()),
+    )
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    real_official = pipeline._official_universe
+
+    def incomplete_new_master(target, *, predecessor):
+        resolved = real_official(target, predecessor=predecessor)
+        frame = resolved.frame.copy()
+        new_row = frame["instrument_id"].eq(_DAILY_NEW_ID)
+        frame.loc[new_row, "asset_type"] = "etf"
+        frame.loc[new_row, "exchange_product_class"] = None
+        return replace(resolved, frame=frame)
+
+    monkeypatch.setattr(pipeline, "_official_universe", incomplete_new_master)
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert tuple(universe.detail["pending_onboarding"]) == (_DAILY_NEW_ID,)
+    assert universe.detail["pending_onboarding"][_DAILY_NEW_ID]["missing_fields"] == (
+        "exchange_product_class",
+    )
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert _DAILY_NEW_ID not in snapshot.plan.universe_scope.instrument_ids
+
+
+def test_daily_pending_onboarding_and_exact_no_trade_do_not_block_publication(
+    tmp_path, monkeypatch,
+):
+    _install_daily_etf_detail_client(monkeypatch)
+    real_official = _daily_official_instruments
+    real_bars = _daily_increment_bars
+    no_trade_id = "600000.SH"
+    carried_id = "000001.SZ"
+
+    def official_with_future_listing():
+        frame = real_official().copy()
+        frame.loc[
+            frame["instrument_id"].eq(_DAILY_NEW_ID), "listed_date"
+        ] = FUTURE_DAYS[1].isoformat()
+        return frame.loc[
+            ~frame["instrument_id"].eq(carried_id)
+        ].reset_index(drop=True)
+
+    def bars_without_exact_no_trade_candidate(request):
+        frame = real_bars(request)
+        return frame.loc[
+            ~frame["instrument_id"].astype(str).eq(no_trade_id)
+        ].reset_index(drop=True)
+
+    monkeypatch.setitem(globals(), "_daily_official_instruments", official_with_future_listing)
+    monkeypatch.setitem(globals(), "_daily_increment_bars", bars_without_exact_no_trade_candidate)
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded" and result.exit_code == 0, [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    assert result.snapshot_id is not None
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert tuple(universe.detail["pending_onboarding"]) == (_DAILY_NEW_ID,)
+    pending_manifest = pipeline.warehouse.load_observation(
+        universe.detail["universe_observation_id"]
+    )
+    carry_manifest = pipeline.warehouse.load_observation(
+        pending_manifest.request.parameters["official_observation_id"]
+    )
+    assert carry_manifest.provider == "canonical-universe-carry-forward-daily-pipeline-v2"
+    assert (
+        carry_manifest.request.parameters["reason"]
+        == "official_universe_removed_predecessor_instruments"
+    )
+    no_trade = next(stage for stage in result.stages if stage.name == "no_trade")
+    assert no_trade.status == "ok"
+    assert no_trade.detail["instruments"] == (no_trade_id,)
+    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert _DAILY_NEW_ID not in snapshot.plan.universe_scope.instrument_ids
+    assert no_trade_id in snapshot.plan.universe_scope.instrument_ids
+    assert carried_id in snapshot.plan.universe_scope.instrument_ids
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        snapshot,
+        MarketTable.DAILY_BARS,
+        instrument_ids=(no_trade_id,),
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert len(rows) == 1
+    assert pd.isna(rows.iloc[0]["open"])
+
+
+def test_daily_verified_research_missing_ids_are_repaired_with_exact_quarantine(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+    import fundlab.pipeline.daily as daily_module
+    from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
+
+    class EtfDetailClient:
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            assert iscomplete
+            opened, category = {
+                "510050.SH": ("20050223", 70283376),
+                "159001.SZ": ("20060221", 3203072),
+            }[instrument_id]
+            return {
+                "OpenDate": opened, "secuCategory": category,
+                "PreClose": 10.0, "UpStopPrice": 11.0,
+                "DownStopPrice": 9.0, "PriceTick": 0.001,
+            }
+
+    monkeypatch.setattr(
+        simulation_data_module, "EtfRuleEvidenceBuilder",
+        lambda report_root: EtfRuleEvidenceBuilder(report_root, client=EtfDetailClient()),
+    )
+    real_derive = daily_module.derive_current_research_snapshot
+    derive_calls = 0
+
+    def missing_once(*args, **kwargs):
+        nonlocal derive_calls
+        result = real_derive(*args, **kwargs)
+        derive_calls += 1
+        if derive_calls == 1:
+            return replace(
+                result,
+                status="ready_scoped",
+                missing_instrument_ids=("600000.SH",),
+            )
+        return result
+
+    monkeypatch.setattr(daily_module, "derive_current_research_snapshot", missing_once)
+    _ready_multi_asset_market(tmp_path / "market")
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    research = next(stage for stage in result.stages if stage.name == "research")
+    assert research.status == "degraded"
+    assert research.detail["quarantine_instrument_ids"] == ("600000.SH",)
+
+
+def test_execution_guard_drops_duplicate_research_key_to_no_price_guard():
+    target = FUTURE_DAYS[0]
+    instruments = _daily_base_instruments()
+    duplicate_rows = pd.DataFrame([
+        {
+            "instrument_id": "600000.SH",
+            "session_date": target.isoformat(),
+            "price_mode": "raw",
+            "open": 10.0,
+            "high": 10.1,
+            "low": 9.9,
+            "close": 10.0,
+        },
+        {
+            "instrument_id": "600000.SH",
+            "session_date": target.isoformat(),
+            "price_mode": "raw",
+            "open": 20.0,
+            "high": 20.1,
+            "low": 19.9,
+            "close": 20.0,
+        },
+    ])
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE, target, target, target,
+        instrument_ids=("600000.SH",),
+    )
+
+    bars = DailyPipeline._build_execution_guard_bars(
+        instruments=instruments,
+        research_bars=duplicate_rows,
+        calendar=_daily_calendar(),
+        scope=scope,
+        instrument_ids=("600000.SH",),
+        reasons={"600000.SH": ("status:source_gap",)},
+        source_observation_id="obs-source",
+    )
+
+    row = bars.iloc[0]
+    assert row["trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert pd.isna(row["open"]) and pd.isna(row["close"])
+    lineage = json.loads(row["field_lineage"])
+    assert lineage["duplicate_research_price_key"] is True
+    assert "duplicate_research_price_key" in lineage["reasons"]
 
 
 def test_daily_new_listing_runs_through_componentized_increment_and_publication(
@@ -1434,7 +2682,6 @@ def test_daily_preserves_price_and_disables_execution_for_evidence_gap(
 ):
     import fundlab.marketdata.simulation_data as simulation_data_module
     import fundlab.pipeline.daily as daily_module
-    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
 
     class EtfDetailClient:
@@ -1539,7 +2786,6 @@ def test_daily_preserves_price_and_disables_execution_for_evidence_gap(
 
 def test_daily_factor_failure_guards_only_named_instrument(tmp_path, monkeypatch):
     import fundlab.marketdata.simulation_data as simulation_data_module
-    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
 
     class EtfDetailClient:
@@ -1579,8 +2825,9 @@ def test_daily_factor_failure_guards_only_named_instrument(tmp_path, monkeypatch
         ids = set(map(str, kwargs["instruments"]["instrument_id"]))
         if not failed and "600000.SH" in ids:
             failed = True
-            raise SnapshotNotReadyError(
-                "factor evidence unavailable: 600000.SH/2026-07-17"
+            raise TradeRuleError(
+                "factor evidence unavailable",
+                instrument_ids=("600000.SH",),
             )
         return real_reconcile(**kwargs)
 
@@ -1707,10 +2954,9 @@ def test_daily_publishes_prices_with_execution_guard_when_direct_limits_are_miss
     assert EXECUTION_EVIDENCE_GAP_RULE_ID not in set(prior_rows["trade_rule_id"])
 
 
-def test_daily_status_provider_failure_preserves_prices_and_publishes(tmp_path, monkeypatch):
+def test_daily_status_collector_top_level_failure_blocks(tmp_path, monkeypatch):
     import fundlab.marketdata.simulation_data as simulation_data_module
     import fundlab.pipeline.daily as daily_module
-    from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
 
     class EtfDetailClient:
@@ -1744,7 +2990,7 @@ def test_daily_status_provider_failure_preserves_prices_and_publishes(tmp_path, 
 
         def collect(self, spec):
             if spec.provider_name == "xtquant":
-                raise RuntimeError("MiniQMT status endpoint unavailable")
+                raise ConnectionError("MiniQMT status endpoint unavailable")
             return self.delegate.collect(spec)
 
     monkeypatch.setattr(
@@ -1759,22 +3005,10 @@ def test_daily_status_provider_failure_preserves_prices_and_publishes(tmp_path, 
 
     result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
 
-    assert result.status == "degraded"
+    assert result.status == "blocked"
     status = next(stage for stage in result.stages if stage.name == "status")
-    assert status.status == "degraded"
-    assert "MiniQMT status endpoint unavailable" in status.detail["xtquant"][
-        "blockers"
-    ][0]
-    snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
-    rows = pipeline.warehouse.query_loaded_snapshot_table(
-        snapshot,
-        MarketTable.DAILY_BARS,
-        start_date=FUTURE_DAYS[0],
-        end_date=FUTURE_DAYS[0],
-        price_mode="raw",
-    )
-    assert rows[["open", "high", "low", "close"]].notna().all().all()
-    assert set(rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+    assert status.status == "blocked"
+    assert status.detail["error_type"] == "ConnectionError"
 
 
 def test_daily_etf_rule_detail_failure_guards_only_affected_etf(tmp_path, monkeypatch):
@@ -1839,7 +3073,7 @@ def test_daily_carries_last_trusted_universe_when_official_endpoint_is_unavailab
     tmp_path, monkeypatch,
 ):
     import fundlab.marketdata.simulation_data as simulation_data_module
-    from fundlab.marketdata import MarketIngestionService, ObservationError
+    from fundlab.marketdata import MarketIngestionService, ProviderUnavailableError
     from fundlab.marketdata.contracts import EXECUTION_EVIDENCE_GAP_RULE_ID
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
 
@@ -1870,7 +3104,7 @@ def test_daily_carries_last_trusted_universe_when_official_endpoint_is_unavailab
 
     def capture_with_missing_official(self, provider_name, request, *, refresh=False):
         if provider_name == "exchange-public":
-            raise ObservationError("official endpoint returned no rows")
+            raise ProviderUnavailableError("official endpoint unavailable")
         return real_capture(self, provider_name, request, refresh=refresh)
 
     monkeypatch.setattr(
@@ -1902,6 +3136,252 @@ def test_daily_carries_last_trusted_universe_when_official_endpoint_is_unavailab
     )
     assert rows[["open", "high", "low", "close"]].notna().all().all()
     assert set(rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+
+
+def test_daily_carries_and_guards_only_prior_sz_etf_for_component_outage(
+    tmp_path, monkeypatch,
+):
+    _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
+    _install_official_component_outage(monkeypatch, registry, ("sz-etf",))
+    _install_daily_etf_detail_client(monkeypatch)
+    _install_new_stock_direct_limit_evidence(monkeypatch, registry)
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert universe.status == "degraded"
+    assert tuple(universe.detail["unavailable_components"]) == ("sz-etf",)
+    assert universe.detail["removed_sample"] == ("159001.SZ",)
+    published = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert set((*_DAILY_BASE_IDS, _DAILY_NEW_ID)) == set(
+        published.plan.universe_scope.instrument_ids
+    )
+    supplement = next(stage for stage in result.stages if stage.name == "new_instruments")
+    assert supplement.status == "ok"
+    assert supplement.detail["instrument_ids"] == (_DAILY_NEW_ID,)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        published,
+        MarketTable.DAILY_BARS,
+        instrument_ids=(*_DAILY_BASE_IDS, _DAILY_NEW_ID),
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    ).set_index("instrument_id")
+    assert rows.loc["159001.SZ", "trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert all(
+        rows.loc[instrument_id, "trade_rule_id"] != EXECUTION_EVIDENCE_GAP_RULE_ID
+        for instrument_id in ("000001.SZ", "510050.SH", "600000.SH", _DAILY_NEW_ID)
+    )
+
+
+def test_daily_component_outage_without_prior_members_still_publishes_admitted_scope(
+    tmp_path, monkeypatch,
+):
+    _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
+    _install_official_component_outage(monkeypatch, registry, ("sh-stock-star",))
+    _install_daily_etf_detail_client(monkeypatch)
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert universe.detail["unavailable_components"]["sh-stock-star"]["scope"] == {
+        "exchange": "SH", "asset_type": "stock", "board": "star",
+    }
+    assert universe.detail["carried_instruments"] == 0
+    published = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert set(published.plan.universe_scope.instrument_ids) == set(_DAILY_BASE_IDS)
+
+
+def test_daily_all_unavailable_official_components_carry_and_guard_prior_scope(
+    tmp_path, monkeypatch,
+):
+    _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
+    _install_official_component_outage(
+        monkeypatch, registry, tuple(_OFFICIAL_COMPONENT_SCOPES),
+    )
+    _install_daily_etf_detail_client(monkeypatch)
+    pipeline = DailyPipeline(
+        build_settings(tmp_path, ()), registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "degraded", [
+        (stage.name, stage.status, stage.detail) for stage in result.stages
+    ]
+    universe = next(stage for stage in result.stages if stage.name == "universe")
+    assert universe.status == "degraded"
+    assert set(universe.detail["unavailable_components"]) == set(_OFFICIAL_COMPONENT_SCOPES)
+    assert set(universe.detail["removed_sample"]) == set(_DAILY_BASE_IDS)
+    published = pipeline.warehouse.load_snapshot(result.snapshot_id)
+    assert set(published.plan.universe_scope.instrument_ids) == set(_DAILY_BASE_IDS)
+    rows = pipeline.warehouse.query_loaded_snapshot_table(
+        published,
+        MarketTable.DAILY_BARS,
+        instrument_ids=_DAILY_BASE_IDS,
+        start_date=FUTURE_DAYS[0],
+        end_date=FUTURE_DAYS[0],
+        price_mode="raw",
+    )
+    assert set(rows["trade_rule_id"]) == {EXECUTION_EVIDENCE_GAP_RULE_ID}
+
+
+def test_daily_unknown_official_universe_observation_error_blocks_without_carry_forward(
+    tmp_path, monkeypatch,
+):
+    from fundlab.marketdata import MarketIngestionService, ObservationError
+
+    _ready_multi_asset_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "paper-official-parser", "Official Parser", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+    settings = build_settings(tmp_path, (account,))
+    pipeline = DailyPipeline(
+        settings, registry=_daily_extension_registry(),
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    assert pipeline.run(target_date=FUTURE_DAYS[0], skip_data=True).status == "ok"
+    before = pipeline.warehouse.current_snapshot_id()
+    repository = TradingRepository(settings.paths.trading_database)
+    _, head_before = repository.selected_state(account.account_id)
+    assert head_before is not None
+    real_capture = MarketIngestionService.capture_resumable
+
+    def malformed_official(self, provider_name, request, *, refresh=False):
+        if provider_name == "exchange-public":
+            raise ObservationError("instruments has unknown columns: bogus")
+        return real_capture(self, provider_name, request, refresh=refresh)
+
+    monkeypatch.setattr(MarketIngestionService, "capture_resumable", malformed_official)
+
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    blocked = next(stage for stage in result.stages if stage.name == "universe")
+    assert blocked.detail["error_type"] == "ObservationError"
+    assert pipeline.warehouse.current_snapshot_id() == before
+    assert repository.selected_state(account.account_id)[1] == head_before
+
+
+def test_daily_tampered_official_endpoint_evidence_blocks_without_state_change(
+    tmp_path, monkeypatch,
+):
+    _ready_multi_asset_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "paper-official-evidence", "Official Evidence", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+    settings = build_settings(tmp_path, (account,))
+    registry = _daily_extension_registry()
+    _install_official_component_outage(monkeypatch, registry, ("sz-etf",))
+    pipeline = DailyPipeline(
+        settings, registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    assert pipeline.run(target_date=FUTURE_DAYS[0], skip_data=True).status == "ok"
+    before = pipeline.warehouse.current_snapshot_id()
+    repository = TradingRepository(settings.paths.trading_database)
+    _, head_before = repository.selected_state(account.account_id)
+    assert head_before is not None
+
+    provider = registry.provider("exchange-public")
+    original_observe = provider.observe
+
+    def tampered_observe(request: ProviderRequest) -> ObservationPayload:
+        payload = original_observe(request)
+        if request.capability is not ProviderCapability.INSTRUMENTS:
+            return payload
+        metadata = dict(payload.source_metadata)
+        closure = json.loads(canonical_json(metadata["component_closure"]))
+        closure["sh-etf"]["admitted_ids"] = []
+        metadata["component_closure"] = closure
+        return ObservationPayload(
+            payload.provider,
+            payload.observed_at,
+            payload.request,
+            payload.tables,
+            payload.coverage,
+            metadata,
+        )
+
+    monkeypatch.setattr(provider, "observe", tampered_observe)
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    blocked = next(stage for stage in result.stages if stage.name == "universe")
+    assert blocked.detail["reason"] == "official universe component closure is invalid"
+    assert pipeline.warehouse.current_snapshot_id() == before
+    assert repository.selected_state(account.account_id)[1] == head_before
+
+
+def test_daily_tampered_partial_official_frame_lineage_blocks_without_state_change(
+    tmp_path, monkeypatch,
+):
+    _ready_multi_asset_market(tmp_path / "market")
+    account = DailyAccountSettings(
+        "paper-official-lineage", "Official Lineage", Decimal("100000"), "static",
+        {"600000.SH": Decimal("0.5")},
+    )
+    settings = build_settings(tmp_path, (account,))
+    registry = _daily_extension_registry()
+    _install_official_component_outage(monkeypatch, registry, ("sz-etf",))
+    pipeline = DailyPipeline(
+        settings, registry=registry,
+        now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    assert pipeline.run(target_date=FUTURE_DAYS[0], skip_data=True).status == "ok"
+    before = pipeline.warehouse.current_snapshot_id()
+    repository = TradingRepository(settings.paths.trading_database)
+    _, head_before = repository.selected_state(account.account_id)
+    assert head_before is not None
+
+    provider = registry.provider("exchange-public")
+    original_observe = provider.observe
+
+    def tampered_observe(request: ProviderRequest) -> ObservationPayload:
+        payload = original_observe(request)
+        if request.capability is not ProviderCapability.INSTRUMENTS:
+            return payload
+        frame = payload.tables[MarketTable.INSTRUMENTS].copy()
+        frame.at[frame.index[0], "field_lineage"] = canonical_json({
+            "endpoint": "tampered-unsuccessful-endpoint",
+        })
+        return ObservationPayload(
+            payload.provider,
+            payload.observed_at,
+            payload.request,
+            {MarketTable.INSTRUMENTS: frame},
+            payload.coverage,
+            payload.source_metadata,
+        )
+
+    monkeypatch.setattr(provider, "observe", tampered_observe)
+    result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
+
+    assert result.status == "blocked"
+    blocked = next(stage for stage in result.stages if stage.name == "universe")
+    assert blocked.detail["reason"] == "official universe component closure is invalid"
+    assert pipeline.warehouse.current_snapshot_id() == before
+    assert repository.selected_state(account.account_id)[1] == head_before
 
 
 def test_daily_validation_failure_is_reported_as_a_blocked_stage(tmp_path, monkeypatch):
@@ -1984,7 +3464,7 @@ def test_daily_adjusted_price_factor_audit_only_fills_unmatched_candidates():
     assert factors.iloc[0]["price_multiplier"] == pytest.approx(0.5)
     payload = json.loads(factors.iloc[0]["source_payload"])
     assert payload["adjusted_price_audit"]["prior_session"] == "2026-07-27"
-    with pytest.raises(SnapshotNotReadyError, match="expected=0.4"):
+    with pytest.raises(TradeRuleError, match="expected=0.4") as exc_info:
         DailyPipeline._derive_adjusted_price_factor_rows(
             raw_bars=raw,
             adjusted_bars=adjusted,
@@ -1992,6 +3472,97 @@ def test_daily_adjusted_price_factor_audit_only_fills_unmatched_candidates():
             raw_observation_id="obs-raw-factor-audit",
             adjusted_observation_id="obs-adjusted-factor-audit",
         )
+    assert exc_info.value.instrument_ids == ("510050.SH",)
+
+
+def test_daily_adjusted_factor_duplicate_keys_report_exact_instrument_scope():
+    raw = pd.DataFrame([
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-27",
+            "price_mode": "raw", "close": 2.0,
+        },
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-27",
+            "price_mode": "raw", "close": 2.1,
+        },
+        {
+            "instrument_id": "600000.SH", "session_date": "2026-07-27",
+            "price_mode": "raw", "close": 10.0,
+        },
+    ])
+    adjusted = pd.DataFrame([
+        {
+            "instrument_id": "510050.SH", "session_date": "2026-07-27",
+            "price_mode": "adjusted", "close": 1.0,
+        },
+        {
+            "instrument_id": "600000.SH", "session_date": "2026-07-27",
+            "price_mode": "adjusted", "close": 10.0,
+        },
+    ])
+
+    with pytest.raises(TradeRuleError, match="duplicate daily keys") as exc_info:
+        DailyPipeline._derive_adjusted_price_factor_rows(
+            raw_bars=raw,
+            adjusted_bars=adjusted,
+            candidates={"510050.SH": {"2026-07-28": 0.5}},
+            raw_observation_id="obs-raw",
+            adjusted_observation_id="obs-adjusted",
+        )
+
+    assert exc_info.value.instrument_ids == ("510050.SH",)
+
+
+def test_daily_factor_audit_without_prior_open_session_reports_unresolved_scope(
+    monkeypatch,
+):
+    import fundlab.pipeline.daily as daily_module
+
+    pipeline = object.__new__(DailyPipeline)
+    pipeline.warehouse = SimpleNamespace(
+        read_observation_table=lambda observation_id, table: empty_table(
+            MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+        ),
+    )
+    pipeline._capture_exact_source = lambda **kwargs: (
+        SimpleNamespace(observation_id="obs-baostock"), False,
+    )
+    monkeypatch.setattr(
+        daily_module,
+        "build_factor_audit_candidates",
+        lambda **kwargs: {
+            "510050.SH": {FUTURE_DAYS[0].isoformat(): 0.5},
+            "600000.SH": {FUTURE_DAYS[0].isoformat(): 0.9},
+        },
+    )
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        FUTURE_DAYS[0],
+        FUTURE_DAYS[0],
+        FUTURE_DAYS[0],
+        instrument_ids=("510050.SH", "600000.SH"),
+    )
+    calendar = pd.DataFrame([{
+        "exchange": "SH",
+        "session_date": FUTURE_DAYS[0].isoformat(),
+        "is_open": True,
+    }])
+
+    with pytest.raises(TradeRuleError, match="no prior open session") as exc_info:
+        pipeline._reconcile_action_factor_evidence(
+            instruments=_daily_base_instruments().loc[
+                lambda frame: frame["instrument_id"].isin(scope.instrument_ids)
+            ],
+            actions=empty_table(MarketTable.CORPORATE_ACTIONS, include_lineage=True),
+            primary_factors=empty_table(
+                MarketTable.ADJUSTMENT_FACTORS, include_lineage=True,
+            ),
+            bars=empty_table(MarketTable.DAILY_BARS, include_lineage=True),
+            calendar_frame=calendar,
+            increment_scope=scope,
+        )
+
+    assert exc_info.value.instrument_ids == ("510050.SH", "600000.SH")
 
 
 def test_daily_healthy_increment_retains_prior_incomplete_coverage_marker(

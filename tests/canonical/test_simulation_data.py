@@ -12,29 +12,38 @@ from fundlab.marketdata import (
     CoverageClaim,
     ETF_ACTION_CANONICAL_PROVIDER,
     EvidenceCollectionSpec,
+    IntegrityError,
     MarketDataWarehouse,
     MarketTable,
     ObservationPayload,
+    ObservationError,
     ProviderCapability,
     ProviderRequest,
     ReadinessProfile,
     SIMULATION_STATUS_CANONICAL_PROVIDER,
     STOCK_ACTION_CANONICAL_PROVIDER,
     SimulationEvidenceCollector,
+    SimulationIncrementValidator,
     SimulationStatusCollector,
     StatusCollectionSpec,
     SnapshotPlan,
     SnapshotNotReadyError,
     SourceSlice,
+    TradeRuleError,
     UniverseScope,
     build_dense_simulation_bars,
     canonicalize_suspension_status,
     reconcile_corporate_action_factors,
     reconcile_simulation_status,
 )
+from fundlab.marketdata.contracts import (
+    EXECUTION_EVIDENCE_GAP_RULE_ID,
+    ExecutionEvidenceImpact,
+)
 from fundlab.marketdata.simulation_data import (
     _action_observation_policy_is_current,
     _collapse_same_lifecycle_cash_components,
+    _guard_execution_evidence_rows,
 )
 from fundlab.marketdata.sources.cninfo import (
     CninfoAnnouncementPageEvidence,
@@ -42,7 +51,7 @@ from fundlab.marketdata.sources.cninfo import (
     CninfoAnnouncementScan,
 )
 from fundlab.marketdata.sources.eastmoney_fund import EASTMONEY_ETF_ACTION_POLICY
-from tests.canonical.fixtures import DAYS, market_frames
+from tests.canonical.fixtures import DAYS, market_frames, observation
 
 
 def test_legacy_etf_action_observation_is_never_reused_as_exhaustive():
@@ -52,6 +61,272 @@ def test_legacy_etf_action_observation_is_never_reused_as_exhaustive():
     assert _action_observation_policy_is_current(
         "etf-actions", {"parser_policy": EASTMONEY_ETF_ACTION_POLICY},
     )
+
+
+def test_execution_evidence_guard_changes_only_all_explicit_impacted_rows():
+    bars = pd.DataFrame([
+        {
+            "instrument_id": instrument_id,
+            "session_date": session_date,
+            "field_lineage": "{}",
+            "suspended": False,
+            "is_st": False,
+            "trade_rule_id": "ordinary",
+            "trade_rule_known_date": "2026-07-15",
+        }
+        for instrument_id, session_date in (
+            ("600000.SH", "2026-07-15"),
+            ("600000.SH", "2026-07-16"),
+            ("600001.SH", "2026-07-15"),
+        )
+    ])
+    reasons: dict[str, tuple[str, ...]] = {}
+
+    guarded = _guard_execution_evidence_rows(
+        bars,
+        (
+            ExecutionEvidenceImpact("600000.SH", "2026-07-15"),
+            ExecutionEvidenceImpact("600001.SH", "2026-07-15"),
+        ),
+        reason="price_limit_audit:exact test gaps",
+        validator_reasons=reasons,
+    )
+
+    assert guarded.tolist() == [True, False, True]
+    assert bars.loc[guarded, "trade_rule_id"].tolist() == [
+        EXECUTION_EVIDENCE_GAP_RULE_ID,
+        EXECUTION_EVIDENCE_GAP_RULE_ID,
+    ]
+    assert bars.loc[~guarded, "trade_rule_id"].tolist() == ["ordinary"]
+    assert set(reasons) == {"600000.SH", "600001.SH"}
+    assert all("@2026-07-15" in values[0] for values in reasons.values())
+
+    mixed = pd.DataFrame([{
+        "instrument_id": "600000.SH",
+        "session_date": "2026-07-15",
+        "field_lineage": "{}",
+        "suspended": False,
+        "is_st": False,
+        "trade_rule_id": "ordinary",
+        "trade_rule_known_date": "2026-07-15",
+    }])
+    with pytest.raises(SnapshotNotReadyError, match="outside the exact partition"):
+        _guard_execution_evidence_rows(
+            mixed,
+            (
+                ExecutionEvidenceImpact("600000.SH", "2026-07-15"),
+                ExecutionEvidenceImpact("600001.SH", "2026-07-15"),
+            ),
+            reason="mixed exact and out-of-scope impacts",
+            validator_reasons={},
+        )
+    assert mixed.loc[0, "trade_rule_id"] == "ordinary"
+
+
+def test_validator_reasserts_guard_after_typed_price_limit_audit_impact(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    calendar_source = warehouse.record_observation(observation())
+    frames = market_frames()
+    target_date = DAYS[-1]
+    target_raw = frames[MarketTable.DAILY_BARS].loc[
+        frames[MarketTable.DAILY_BARS]["session_date"].eq(target_date.isoformat())
+        & frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+    ].reset_index(drop=True)
+    upstream_ids = []
+    for second, provider in enumerate(("baostock", "xtquant"), start=1):
+        upstream = warehouse.record_observation(ObservationPayload(
+            provider,
+            datetime(2026, 7, 18, 1, 0, second, tzinfo=timezone.utc),
+            ProviderRequest(
+                ProviderCapability.DAILY_BARS_RAW,
+                target_date, target_date, ("600000.SH",),
+            ),
+            {MarketTable.DAILY_BARS: target_raw},
+            (CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                target_date,
+                target_date,
+                ("600000.SH",),
+            ),),
+        ))
+        upstream_ids.append(upstream.observation_id)
+    candidate = warehouse.record_observation(ObservationPayload(
+        "canonical-reconciler-a-share-daily-simulation-v4",
+        datetime(2026, 7, 18, 1, 1, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            target_date, target_date, ("600000.SH",),
+            {"input_observation_ids": tuple(upstream_ids)},
+        ),
+        {
+            MarketTable.INSTRUMENTS: frames[MarketTable.INSTRUMENTS],
+            MarketTable.DAILY_BARS: target_raw,
+            MarketTable.CORPORATE_ACTIONS: frames[MarketTable.CORPORATE_ACTIONS],
+            MarketTable.ADJUSTMENT_FACTORS: frames[MarketTable.ADJUSTMENT_FACTORS],
+        },
+        tuple(CoverageClaim(
+            table,
+            True,
+            None if table is MarketTable.INSTRUMENTS else target_date,
+            None if table is MarketTable.INSTRUMENTS else target_date,
+            ("600000.SH",),
+        ) for table in (
+            MarketTable.INSTRUMENTS,
+            MarketTable.DAILY_BARS,
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        )),
+        {
+            "kind": "field_level_reconciliation",
+            "reconciliation_ready": True,
+            "report": {"input_observation_ids": tuple(upstream_ids)},
+        },
+    ))
+    original_audit = simulation_data_module.audit_provider_price_limits
+    calls = 0
+
+    def typed_gap_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TradeRuleError(
+                "synthetic exact audit gap",
+                impacts=(ExecutionEvidenceImpact("600000.SH", target_date.isoformat()),),
+            )
+        return original_audit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        simulation_data_module, "audit_provider_price_limits", typed_gap_once,
+    )
+    validated = SimulationIncrementValidator(warehouse, tmp_path / "reports").validate_and_record(
+        candidate_observation_id=candidate.observation_id,
+        calendar_observation_id=calendar_source.observation_id,
+        universe_scope=UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            target_date,
+            target_date,
+            target_date,
+            survivorship_bias=True,
+            instrument_ids=("600000.SH",),
+        ),
+        description="typed price-limit gap guard fixture",
+    )
+
+    assert calls == 2
+    rows = warehouse.read_observation_table(validated.observation_id, MarketTable.DAILY_BARS)
+    row = rows.iloc[0]
+    assert row["trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert pd.isna(row["suspended"])
+    assert pd.isna(row["is_st"])
+
+
+def test_validator_retries_typed_trade_rule_impact_with_exact_guard(
+    tmp_path, monkeypatch,
+):
+    import fundlab.marketdata.simulation_data as simulation_data_module
+
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    calendar_source = warehouse.record_observation(observation())
+    frames = market_frames()
+    target_date = DAYS[-1]
+    target_raw = frames[MarketTable.DAILY_BARS].loc[
+        frames[MarketTable.DAILY_BARS]["session_date"].eq(target_date.isoformat())
+        & frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+    ].reset_index(drop=True)
+    upstream_ids = []
+    for second, provider in enumerate(("baostock", "xtquant"), start=1):
+        upstream = warehouse.record_observation(ObservationPayload(
+            provider,
+            datetime(2026, 7, 18, 1, 0, second, tzinfo=timezone.utc),
+            ProviderRequest(
+                ProviderCapability.DAILY_BARS_RAW,
+                target_date, target_date, ("600000.SH",),
+            ),
+            {MarketTable.DAILY_BARS: target_raw},
+            (CoverageClaim(
+                MarketTable.DAILY_BARS,
+                True,
+                target_date,
+                target_date,
+                ("600000.SH",),
+            ),),
+        ))
+        upstream_ids.append(upstream.observation_id)
+    candidate = warehouse.record_observation(ObservationPayload(
+        "canonical-reconciler-a-share-daily-simulation-v4",
+        datetime(2026, 7, 18, 1, 1, tzinfo=timezone.utc),
+        ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            target_date, target_date, ("600000.SH",),
+            {"input_observation_ids": tuple(upstream_ids)},
+        ),
+        {
+            MarketTable.INSTRUMENTS: frames[MarketTable.INSTRUMENTS],
+            MarketTable.DAILY_BARS: target_raw,
+            MarketTable.CORPORATE_ACTIONS: frames[MarketTable.CORPORATE_ACTIONS],
+            MarketTable.ADJUSTMENT_FACTORS: frames[MarketTable.ADJUSTMENT_FACTORS],
+        },
+        tuple(CoverageClaim(
+            table,
+            True,
+            None if table is MarketTable.INSTRUMENTS else target_date,
+            None if table is MarketTable.INSTRUMENTS else target_date,
+            ("600000.SH",),
+        ) for table in (
+            MarketTable.INSTRUMENTS,
+            MarketTable.DAILY_BARS,
+            MarketTable.CORPORATE_ACTIONS,
+            MarketTable.ADJUSTMENT_FACTORS,
+        )),
+        {
+            "kind": "field_level_reconciliation",
+            "reconciliation_ready": True,
+            "report": {"input_observation_ids": tuple(upstream_ids)},
+        },
+    ))
+    original_materialize = simulation_data_module.materialize_daily_trade_rules
+    calls = 0
+
+    def typed_gap_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TradeRuleError(
+                "synthetic exact trade-rule gap",
+                impacts=(ExecutionEvidenceImpact("600000.SH", target_date.isoformat()),),
+            )
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        simulation_data_module, "materialize_daily_trade_rules", typed_gap_once,
+    )
+    validated = SimulationIncrementValidator(warehouse, tmp_path / "reports").validate_and_record(
+        candidate_observation_id=candidate.observation_id,
+        calendar_observation_id=calendar_source.observation_id,
+        universe_scope=UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            target_date,
+            target_date,
+            target_date,
+            survivorship_bias=True,
+            instrument_ids=("600000.SH",),
+        ),
+        description="typed trade-rule gap guard fixture",
+    )
+
+    assert calls == 2
+    row = warehouse.read_observation_table(
+        validated.observation_id, MarketTable.DAILY_BARS,
+    ).iloc[0]
+    assert row["trade_rule_id"] == EXECUTION_EVIDENCE_GAP_RULE_ID
+    assert pd.isna(row["suspended"])
+    assert pd.isna(row["is_st"])
+    assert row[["open", "high", "low", "close"]].notna().all()
 
 
 def test_same_lifecycle_cash_components_are_summed_with_conservative_known_date():
@@ -528,8 +803,116 @@ def test_status_collection_is_shardable_validated_and_resumable(tmp_path, monkey
     assert queried_tables.count(MarketTable.DAILY_BARS) == 1
     assert first.checkpoint.is_file() and first.report.is_file()
 
+    class UnavailableStatusProvider(StatusProvider):
+        def observe(self, request):
+            raise ObservationError("status source unavailable for exact batch")
 
-def test_xt_status_collection_records_dense_canonical_evidence_and_resumes(tmp_path):
+    unavailable_registry = ProviderRegistry()
+    unavailable_registry.register(UnavailableStatusProvider())
+    unavailable = SimulationStatusCollector(
+        warehouse, tmp_path / "unavailable-status", registry=unavailable_registry,
+    ).collect(StatusCollectionSpec(
+        research.snapshot_id, calendar.observation_id, batch_size=1, refresh=True,
+    ))
+    assert unavailable.status == "incomplete"
+    assert unavailable.unresolved_instrument_ids == ("600000.SH",)
+    assert any("ObservationError" in item for item in unavailable.blockers)
+
+    class IncompleteStatusProvider(StatusProvider):
+        def observe(self, request):
+            status = frames[MarketTable.DAILY_BARS].loc[
+                frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+            ].copy()
+            status[["open", "high", "low", "close"]] = None
+            status["volume"] = 0
+            return ObservationPayload(
+                self.name,
+                observed_at,
+                request,
+                {MarketTable.DAILY_BARS: status},
+                (CoverageClaim(
+                    MarketTable.DAILY_BARS,
+                    False,
+                    DAYS[0],
+                    DAYS[-1],
+                    request.instrument_ids,
+                ),),
+                {"backend_group": "baostock"},
+            )
+
+    incomplete_registry = ProviderRegistry()
+    incomplete_registry.register(IncompleteStatusProvider())
+    incomplete = SimulationStatusCollector(
+        warehouse, tmp_path / "incomplete-status", registry=incomplete_registry,
+    ).collect(StatusCollectionSpec(
+        research.snapshot_id, calendar.observation_id, batch_size=1, refresh=True,
+    ))
+    assert incomplete.status == "incomplete"
+    assert incomplete.unresolved_instrument_ids == ("600000.SH",)
+    assert any("SnapshotNotReadyError" in item for item in incomplete.blockers)
+
+    invalid_request = ProviderRequest(
+        ProviderCapability.DAILY_STATUS,
+        DAYS[0],
+        DAYS[-1],
+        ("600000.SH",),
+    )
+    invalid_status = frames[MarketTable.DAILY_BARS].loc[
+        frames[MarketTable.DAILY_BARS]["price_mode"].eq("raw")
+    ].copy()
+    invalid = warehouse.record_observation(ObservationPayload(
+        "baostock",
+        observed_at,
+        invalid_request,
+        {MarketTable.DAILY_BARS: invalid_status},
+        (CoverageClaim(
+            MarketTable.DAILY_BARS,
+            False,
+            DAYS[0],
+            DAYS[-1],
+            ("600000.SH",),
+        ),),
+        {"backend_group": "baostock"},
+    ))
+    real_matches = warehouse.matching_observations
+
+    def invalid_source_only(*, provider, request):
+        if provider == "baostock" and request == invalid_request:
+            return (invalid,)
+        return real_matches(provider=provider, request=request)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, "matching_observations", invalid_source_only)
+        reacquired = SimulationStatusCollector(
+            warehouse, tmp_path / "reacquired-status", registry=registry,
+        ).collect(StatusCollectionSpec(
+            research.snapshot_id, calendar.observation_id, batch_size=2,
+        ))
+    assert reacquired.status == "complete"
+    assert provider.calls == 2
+
+    def raise_error(error):
+        def fail(*_args, **_kwargs):
+            raise error
+        return fail
+
+    for error in (
+        ObservationError("record schema failure"),
+        IntegrityError("record integrity failure"),
+        OSError("record disk failure"),
+        RuntimeError("record bug"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(warehouse, "record_observation", raise_error(error))
+            with pytest.raises(type(error)):
+                SimulationStatusCollector(
+                    warehouse, tmp_path / f"record-status-{type(error).__name__}", registry=registry,
+                ).collect(StatusCollectionSpec(
+                    research.snapshot_id, calendar.observation_id, batch_size=1, refresh=True,
+                ))
+
+
+def test_xt_status_collection_records_dense_canonical_evidence_and_resumes(tmp_path, monkeypatch):
     frames = market_frames(suspended_on=DAYS[1])
     observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
     raw = frames[MarketTable.DAILY_BARS].loc[
@@ -641,8 +1024,35 @@ def test_xt_status_collection_records_dense_canonical_evidence_and_resumes(tmp_p
     assert len(dense) == len(DAYS)
     assert dense.loc[dense["session_date"].eq(DAYS[1].isoformat()), "suspended"].item()
 
+    real_record = warehouse.record_observation
+    real_matches = warehouse.matching_observations
 
-def test_factor_evidence_collection_is_validated_and_resumable(tmp_path):
+    def fail_canonical_record(payload):
+        if payload.provider == SIMULATION_STATUS_CANONICAL_PROVIDER:
+            raise ObservationError("canonical status record failure")
+        return real_record(payload)
+
+    def without_canonical_match(*, provider, request):
+        if provider == SIMULATION_STATUS_CANONICAL_PROVIDER:
+            return ()
+        return real_matches(provider=provider, request=request)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, "record_observation", fail_canonical_record)
+        patch.setattr(warehouse, "matching_observations", without_canonical_match)
+        with pytest.raises(ObservationError, match="canonical status record failure"):
+            SimulationStatusCollector(
+                warehouse, tmp_path / "canonical-record-failure", registry=registry,
+            ).collect(StatusCollectionSpec(
+                research.snapshot_id,
+                calendar.observation_id,
+                provider_name="xtquant",
+                batch_size=1,
+                refresh=True,
+            ))
+
+
+def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeypatch):
     frames = market_frames()
     observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
     warehouse = MarketDataWarehouse(tmp_path / "market")
@@ -723,8 +1133,55 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path):
     assert first.completed_instruments == 1
     assert provider.calls == 1
 
+    class ScopedUnavailableFactorProvider(FactorProvider):
+        def observe(self, request):
+            raise ObservationError("provider unavailable for exact request")
 
-def test_etf_action_collection_accumulates_successes_and_retries_only_failures(tmp_path):
+    unavailable_registry = ProviderRegistry()
+    unavailable_registry.register(ScopedUnavailableFactorProvider())
+    unavailable = SimulationEvidenceCollector(
+        warehouse, tmp_path / "unavailable-reports", registry=unavailable_registry,
+    ).collect(EvidenceCollectionSpec(
+        research.snapshot_id, "factors", batch_size=1, refresh=True,
+    ))
+    assert unavailable.status == "incomplete"
+    assert unavailable.unresolved_instrument_ids == ("600000.SH",)
+    assert any("ObservationError" in item for item in unavailable.blockers)
+
+    def raise_error(error):
+        def fail(*_args, **_kwargs):
+            raise error
+        return fail
+
+    for error in (IntegrityError("durability failed"), OSError("disk full"), RuntimeError("bug")):
+        with monkeypatch.context() as patch:
+            patch.setattr(warehouse, "record_observation", raise_error(error))
+            with pytest.raises(type(error)):
+                SimulationEvidenceCollector(
+                    warehouse, tmp_path / f"record-{type(error).__name__}", registry=registry,
+                ).collect(EvidenceCollectionSpec(
+                    research.snapshot_id, "factors", batch_size=1, refresh=True,
+                ))
+
+    import fundlab.marketdata.simulation_data as simulation_data_module
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            simulation_data_module,
+            "_write_atomic_json",
+            raise_error(OSError("checkpoint write failed")),
+        )
+        with pytest.raises(OSError, match="checkpoint write failed"):
+            SimulationEvidenceCollector(
+                warehouse, tmp_path / "checkpoint-failure", registry=registry,
+            ).collect(EvidenceCollectionSpec(
+                research.snapshot_id, "factors", batch_size=1, refresh=True,
+            ))
+
+
+def test_etf_action_collection_accumulates_successes_and_retries_only_failures(
+    tmp_path, monkeypatch,
+):
     frames = market_frames()
     observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
     instrument_rows = []
@@ -845,6 +1302,22 @@ def test_etf_action_collection_accumulates_successes_and_retries_only_failures(t
     assert set(manifest.source_metadata["per_instrument_evidence"]) == {
         "159919.SZ", "510050.SH",
     }
+
+    real_record = warehouse.record_observation
+
+    def fail_canonical_record(payload):
+        if payload.provider == ETF_ACTION_CANONICAL_PROVIDER:
+            raise ObservationError("canonical action record failure")
+        return real_record(payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, "record_observation", fail_canonical_record)
+        with pytest.raises(ObservationError, match="canonical action record failure"):
+            SimulationEvidenceCollector(
+                warehouse, tmp_path / "canonical-action-record", registry=registry,
+            ).collect(EvidenceCollectionSpec(
+                research.snapshot_id, "etf-actions", batch_size=2, refresh=True,
+            ))
 
     class PersistentlyPartialEtfProvider(PartialEtfProvider):
         def observe(self, request):
@@ -1667,7 +2140,7 @@ def test_stock_action_matches_utc_announcement_by_shanghai_disclosure_date(tmp_p
     assert result.unresolved_instrument_ids == ()
 
 
-def test_stock_action_historical_difference_blocks_without_canonical_observation(tmp_path):
+def test_stock_action_historical_difference_keeps_clean_stock_canonical_observation(tmp_path):
     target = "600000.SH"
     predecessor_actions = pd.DataFrame([
         _stock_action_row(target, ex_date=DAYS[1], cash_per_share=0.1),
@@ -1691,9 +2164,11 @@ def test_stock_action_historical_difference_blocks_without_canonical_observation
     )
 
     assert result.status == "incomplete"
-    assert result.observation_ids == ()
+    assert result.unresolved_instrument_ids == (target,)
     assert any(item.startswith("HistoricalActionCorrectionError:") for item in result.blockers)
-    assert warehouse.observations(provider=STOCK_ACTION_CANONICAL_PROVIDER) == ()
+    assert len(result.observation_ids) == 1
+    manifest = warehouse.load_observation(result.observation_ids[0])
+    assert manifest.request.instrument_ids == ("600001.SH",)
 
 
 def test_stock_action_historical_ex_date_move_reports_removed_and_added_keys(tmp_path):
@@ -1728,7 +2203,11 @@ def test_stock_action_historical_ex_date_move_reports_removed_and_added_keys(tmp
     )
     assert f"cash_dividend|{old_ex_date.isoformat()}" in correction
     assert f"cash_dividend|{corrected_ex_date.isoformat()}" in correction
-    assert result.observation_ids == ()
+    assert result.unresolved_instrument_ids == (target,)
+    assert len(result.observation_ids) == 1
+    assert warehouse.load_observation(result.observation_ids[0]).request.instrument_ids == (
+        "600001.SH",
+    )
 
 
 def test_stock_action_historical_listing_and_quantity_changes_are_exact_blockers(tmp_path):
@@ -1764,7 +2243,8 @@ def test_stock_action_historical_listing_and_quantity_changes_are_exact_blockers
     )
     assert '"listing_date"' in correction
     assert '"quantity_multiplier"' in correction
-    assert result.observation_ids == ()
+    assert result.unresolved_instrument_ids == (target,)
+    assert len(result.observation_ids) == 1
 
 
 def test_stock_action_derived_pay_date_does_not_masquerade_as_source_correction(tmp_path):

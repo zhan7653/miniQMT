@@ -12,6 +12,7 @@ from fundlab.common.canonical import canonical_json, stable_digest
 from fundlab.marketdata.contracts import (
     CorporateActionType,
     SnapshotNotReadyError,
+    TradeRuleError,
     UniverseScope,
 )
 
@@ -86,7 +87,9 @@ def build_factor_audit_candidates(
         factor_rows_by_instrument.setdefault(str(row["instrument_id"]), []).append(row)
     candidates: dict[str, dict[str, float]] = {}
     for row in factor_rows:
-        raw = _factor_raw(row.get("source_payload"))
+        raw = _factor_raw(
+            row.get("source_payload"), instrument_id=str(row["instrument_id"]),
+        )
         if not _has_position_economics(raw):
             continue
         instrument_id = str(row["instrument_id"])
@@ -105,7 +108,13 @@ def build_factor_audit_candidates(
     for key, group in action_groups.items():
         if any(
             _date_distance(str(row["effective_date"]), key[1]) <= 31
-            and not _economic_mismatches(group, _factor_raw(row.get("source_payload")))
+            and not _economic_mismatches(
+                group,
+                _factor_raw(
+                    row.get("source_payload"),
+                    instrument_id=str(row["instrument_id"]),
+                ),
+            )
             for row in factor_rows_by_instrument.get(key[0], ())
         ):
             continue
@@ -116,6 +125,21 @@ def build_factor_audit_candidates(
         instrument_id: MappingProxyType(dict(sorted(values.items())))
         for instrument_id, values in sorted(candidates.items())
     })
+
+
+def _scoped_reconciliation_error(
+    message: str,
+    instrument_ids: Any,
+) -> TradeRuleError:
+    """Represent a reconciliation failure whose affected partition is exact."""
+
+    return TradeRuleError(
+        message,
+        instrument_ids=tuple(sorted({
+            str(instrument_id) for instrument_id in instrument_ids
+            if str(instrument_id).strip()
+        })),
+    )
 
 
 def reconcile_corporate_action_factors(
@@ -143,7 +167,10 @@ def reconcile_corporate_action_factors(
         raise SnapshotNotReadyError("Corporate-action partition is outside the pinned universe")
     lifecycle = instruments.set_index("instrument_id")
     if lifecycle["listed_date"].isna().any():
-        raise SnapshotNotReadyError("Corporate-action partition has an unknown listed date")
+        raise _scoped_reconciliation_error(
+            "Corporate-action partition has an unknown listed date",
+            lifecycle.index[lifecycle["listed_date"].isna()],
+        )
     listed_dates = {
         str(instrument_id): str(value)[:10]
         for instrument_id, value in lifecycle["listed_date"].items()
@@ -308,9 +335,25 @@ def reconcile_corporate_action_factors(
         )
     )
     if selected_actions.duplicated(["instrument_id", "action_type", "ex_date"]).any():
-        raise SnapshotNotReadyError("Corporate-action sources contain duplicate semantic events")
+        raise _scoped_reconciliation_error(
+            "Corporate-action sources contain duplicate semantic events",
+            selected_actions.loc[
+                selected_actions.duplicated(
+                    ["instrument_id", "action_type", "ex_date"], keep=False,
+                ),
+                "instrument_id",
+            ],
+        )
     if selected_factors.duplicated(["instrument_id", "effective_date"]).any():
-        raise SnapshotNotReadyError("Adjustment-factor source contains duplicate events")
+        raise _scoped_reconciliation_error(
+            "Adjustment-factor source contains duplicate events",
+            selected_factors.loc[
+                selected_factors.duplicated(
+                    ["instrument_id", "effective_date"], keep=False,
+                ),
+                "instrument_id",
+            ],
+        )
 
     action_groups = {
         (str(instrument_id), str(ex_date)): group
@@ -340,7 +383,10 @@ def reconcile_corporate_action_factors(
         viable: list[tuple[int, int]] = []
         exact_mismatches: tuple[str, ...] = ()
         for index in candidate_indexes:
-            raw = _factor_raw(factor_rows_source[index].get("source_payload"))
+            raw = _factor_raw(
+                factor_rows_source[index].get("source_payload"),
+                instrument_id=str(factor_rows_source[index]["instrument_id"]),
+            )
             mismatches = _economic_mismatches(group, raw)
             if index == exact:
                 exact_mismatches = mismatches
@@ -354,8 +400,9 @@ def reconcile_corporate_action_factors(
         if viable:
             viable.sort()
             if len(viable) > 1 and viable[0][0] == viable[1][0]:
-                raise SnapshotNotReadyError(
-                    f"Ambiguous corporate-action factor match at {key[0]}/{key[1]}"
+                raise _scoped_reconciliation_error(
+                    f"Ambiguous corporate-action factor match at {key[0]}/{key[1]}",
+                    (key[0],),
                 )
             matched[key] = viable[0][1]
             continue
@@ -363,9 +410,10 @@ def reconcile_corporate_action_factors(
             ignored_restructuring.append(key)
             continue
         if exact is not None and exact_mismatches:
-            raise SnapshotNotReadyError(
+            raise _scoped_reconciliation_error(
                 f"Corporate-action/factor conflict at {key[0]}/{key[1]}: "
-                f"{','.join(exact_mismatches)}"
+                f"{','.join(exact_mismatches)}",
+                (key[0],),
             )
         missing_factors.append(key)
 
@@ -376,7 +424,9 @@ def reconcile_corporate_action_factors(
     for index, factor in enumerate(factor_rows_source):
         if index in matched_factor_indexes:
             continue
-        raw = _factor_raw(factor.get("source_payload"))
+        raw = _factor_raw(
+            factor.get("source_payload"), instrument_id=str(factor["instrument_id"]),
+        )
         if not _has_position_economics(raw):
             technical_factor_indexes.add(index)
             continue
@@ -395,12 +445,13 @@ def reconcile_corporate_action_factors(
     missing_factors_tuple = tuple(sorted(missing_factors))
     missing_actions_tuple = tuple(sorted(missing_actions))
     if missing_factors_tuple or missing_actions_tuple:
-        raise SnapshotNotReadyError(
+        raise _scoped_reconciliation_error(
             "Corporate-action/factor event coverage mismatch: "
             f"missing_factors={len(missing_factors_tuple)} "
             f"missing_actions={len(missing_actions_tuple)} "
             f"factor_examples={missing_factors_tuple[:3]} "
-            f"action_examples={missing_actions_tuple[:3]}"
+            f"action_examples={missing_actions_tuple[:3]}",
+            tuple(key[0] for key in (*missing_factors_tuple, *missing_actions_tuple)),
         )
 
     factor_rows: list[dict[str, Any]] = []
@@ -410,15 +461,24 @@ def reconcile_corporate_action_factors(
         group = action_groups[key]
         retained_action_indexes.update(map(int, group.index))
         factor = dict(factor_rows_source[matched[key]])
-        raw = _factor_raw(factor.get("source_payload"))
+        raw = _factor_raw(
+            factor.get("source_payload"), instrument_id=str(factor["instrument_id"]),
+        )
         mismatches = _economic_mismatches(group, raw)
         if mismatches:
-            raise SnapshotNotReadyError(
-                f"Corporate-action/factor conflict at {key[0]}/{key[1]}: {','.join(mismatches)}"
+            raise _scoped_reconciliation_error(
+                f"Corporate-action/factor conflict at {key[0]}/{key[1]}: {','.join(mismatches)}",
+                (key[0],),
             )
-        known_dates = tuple(sorted(map(str, group["known_date"])))
-        if not known_dates or any(item in {"", "<NA>", "None"} for item in known_dates):
-            raise SnapshotNotReadyError(f"Corporate action has no known date: {key}")
+        known_date_values = tuple(group["known_date"])
+        if not known_date_values or any(
+            pd.isna(item) or str(item) in {"", "<NA>", "None"}
+            for item in known_date_values
+        ):
+            raise _scoped_reconciliation_error(
+                f"Corporate action has no known date: {key}", (key[0],),
+            )
+        known_dates = tuple(sorted(map(str, known_date_values)))
         raw_effective_date = str(factor["effective_date"])
         factor["effective_date"] = key[1]
         factor["known_date"] = known_dates[0]
@@ -540,7 +600,12 @@ def _recover_official_etf_cash_factors(
             continue
         factor_index = exact_indexes[0]
         primary = working.loc[factor_index].to_dict()
-        mismatches = _economic_mismatches(group, _factor_raw(primary.get("source_payload")))
+        mismatches = _economic_mismatches(
+            group,
+            _factor_raw(
+                primary.get("source_payload"), instrument_id=event_key[0],
+            ),
+        )
         if not mismatches:
             continue
         expected = _expected_action_price_multiplier(
@@ -602,12 +667,18 @@ def _recover_official_etf_cash_factors(
     return working, tuple(recovered)
 
 
-def _factor_raw(value: Any) -> Mapping[str, Any]:
+def _factor_raw(
+    value: Any, *, instrument_id: str | None = None,
+) -> Mapping[str, Any]:
     if value is None or value is pd.NA or pd.isna(value):
         return {}
     try:
         payload = json.loads(str(value))
     except json.JSONDecodeError as exc:
+        if instrument_id is not None:
+            raise _scoped_reconciliation_error(
+                "Adjustment factor has invalid source payload", (instrument_id,),
+            ) from exc
         raise SnapshotNotReadyError("Adjustment factor has invalid source payload") from exc
     raw = payload.get("raw") if isinstance(payload, Mapping) else None
     return raw if isinstance(raw, Mapping) else {}
@@ -648,7 +719,13 @@ def _apply_corroborating_factor_evidence(
         already_proven = any(
             str(row["instrument_id"]) == key[0]
             and _date_distance(str(row["effective_date"]), key[1]) <= 31
-            and not _economic_mismatches(group, _factor_raw(row.get("source_payload")))
+            and not _economic_mismatches(
+                group,
+                _factor_raw(
+                    row.get("source_payload"),
+                    instrument_id=str(row["instrument_id"]),
+                ),
+            )
             for row in primary_rows
         )
         if already_proven:
@@ -674,7 +751,9 @@ def _apply_corroborating_factor_evidence(
             row for row in primary_rows
             if str(row["instrument_id"]) == key[0]
             and _date_distance(str(row["effective_date"]), key[1]) <= 31
-            and _has_position_economics(_factor_raw(row.get("source_payload")))
+            and _has_position_economics(_factor_raw(
+                row.get("source_payload"), instrument_id=str(row["instrument_id"]),
+            ))
         ]
         primary_agrees = any(
             abs(float(row["price_multiplier"]) - float(secondary["price_multiplier"]))
@@ -699,10 +778,15 @@ def _apply_corroborating_factor_evidence(
             and official_raw["interest"] > 0
             and any(
                 str(row["effective_date"]) == key[1]
-                and 0 < _number(_factor_raw(row.get("source_payload")).get("interest"))
+                and 0 < _number(_factor_raw(
+                    row.get("source_payload"), instrument_id=str(row["instrument_id"]),
+                ).get("interest"))
                 < official_raw["interest"] - 1e-12
                 and all(
-                    abs(_number(_factor_raw(row.get("source_payload")).get(field)))
+                    abs(_number(_factor_raw(
+                        row.get("source_payload"),
+                        instrument_id=str(row["instrument_id"]),
+                    ).get(field)))
                     <= 1e-12
                     for field in ("stockBonus", "stockGift", "allotNum", "allotPrice")
                 )
@@ -768,7 +852,9 @@ def _apply_corroborating_factor_evidence(
     quarantined_indexes: set[int] = set()
     quarantine_evidence: list[Mapping[str, Any]] = []
     for index, row in enumerate(primary_rows):
-        raw = _factor_raw(row.get("source_payload"))
+        raw = _factor_raw(
+            row.get("source_payload"), instrument_id=str(row["instrument_id"]),
+        )
         if not _has_position_economics(raw):
             continue
         factor_key = (str(row["instrument_id"]), str(row["effective_date"]))
@@ -800,7 +886,9 @@ def _apply_corroborating_factor_evidence(
     for index, row in enumerate(primary_rows):
         if index in quarantined_indexes:
             continue
-        raw = _factor_raw(row.get("source_payload"))
+        raw = _factor_raw(
+            row.get("source_payload"), instrument_id=str(row["instrument_id"]),
+        )
         if not _has_position_economics(raw):
             continue
         factor_key = (str(row["instrument_id"]), str(row["effective_date"]))

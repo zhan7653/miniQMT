@@ -54,8 +54,31 @@ class EtfRuleEvidenceBuilder:
         etfs = instruments.loc[
             instruments["asset_type"].astype(str).eq("etf")
         ].sort_values("instrument_id", kind="stable").reset_index(drop=True)
-        if etfs.empty or etfs["exchange_product_class"].isna().any():
+        if etfs.empty:
             raise TradeRuleError("ETF rules require exchange product classes for every ETF")
+        missing_class_ids = tuple(sorted(
+            str(row["instrument_id"])
+            for row in etfs.to_dict("records")
+            if (
+                pd.isna(row["exchange_product_class"])
+                or not str(row["exchange_product_class"]).strip()
+            )
+        ))
+        if missing_class_ids:
+            raise TradeRuleError(
+                "ETF rules require exchange product classes for every ETF",
+                instrument_ids=missing_class_ids,
+            )
+        missing_listed_ids = tuple(sorted(
+            str(row["instrument_id"])
+            for row in etfs.to_dict("records")
+            if not _has_required_date(row.get("listed_date"))
+        ))
+        if missing_listed_ids:
+            raise TradeRuleError(
+                "Required ETF rule listing date is missing or invalid",
+                instrument_ids=missing_listed_ids,
+            )
         source_identity = {
             "membership_and_classification": "SSE/SZSE public fund lists",
             "current_limit_calibration": "MiniQMT/xtquant get_instrument_detail",
@@ -108,11 +131,24 @@ class EtfRuleEvidenceBuilder:
         listing_date_conflicts: dict[str, dict[str, str]] = {}
         for instrument in etfs.to_dict("records"):
             instrument_id = str(instrument["instrument_id"])
-            detail = client.get_instrument_detail(instrument_id, iscomplete=True)
+            try:
+                detail = client.get_instrument_detail(instrument_id, iscomplete=True)
+            except Exception as exc:
+                raise TradeRuleError(
+                    f"MiniQMT ETF rule evidence request failed: {instrument_id}",
+                    instrument_ids=(instrument_id,),
+                ) from exc
             if not isinstance(detail, Mapping) or not detail:
-                raise TradeRuleError(f"MiniQMT has no current ETF rule evidence: {instrument_id}")
+                raise TradeRuleError(
+                    f"MiniQMT has no current ETF rule evidence: {instrument_id}",
+                    instrument_ids=(instrument_id,),
+                )
             detail_hashes[instrument_id] = stable_digest(_replace_non_finite(detail))
-            listed = _required_date(instrument.get("listed_date"), f"listed_date:{instrument_id}")
+            listed = _required_date(
+                instrument.get("listed_date"),
+                f"listed_date:{instrument_id}",
+                instrument_id=instrument_id,
+            )
             observed_open = _compact_date(detail.get("OpenDate"))
             if observed_open is not None and observed_open != listed:
                 # The exchange list owns the listing lifecycle.  MiniQMT's OpenDate
@@ -134,7 +170,8 @@ class EtfRuleEvidenceBuilder:
                 expected_ratio = 0.20 if subclass in _SSE_20_PERCENT_SUBCLASSES else 0.10
                 if abs(current_ratio - expected_ratio) > 1e-9:
                     raise TradeRuleError(
-                        f"SSE class/current limit conflict: {instrument_id}/{subclass}"
+                        f"SSE class/current limit conflict: {instrument_id}/{subclass}",
+                        instrument_ids=(instrument_id,),
                     )
             breakpoints = {listed}
             if current_ratio == 0.20 and listed < ETF_20_PERCENT_EFFECTIVE:
@@ -313,14 +350,19 @@ def _validate_reused_rules(frame: pd.DataFrame, etfs: pd.DataFrame) -> None:
         raise TradeRuleError("Reused ETF rule IDs are not unique")
     listed_dates = {
         str(row["instrument_id"]): _required_date(
-            row["listed_date"], f"listed_date:{row['instrument_id']}",
+            row["listed_date"],
+            f"listed_date:{row['instrument_id']}",
+            instrument_id=str(row["instrument_id"]),
         )
         for row in etfs.to_dict("records")
     }
     for instrument_id, rows in frame.groupby("instrument_id", sort=True):
         ordered = rows.sort_values("effective_from", kind="stable").to_dict("records")
         if ordered[0]["effective_from"] != listed_dates[str(instrument_id)]:
-            raise TradeRuleError(f"Reused ETF rule starts after listing: {instrument_id}")
+            raise TradeRuleError(
+                f"Reused ETF rule starts after listing: {instrument_id}",
+                instrument_ids=(str(instrument_id),),
+            )
         for index, row in enumerate(ordered):
             start = row["effective_from"]
             end = row["effective_to"]
@@ -336,14 +378,23 @@ def _validate_reused_rules(frame: pd.DataFrame, etfs: pd.DataFrame) -> None:
                 or not str(row["rule_id"]).strip()
                 or not str(row["evidence"]).strip()
             ):
-                raise TradeRuleError(f"Reused ETF rule is invalid: {instrument_id}")
+                raise TradeRuleError(
+                    f"Reused ETF rule is invalid: {instrument_id}",
+                    instrument_ids=(str(instrument_id),),
+                )
             if index + 1 == len(ordered):
                 if end is not None:
-                    raise TradeRuleError(f"Reused ETF rule has no open interval: {instrument_id}")
+                    raise TradeRuleError(
+                        f"Reused ETF rule has no open interval: {instrument_id}",
+                        instrument_ids=(str(instrument_id),),
+                    )
             else:
                 next_start = ordered[index + 1]["effective_from"]
                 if end is None or end.toordinal() + 1 != next_start.toordinal():
-                    raise TradeRuleError(f"Reused ETF rule intervals are not contiguous: {instrument_id}")
+                    raise TradeRuleError(
+                        f"Reused ETF rule intervals are not contiguous: {instrument_id}",
+                        instrument_ids=(str(instrument_id),),
+                    )
 
 
 def _settlement_class(
@@ -354,18 +405,28 @@ def _settlement_class(
 ) -> tuple[int, bool]:
     if exchange == "SH":
         if not product_class.startswith("sse-fund-subclass-"):
-            raise TradeRuleError(f"Unknown SSE ETF product class: {instrument_id}")
+            raise TradeRuleError(
+                f"Unknown SSE ETF product class: {instrument_id}",
+                instrument_ids=(instrument_id,),
+            )
         subclass = product_class.rsplit("-", 1)[-1]
         return (0 if subclass in _SSE_T0_SUBCLASSES else 1), (
             subclass in _SSE_CROSS_BORDER_SUBCLASSES
         )
-    category = int(detail.get("secuCategory", -1))
+    try:
+        category = int(detail.get("secuCategory", -1))
+    except (TypeError, ValueError) as exc:
+        raise TradeRuleError(
+            f"Unknown SZSE ETF settlement category: {instrument_id}",
+            instrument_ids=(instrument_id,),
+        ) from exc
     if category in _SZ_T0_CATEGORIES:
         return 0, category == 3211264
     if category in _SZ_T1_CATEGORIES:
         return 1, False
     raise TradeRuleError(
-        f"Unknown SZSE ETF settlement category: {instrument_id}/{category}"
+        f"Unknown SZSE ETF settlement category: {instrument_id}/{category}",
+        instrument_ids=(instrument_id,),
     )
 
 
@@ -376,16 +437,25 @@ def _observed_limit_ratio(detail: Mapping[str, Any], instrument_id: str) -> floa
         lower = float(detail["DownStopPrice"])
         tick = float(detail["PriceTick"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise TradeRuleError(f"ETF current limit evidence is incomplete: {instrument_id}") from exc
+        raise TradeRuleError(
+            f"ETF current limit evidence is incomplete: {instrument_id}",
+            instrument_ids=(instrument_id,),
+        ) from exc
     if previous <= 0 or upper <= previous or lower >= previous or tick <= 0:
-        raise TradeRuleError(f"ETF current limit evidence is invalid: {instrument_id}")
+        raise TradeRuleError(
+            f"ETF current limit evidence is invalid: {instrument_id}",
+            instrument_ids=(instrument_id,),
+        )
     candidates = (0.10, 0.20)
     observed_up = upper / previous - 1
     observed_down = 1 - lower / previous
     ratio = min(candidates, key=lambda item: abs(observed_up - item) + abs(observed_down - item))
     tolerance = 2 * tick / previous + 0.001
     if abs(observed_up - ratio) > tolerance or abs(observed_down - ratio) > tolerance:
-        raise TradeRuleError(f"ETF current limit ratio is neither 10% nor 20%: {instrument_id}")
+        raise TradeRuleError(
+            f"ETF current limit ratio is neither 10% nor 20%: {instrument_id}",
+            instrument_ids=(instrument_id,),
+        )
     return ratio
 
 
@@ -397,10 +467,29 @@ def _compact_date(value: Any) -> date | None:
     return None if pd.isna(parsed) else parsed.date()
 
 
-def _required_date(value: Any, field: str) -> date:
-    if value is None or pd.isna(value):
-        raise TradeRuleError(f"Required ETF rule date is missing: {field}")
-    return date.fromisoformat(str(value)[:10])
+def _has_required_date(value: Any) -> bool:
+    try:
+        _required_date(value, "listed_date")
+    except TradeRuleError:
+        return False
+    return True
+
+
+def _required_date(
+    value: Any,
+    field: str,
+    *,
+    instrument_id: str | None = None,
+) -> date:
+    try:
+        if value is None or pd.isna(value):
+            raise ValueError
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError) as exc:
+        raise TradeRuleError(
+            f"Required ETF rule date is missing: {field}",
+            instrument_ids=() if instrument_id is None else (instrument_id,),
+        ) from exc
 
 
 def _replace_non_finite(value: Any) -> Any:

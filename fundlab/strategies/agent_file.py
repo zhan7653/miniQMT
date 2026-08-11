@@ -217,6 +217,18 @@ class FileIntentSource:
             "decision_date": self.target_date,
         })
 
+    @property
+    def market_scope(self) -> tuple[str, ...]:
+        """The fixed market dependency declared by the dropped decision.
+
+        Runtime-owned account state dependencies (positions, pending orders,
+        and entitlements) are deliberately not repeated here: the simulation
+        runtime adds them to this source-declared target scope.
+        """
+        if self._decision is None:
+            return ()
+        return tuple(sorted(self._decision.target_weights))
+
     def decide(
         self,
         *,

@@ -4,9 +4,10 @@ from datetime import date
 import json
 
 import pandas as pd
+import pytest
 
 from fundlab.common.canonical import canonical_json, stable_digest
-from fundlab.marketdata import EtfRuleEvidenceBuilder
+from fundlab.marketdata import EtfRuleEvidenceBuilder, TradeRuleError
 
 
 def _instrument(instrument_id, listed_date, product_class):
@@ -39,6 +40,36 @@ class _Client:
             "DownStopPrice": previous * (1 - ratio),
             "PriceTick": 0.001,
         }
+
+
+def test_etf_rule_evidence_reports_typed_exact_instrument_failures(tmp_path):
+    class MissingDetailClient(_Client):
+        def get_instrument_detail(self, instrument_id, *, iscomplete):
+            if instrument_id == "510300.SH":
+                return {}
+            return super().get_instrument_detail(instrument_id, iscomplete=iscomplete)
+
+    instruments = pd.DataFrame([
+        _instrument("510300.SH", "2012-05-28", "sse-fund-subclass-03"),
+        _instrument("513100.SH", "2013-05-15", "sse-fund-subclass-33"),
+    ])
+    with pytest.raises(TradeRuleError) as failure:
+        EtfRuleEvidenceBuilder(tmp_path, client=MissingDetailClient()).build(
+            instruments,
+            universe_as_of=date(2026, 7, 17),
+            universe_observation_id="obs-official",
+        )
+    assert failure.value.instrument_ids == ("510300.SH",)
+
+    missing_classes = instruments.copy()
+    missing_classes.loc[:, "exchange_product_class"] = pd.NA
+    with pytest.raises(TradeRuleError) as failure:
+        EtfRuleEvidenceBuilder(tmp_path, client=_Client()).build(
+            missing_classes,
+            universe_as_of=date(2026, 7, 17),
+            universe_observation_id="obs-official",
+        )
+    assert failure.value.instrument_ids == ("510300.SH", "513100.SH")
 
 
 def test_etf_rule_evidence_materializes_historical_ratio_and_t0_transitions(tmp_path):

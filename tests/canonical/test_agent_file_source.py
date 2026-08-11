@@ -37,6 +37,7 @@ def test_absent_decision_is_a_hold_not_an_error(tmp_path):
     source = FileIntentSource(tmp_path / "decisions", "paper-1", DAYS[0])
     assert isinstance(source, IntentSource)
     assert source.decision is None
+    assert source.market_scope == ()
     market = ready_market(tmp_path / "market")
     view_day = DAYS[0]
     from fundlab.marketdata.portal import PointInTimeMarketView
@@ -90,6 +91,40 @@ def test_decision_content_changes_config_hash(tmp_path):
     changed["target_weights"] = {"600000.SH": "0.9"}
     write_decision(decisions, "paper-1", DAYS[0], changed)
     assert FileIntentSource(decisions, "paper-1", DAYS[0]).config_hash != first
+
+
+def test_market_scope_is_exact_decision_targets_not_the_market_universe(tmp_path, monkeypatch):
+    market = ready_market(tmp_path / "market")
+    repository = TradingRepository(tmp_path / "trading.sqlite3")
+    repository.create_account("paper-1", "paper", PortfolioState.with_cash(100_000))
+    decisions = tmp_path / "decisions"
+    write_decision(decisions, "paper-1", DAYS[0], decision_payload("paper-1", DAYS[0]))
+    source = FileIntentSource(decisions, "paper-1", DAYS[0])
+
+    assert source.market_scope == ("600000.SH",)
+    assert "000001.SZ" not in source.market_scope
+
+    requested_scopes: list[tuple[str, ...]] = []
+    original_session_range = type(market).session_range
+
+    def record_session_scope(self, session_dates, *, instrument_ids):
+        requested_scopes.append(tuple(sorted(instrument_ids)))
+        return original_session_range(self, session_dates, instrument_ids=instrument_ids)
+
+    monkeypatch.setattr(type(market), "session_range", record_session_scope)
+    execution, risk = policies()
+    outcome = SimulationService(
+        market_data=market,
+        repository=repository,
+        execution_policy=execution,
+        risk_policy=risk,
+        fee_schedule=fees(),
+    ).run_daily("paper-1", DAYS[0], source)
+
+    # The source's actual target remains readable and passes runtime scope
+    # validation, while an unrelated market symbol is never requested.
+    assert [order.instrument_id for order in outcome.final_state.pending_orders] == ["600000.SH"]
+    assert requested_scopes == [("600000.SH",)]
 
 
 def test_malformed_or_mismatched_decisions_fail_closed(tmp_path):

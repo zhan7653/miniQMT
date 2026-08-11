@@ -8,41 +8,89 @@
 
 param([switch]$FunctionsOnly)
 
+function Get-DailyReportSnapshot {
+    param([Parameter(Mandatory = $true)][string]$DailyReportDir)
+
+    return @(
+        Get-ChildItem -Path $DailyReportDir -Filter "daily-*.json" `
+            -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName }
+    )
+}
+
+function Get-DailyPendingReportNameSnapshot {
+    param([Parameter(Mandatory = $true)][string]$DailyReportDir)
+
+    $pendingRoot = Join-Path $DailyReportDir ".pending"
+    return @(
+        Get-ChildItem -Path $pendingRoot -Filter "daily-*.json" `
+            -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Name }
+    )
+}
+
 function Get-DailyAttemptReport {
     param(
         [Parameter(Mandatory = $true)][string]$DailyReportDir,
-        [Parameter(Mandatory = $true)][datetime]$AttemptStarted
+        [AllowEmptyCollection()][string[]]$ExistingReportPaths = @(),
+        [AllowEmptyCollection()][string[]]$PendingReportNames = @()
     )
 
-    $latestReport = Get-ChildItem -Path $DailyReportDir -Filter "daily-*.json" `
+    # A formal report is the durable commit marker for this invocation.  Do
+    # not infer ownership from timestamps: an old report can easily share the
+    # scheduler's clock window.  Only a file that appeared after our snapshot
+    # may be used for retries or a successful outcome.
+    $knownPaths = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($path in $ExistingReportPaths) {
+        [void]$knownPaths.Add($path)
+    }
+    $pendingNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($name in $PendingReportNames) {
+        [void]$pendingNames.Add($name)
+    }
+    $newReports = Get-ChildItem -Path $DailyReportDir -Filter "daily-*.json" `
             -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -ge $AttemptStarted.AddSeconds(-2) } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    if ($null -eq $latestReport) {
-        return $null
+        Where-Object {
+            -not $knownPaths.Contains($_.FullName) -and
+            -not $pendingNames.Contains($_.Name)
+        } |
+        Sort-Object LastWriteTime -Descending
+    foreach ($newReport in $newReports) {
+        try {
+            $report = Get-Content -Raw -LiteralPath $newReport.FullName |
+                ConvertFrom-Json
+        } catch {
+            continue
+        }
+        if ($report -isnot [pscustomobject]) {
+            continue
+        }
+        return [pscustomobject]@{
+            Path = $newReport.FullName
+            Report = $report
+        }
     }
-    try {
-        $report = Get-Content -Raw -LiteralPath $latestReport.FullName |
-            ConvertFrom-Json
-    } catch {
-        return $null
-    }
-    return [pscustomobject]@{
-        Path = $latestReport.FullName
-        Report = $report
-    }
+    return $null
 }
 
 function Test-DailyFailureRetryable {
     param(
         [Parameter(Mandatory = $true)][string]$DailyReportDir,
-        [Parameter(Mandatory = $true)][datetime]$AttemptStarted
+        [AllowEmptyCollection()][string[]]$ExistingReportPaths = @(),
+        [AllowEmptyCollection()][string[]]$PendingReportNames = @(),
+        # Kept only for callers of the exported FunctionsOnly helper.  The
+        # executable wrapper always supplies a pre-invocation file snapshot.
+        [datetime]$AttemptStarted
     )
 
     $attemptReport = Get-DailyAttemptReport `
         -DailyReportDir $DailyReportDir `
-        -AttemptStarted $AttemptStarted
+        -ExistingReportPaths $ExistingReportPaths `
+        -PendingReportNames $PendingReportNames
     if ($null -eq $attemptReport) {
         return $false
     }
@@ -101,16 +149,31 @@ $code = 1
 for ($attempt = 1; $attempt -le $maxDailyAttempts; $attempt++) {
     "[$stamp] fundlab daily run starting (attempt $attempt/$maxDailyAttempts)" |
         Tee-Object -FilePath $logFile -Append
-    $attemptStarted = Get-Date
+    $reportSnapshot = Get-DailyReportSnapshot -DailyReportDir $dailyReportDir
+    $pendingReportNames = Get-DailyPendingReportNameSnapshot `
+        -DailyReportDir $dailyReportDir
     & uv run fundlab daily run *>> $logFile
     $code = $LASTEXITCODE
     if ($code -eq 0) {
+        $attemptReport = Get-DailyAttemptReport `
+            -DailyReportDir $dailyReportDir `
+            -ExistingReportPaths $reportSnapshot `
+            -PendingReportNames $pendingReportNames
+        if ($null -eq $attemptReport) {
+            # Exit 0 without a new formal report is not an auditable daily
+            # outcome.  Treat it as a failed run rather than publishing a
+            # misleading success based on an older report.
+            $code = 2
+            "[$stamp] daily run audit failed: no new formal report" |
+                Tee-Object -FilePath $logFile -Append
+        }
         break
     }
     $retryable = $code -eq 2 -and (
         Test-DailyFailureRetryable `
             -DailyReportDir $dailyReportDir `
-            -AttemptStarted $attemptStarted
+            -ExistingReportPaths $reportSnapshot `
+            -PendingReportNames $pendingReportNames
     )
     if (-not $retryable -or $attempt -eq $maxDailyAttempts) {
         break
@@ -123,25 +186,77 @@ for ($attempt = 1; $attempt -le $maxDailyAttempts; $attempt++) {
 
 if ($code -eq 0) {
     Remove-Item -Force (Join-Path $logDir "LAST-RUN-BLOCKED") -ErrorAction SilentlyContinue
-    $attemptReport = Get-DailyAttemptReport `
-        -DailyReportDir $dailyReportDir `
-        -AttemptStarted $attemptStarted
     if ($null -ne $attemptReport -and $attemptReport.Report.status -eq "degraded") {
+        $degradedStages = @(
+            $attemptReport.Report.stages |
+                Where-Object { $_.status -eq "degraded" }
+        )
+        $affectedAccounts = @(
+            $attemptReport.Report.accounts |
+                Where-Object { $_.status -in @("degraded", "blocked") }
+        )
         $quarantine = $attemptReport.Report.stages |
             Where-Object { $_.name -eq "quarantine" } |
             Select-Object -Last 1
-        $marker = [ordered]@{
+
+        $summaryParts = @()
+        if ($null -ne $quarantine) {
+            $count = $quarantine.detail.instrument_count
+            if (
+                $null -ne $count -and
+                -not [string]::IsNullOrWhiteSpace([string]$count)
+            ) {
+                $summaryParts += "$count quarantined instruments"
+            } else {
+                $summaryParts += "quarantine reported"
+            }
+        }
+        if ($degradedStages.Count -gt 0) {
+            $stageNames = @(
+                $degradedStages | ForEach-Object {
+                    if ([string]::IsNullOrWhiteSpace([string]$_.name)) {
+                        "<unnamed>"
+                    } else {
+                        [string]$_.name
+                    }
+                }
+            ) -join ", "
+            $summaryParts += "degraded stages: $stageNames"
+        }
+        if ($affectedAccounts.Count -gt 0) {
+            $accountSummaries = @(
+                $affectedAccounts | ForEach-Object {
+                    $accountId = [string]$_.account_id
+                    if ([string]::IsNullOrWhiteSpace($accountId)) {
+                        $accountId = "<unknown>"
+                    }
+                    "$accountId ($($_.status))"
+                }
+            ) -join ", "
+            $summaryParts += "affected accounts: $accountSummaries"
+        }
+        if ($summaryParts.Count -eq 0) {
+            $summaryParts += "degraded status reported without stage or account detail"
+        }
+        $summary = $summaryParts -join "; "
+
+        $markerData = [ordered]@{
             status = "degraded"
             detected_at = (Get-Date).ToString("o")
             report = $attemptReport.Path
             target_date = $attemptReport.Report.target_date
             snapshot_id = $attemptReport.Report.snapshot_id
-            quarantine = $quarantine.detail
-        } | ConvertTo-Json -Depth 12
+            summary = $summary
+            degraded_stages = $degradedStages
+            affected_accounts = $affectedAccounts
+        }
+        if ($null -ne $quarantine) {
+            $markerData.quarantine = $quarantine.detail
+        }
+        $marker = $markerData | ConvertTo-Json -Depth 12
         Set-Content -LiteralPath (Join-Path $logDir "LAST-RUN-DEGRADED") `
             -Value $marker
-        $count = $quarantine.detail.instrument_count
-        "[$stamp] [DEGRADED] daily run completed with $count quarantined instruments; see $($attemptReport.Path)" |
+        "[$stamp] [DEGRADED] daily run completed with $summary; see $($attemptReport.Path)" |
             Tee-Object -FilePath $logFile -Append
     } else {
         Remove-Item -Force (Join-Path $logDir "LAST-RUN-DEGRADED") -ErrorAction SilentlyContinue

@@ -63,7 +63,7 @@ class ReadinessProfile(StrEnum):
 
 
 CURRENT_SH_SZ_STOCK_ETF_UNIVERSE = "current_sh_sz_stock_etf"
-SIMULATION_PARTITION_VALIDATOR_VERSION = "simulation-partition-r2-v3"
+SIMULATION_PARTITION_VALIDATOR_VERSION = "simulation-partition-r2-v4"
 DATA_GAP_QUARANTINE_RULE_ID = "cn-data-gap-quarantine-no-execution-v1"
 EXECUTION_EVIDENCE_GAP_RULE_ID = "cn-execution-evidence-gap-no-execution-v1"
 
@@ -274,6 +274,20 @@ class ObservationError(MarketDataError):
     pass
 
 
+class ProviderUnavailableError(ObservationError):
+    """The provider could not supply a current observation at all.
+
+    This deliberately excludes malformed or internally inconsistent responses.
+    Callers may carry forward a last trusted observation only for this precise
+    availability condition; every other ``ObservationError`` remains a data
+    contract failure.
+    """
+
+    def __init__(self, message: str, *, endpoint: str | None = None) -> None:
+        super().__init__(message)
+        self.endpoint = endpoint
+
+
 class SourceConflictError(MarketDataError):
     pass
 
@@ -282,8 +296,39 @@ class ReconciliationError(MarketDataError):
     pass
 
 
+@dataclass(frozen=True, order=True)
+class ExecutionEvidenceImpact:
+    """One exact instrument/session whose execution evidence is incomplete."""
+
+    instrument_id: str
+    session_date: str
+
+    def __post_init__(self) -> None:
+        if not self.instrument_id.strip() or not self.session_date.strip():
+            raise ValueError("Execution evidence impacts require instrument_id and session_date")
+
+
 class TradeRuleError(MarketDataError):
-    pass
+    """A trade-rule failure, optionally scoped to exact sessions or instruments.
+
+    Callers that do not understand the scope attributes retain normal exception
+    behaviour.  Empty scopes deliberately mean that the failure is structural
+    and must not be converted into a partial execution guard.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        impacts: tuple[ExecutionEvidenceImpact, ...] = (),
+        instrument_ids: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.impacts = tuple(sorted(set(impacts)))
+        self.instrument_ids = tuple(sorted({
+            str(instrument_id) for instrument_id in instrument_ids
+            if str(instrument_id).strip()
+        }))
 
 
 class SnapshotNotReadyError(MarketDataError):

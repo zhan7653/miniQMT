@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -20,7 +21,7 @@ from fundlab.settings import (
 from fundlab.web.app import create_app
 from fundlab.web.runner import DailyRunLauncher
 from fundlab.web.schedule import ScheduledTaskState, TaskSchedulerError
-from fundlab.web.service import DashboardService, _account_event_visible
+from fundlab.web.service import DashboardError, DashboardService, _account_event_visible
 from fundlab.strategies import write_agent_decision
 from fundlab.trading import TradingRepository
 from tests.canonical.fixtures import DAYS, FUTURE_DAYS, ready_market
@@ -451,6 +452,50 @@ def test_runs_listing_and_detail(dashboard):
     assert client.get("/api/runs/..%2Fescape.json").status_code in (404, 422)
     # Windows path separators must never escape the reports directory.
     assert client.get("/api/runs/daily-..%5C..%5Cescape.json").status_code == 404
+
+
+def test_runs_listing_ignores_hidden_pending_and_invalid_json(dashboard):
+    client, _, settings = dashboard
+    report_root = settings.daily.report_root
+    (report_root / ".daily-pending.json").write_text(
+        '{"status": "pending"}', encoding="utf-8",
+    )
+    (report_root / "daily-corrupt.json").write_text("{", encoding="utf-8")
+
+    files = {item["file"] for item in client.get("/api/runs").json()}
+
+    assert ".daily-pending.json" not in files
+    assert "daily-corrupt.json" not in files
+
+
+def test_run_detail_turns_read_errors_into_dashboard_errors(dashboard, monkeypatch):
+    _, _, settings = dashboard
+    service = DashboardService(settings)
+    report_root = settings.daily.report_root
+    malformed = report_root / "daily-malformed.json"
+    malformed.write_text("{", encoding="utf-8")
+    non_object = report_root / "daily-array.json"
+    non_object.write_text("[]", encoding="utf-8")
+    unreadable = report_root / "daily-unreadable.json"
+    unreadable.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(DashboardError):
+        service.daily_report("daily-missing.json")
+    with pytest.raises(DashboardError):
+        service.daily_report(malformed.name)
+    with pytest.raises(DashboardError):
+        service.daily_report(non_object.name)
+
+    original_read_text = Path.read_text
+
+    def raise_io_error(path, *args, **kwargs):
+        if path == unreadable:
+            raise OSError("fixture read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", raise_io_error)
+    with pytest.raises(DashboardError):
+        service.daily_report(unreadable.name)
 
 
 def test_schedule_lifecycle(dashboard):

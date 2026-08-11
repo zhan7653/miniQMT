@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -21,14 +23,18 @@ from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     HistoryBuildSpec,
     HistoryDatabaseBuilder,
+    IntegrityError,
     MarketDataWarehouse,
     MarketTable,
+    ObservationError,
     ObservationPayload,
     PriceMode,
     ProviderCapability,
+    ProviderSelectionError,
     ProviderRegistry,
     ProviderRequest,
     ReadinessProfile,
+    SourceConflictError,
     UniverseScope,
     compose_history_snapshot,
     derive_current_research_snapshot,
@@ -242,6 +248,481 @@ class _AllTickProvider(_TickProvider):
             {"backend_group": self.backend_group},
         )
 
+
+def test_history_builder_excludes_only_provider_declared_scoped_observation_error(tmp_path):
+    class UnavailableTick(_AllTickProvider):
+        def observe(self, request: ProviderRequest) -> ObservationPayload:
+            if request.capability is ProviderCapability.DAILY_BARS_RAW:
+                raise ObservationError("exact batch unavailable")
+            return super().observe(request)
+
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(UnavailableTick())
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    result = HistoryDatabaseBuilder(
+        warehouse, tmp_path / "reports", registry=registry,
+    ).build(HistoryBuildSpec(END, start_date=START, instrument_ids=("600000.SH",)))
+
+    assert result.status == "incomplete"
+    assert result.included_instruments == 0
+    assert result.excluded_instruments == 1
+    assert result.snapshot_id is None
+    assert result.blockers
+
+
+@pytest.mark.parametrize("error", (
+    IntegrityError("observation commit integrity failure"),
+    OSError("observation commit persistence failure"),
+    RuntimeError("observation commit unexpected failure"),
+))
+def test_history_builder_propagates_durable_observation_commit_failures(
+    tmp_path, monkeypatch, error,
+):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(_AllTickProvider())
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    original_record = warehouse.record_observation
+
+    def fail_daily_raw_commit(payload):
+        if payload.request.capability is ProviderCapability.DAILY_BARS_RAW:
+            raise error
+        return original_record(payload)
+
+    monkeypatch.setattr(warehouse, "record_observation", fail_daily_raw_commit)
+    builder = HistoryDatabaseBuilder(warehouse, tmp_path / "reports", registry=registry)
+
+    with pytest.raises(type(error), match=str(error)):
+        builder.build(HistoryBuildSpec(
+            END, start_date=START, instrument_ids=("600000.SH",),
+        ))
+
+
+def test_history_builder_propagates_unscoped_provider_selection_failure(tmp_path):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    builder = HistoryDatabaseBuilder(
+        MarketDataWarehouse(tmp_path / "market"), tmp_path / "reports", registry=registry,
+    )
+
+    with pytest.raises(ProviderSelectionError):
+        builder.build(HistoryBuildSpec(
+            END, start_date=START, instrument_ids=("600000.SH",),
+        ))
+
+
+def test_history_builder_propagates_unscoped_structural_provider_failure(tmp_path):
+    class StructuralTick(_AllTickProvider):
+        def observe(self, request: ProviderRequest) -> ObservationPayload:
+            if request.capability is ProviderCapability.DAILY_BARS_RAW:
+                raise SourceConflictError("provider returned a structural conflict")
+            return super().observe(request)
+
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(StructuralTick())
+    builder = HistoryDatabaseBuilder(
+        MarketDataWarehouse(tmp_path / "market"), tmp_path / "reports", registry=registry,
+    )
+
+    with pytest.raises(SourceConflictError, match="structural conflict"):
+        builder.build(HistoryBuildSpec(
+            END, start_date=START, instrument_ids=("600000.SH",),
+        ))
+
+
+@pytest.mark.parametrize("error", (
+    IntegrityError("checkpoint observation integrity failure"),
+    OSError("checkpoint observation persistence failure"),
+    RuntimeError("checkpoint observation unexpected failure"),
+))
+def test_history_builder_propagates_checkpoint_reuse_failures(
+    tmp_path, monkeypatch, error,
+):
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(_AllTickProvider())
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    builder = HistoryDatabaseBuilder(warehouse, tmp_path / "reports", registry=registry)
+    spec = HistoryBuildSpec(END, start_date=START, instrument_ids=("600000.SH",))
+    first = builder.build(spec)
+    checkpoint = json.loads(first.checkpoint.read_text(encoding="utf-8"))
+    canonical_id = next(iter(checkpoint["batches"].values()))["canonical_observation_id"]
+    original_load = warehouse.load_observation
+
+    def fail_checkpoint_reuse(observation_id):
+        if observation_id == canonical_id:
+            raise error
+        return original_load(observation_id)
+
+    monkeypatch.setattr(warehouse, "load_observation", fail_checkpoint_reuse)
+
+    with pytest.raises(type(error), match=str(error)):
+        builder.build(spec)
+
+
+def test_history_builder_preserves_adjudicator_source_error_type_in_exclusion(tmp_path):
+    class ConflictTick(_AllTickProvider):
+        def observe(self, request: ProviderRequest) -> ObservationPayload:
+            payload = super().observe(request)
+            frame = payload.tables[MarketTable.DAILY_BARS].copy()
+            frame.loc[:, "close"] = 12.5
+            frame.loc[:, "high"] = 12.5
+            return ObservationPayload(
+                payload.provider,
+                payload.observed_at,
+                payload.request,
+                {MarketTable.DAILY_BARS: frame},
+                payload.coverage,
+                payload.source_metadata,
+            )
+
+    class UnavailableAdjudicator:
+        name = "xtquant"
+        backend_group = "xtquant"
+        capabilities = frozenset({ProviderCapability.DAILY_BARS_RAW})
+
+        def observe(self, request: ProviderRequest) -> ObservationPayload:
+            raise ObservationError("adjudicator unavailable")
+
+    registry = ProviderRegistry()
+    registry.register(_BaoProvider())
+    registry.register(ConflictTick())
+    registry.register(UnavailableAdjudicator())
+    result = HistoryDatabaseBuilder(
+        MarketDataWarehouse(tmp_path / "market"),
+        tmp_path / "reports",
+        registry=registry,
+        adjudicator_provider="xtquant",
+    ).build(HistoryBuildSpec(END, start_date=START, instrument_ids=("600000.SH",)))
+    checkpoint = json.loads(result.checkpoint.read_text(encoding="utf-8"))
+    excluded = next(iter(checkpoint["batches"].values()))["excluded"]["600000.SH"]
+
+    assert "third_source_error:xtquant=ObservationError:adjudicator unavailable" in excluded
+
+
+def _daily_partial_carry_universe(tmp_path):
+    """Return an independently recorded daily partial master and its trust facade."""
+
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    target = END.isoformat()
+    unavailable = {
+        component: {
+            "component": component,
+            "scope": dict(scope),
+            "endpoints": list(history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS[component]),
+            "failed_endpoint": history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS[component][0],
+            "error_type": "ProviderUnavailableError",
+            "message": f"bounded {component} outage",
+        }
+        for component, scope in history_module._OFFICIAL_UNIVERSE_COMPONENT_SCOPES.items()
+        if component != "sh-stock-star"
+    }
+    successful = {
+        endpoint
+        for component, endpoints in history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.items()
+        if component not in unavailable
+        for endpoint in endpoints
+    }
+    raw_metadata = {
+        "backend_group": "exchange-public",
+        "as_of_date": target,
+        "requested_scope": {"exchanges": ("SH", "SZ"), "asset_types": ("stock", "etf")},
+        "unavailable_components": unavailable,
+        "pending_onboarding": {},
+        "response_sha256": {endpoint: "a" * 64 for endpoint in successful},
+        "endpoint_counts": {endpoint: 1 for endpoint in successful},
+        "endpoint_response_counts": {endpoint: 1 for endpoint in successful},
+        "as_of_excluded_future_instrument_ids": {},
+        "component_closure": {
+            "sh-stock-star": {
+                "component": "sh-stock-star",
+                "scope": {"exchange": "SH", "asset_type": "stock", "board": "star"},
+                "endpoints": ["sse-star-stock-list"],
+                "admitted_ids": ["688825.SH"],
+                "endpoint_membership": {
+                    "sse-star-stock-list": {
+                        "response_sha256": "a" * 64,
+                        "raw_row_count": 1,
+                        "effective_row_count": 1,
+                        "raw_ids": ["688825.SH"],
+                        "comparison_product_class_values": {},
+                        "comparison_product_class_filtered_ids": [],
+                        "authoritative_for_master": True,
+                        "duplicate_occurrences": {},
+                        "duplicate_row_count": 0,
+                        "admission_partitions": {
+                            "admitted": ["688825.SH"],
+                            "pending_onboarding": [],
+                            "future_as_of": [],
+                            "duplicate_identity": [],
+                            "membership_conflict": [],
+                            "intentionally_out_of_component": [],
+                        },
+                    },
+                },
+            },
+        },
+    }
+    raw_frame = _official_master().loc[
+        lambda value: value["instrument_id"].eq("688825.SH")
+    ].reset_index(drop=True)
+    raw_frame["field_lineage"] = json.dumps({
+        "upstream": "exchange-public",
+        "endpoint": "sse-star-stock-list",
+        "response_sha256": "a" * 64,
+    })
+    raw = warehouse.record_observation(ObservationPayload(
+        "exchange-public",
+        datetime(2026, 7, 18, 0, 3, tzinfo=timezone.utc),
+        ProviderRequest(ProviderCapability.INSTRUMENTS, parameters={
+            "exchanges": ("SH", "SZ"), "asset_types": ("stock", "etf"),
+            "as_of_date": target,
+        }),
+        {MarketTable.INSTRUMENTS: raw_frame},
+        (CoverageClaim(MarketTable.INSTRUMENTS, False, instrument_ids=("688825.SH",)),),
+        raw_metadata,
+    ))
+    raw_stored = warehouse.read_observation_table(raw.observation_id, MarketTable.INSTRUMENTS)
+    predecessor_frame = history_module.normalize_table(
+        MarketTable.INSTRUMENTS,
+        _master(),
+        provider="trusted-predecessor",
+        observed_at="2026-07-17T00:00:00+00:00",
+        require_observation_id=False,
+    )
+    predecessor_id = "snap-trusted"
+    observed_at = datetime(2026, 7, 18, 0, 4, tzinfo=timezone.utc)
+    expected = history_module.normalize_table(
+        MarketTable.INSTRUMENTS,
+        pd.concat((raw_stored, predecessor_frame), ignore_index=True),
+        provider=history_module.DAILY_CARRY_UNIVERSE_PROVIDER,
+        observed_at=observed_at.isoformat(),
+        require_observation_id=False,
+    )
+    canonical = warehouse.record_observation(ObservationPayload(
+        history_module.DAILY_CARRY_UNIVERSE_PROVIDER,
+        observed_at,
+        ProviderRequest(ProviderCapability.CANONICAL_RECONCILIATION, parameters={
+            "target_date": target,
+            "predecessor_snapshot_id": predecessor_id,
+            "official_observation_ids": (raw.observation_id,),
+            "reason": "official_universe_component_unavailable",
+            "pipeline": history_module.DAILY_CARRY_PIPELINE_VERSION,
+        }),
+        {MarketTable.INSTRUMENTS: expected},
+        (CoverageClaim(
+            MarketTable.INSTRUMENTS, True,
+            instrument_ids=tuple(expected["instrument_id"]),
+        ),),
+        {
+            "kind": history_module.DAILY_CARRY_UNIVERSE_KIND,
+            "pipeline": history_module.DAILY_CARRY_PIPELINE_VERSION,
+            "target_date": target,
+            "predecessor_snapshot_id": predecessor_id,
+            "input_observation_ids": (raw.observation_id,),
+            "degraded_detail": {
+                "unavailable_components": unavailable,
+                "pending_onboarding": {},
+            },
+        },
+    ))
+    scope = UniverseScope(
+        CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+        END,
+        START - timedelta(days=1),
+        START - timedelta(days=1),
+        instrument_ids=tuple(predecessor_frame["instrument_id"]),
+    )
+    predecessor = SimpleNamespace(
+        snapshot_id=predecessor_id,
+        plan=SimpleNamespace(readiness=ReadinessProfile.SIMULATION, universe_scope=scope),
+        quality=SimpleNamespace(ready=True),
+        component_selections=(object(),),
+    )
+    facade = SimpleNamespace(
+        load_observation=warehouse.load_observation,
+        read_observation_table=warehouse.read_observation_table,
+        current_snapshot_id=lambda: predecessor_id,
+        load_snapshot=lambda snapshot_id: predecessor,
+        query_loaded_snapshot_table=lambda *_args, **_kwargs: predecessor_frame.copy(),
+    )
+    return facade, canonical, warehouse.read_observation_table(
+        canonical.observation_id, MarketTable.INSTRUMENTS,
+    )
+
+
+def test_explicit_history_accepts_verified_daily_partial_carry_for_successful_new_listing(tmp_path):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+
+    history_module._validate_explicit_history_universe(
+        warehouse,
+        canonical,
+        frame,
+        HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+        trusted_predecessor_snapshot_id=None,
+    )
+
+
+@pytest.mark.parametrize("mutation", (
+    "provider", "pipeline", "input", "predecessor", "merged_row", "price_tick",
+))
+def test_explicit_history_rejects_tampered_daily_partial_carry_provenance(tmp_path, mutation):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+    if mutation == "provider":
+        canonical = replace(canonical, provider="canonical-universe-carry-forward-daily-pipeline-v1")
+    elif mutation == "pipeline":
+        canonical = replace(canonical, source_metadata={
+            **canonical.source_metadata, "pipeline": "daily-pipeline-v1",
+        })
+    elif mutation == "input":
+        canonical = replace(canonical, source_metadata={
+            **canonical.source_metadata, "input_observation_ids": ("obs-missing",),
+        })
+    elif mutation == "predecessor":
+        canonical = replace(canonical, source_metadata={
+            **canonical.source_metadata, "predecessor_snapshot_id": "snap-other",
+        })
+    elif mutation == "merged_row":
+        frame = frame.copy()
+        frame.loc[frame["instrument_id"].eq("688825.SH"), "name"] = "forged raw row"
+    else:
+        frame = frame.copy()
+        frame.loc[frame["instrument_id"].eq("688825.SH"), "price_tick"] += 1e-12
+
+    with pytest.raises(ValueError):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
+
+
+def test_explicit_history_rejects_new_listing_only_present_in_carried_predecessor(tmp_path):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+
+    with pytest.raises(ValueError, match="successful official universe components"):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("600000.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
+
+
+def test_explicit_history_rejects_daily_partial_carry_with_noncontiguous_predecessor(tmp_path):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+    predecessor = warehouse.load_snapshot("snap-trusted")
+    stale_scope = replace(
+        predecessor.plan.universe_scope,
+        history_start=START - timedelta(days=2),
+        history_end=START - timedelta(days=2),
+    )
+    warehouse.load_snapshot = lambda _snapshot_id: SimpleNamespace(
+        snapshot_id="snap-trusted",
+        plan=SimpleNamespace(
+            readiness=ReadinessProfile.SIMULATION, universe_scope=stale_scope,
+        ),
+        quality=SimpleNamespace(ready=True),
+        component_selections=(object(),),
+    )
+
+    with pytest.raises(ValueError, match="trusted simulation snapshot"):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
+
+
+def test_explicit_history_rejects_daily_partial_raw_backend_or_pending_overlap(tmp_path):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+    raw_id = canonical.request.parameters["official_observation_ids"][0]
+    original_load = warehouse.load_observation
+
+    def wrong_backend(observation_id):
+        manifest = original_load(observation_id)
+        if observation_id == raw_id:
+            return replace(manifest, source_metadata={
+                **manifest.source_metadata, "backend_group": "forged-backend",
+            })
+        return manifest
+
+    warehouse.load_observation = wrong_backend
+    with pytest.raises(ValueError, match="fixed official request"):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
+    raw = original_load(raw_id)
+    invalid_pending = {"688825.SH": {}}
+    warehouse.load_observation = lambda observation_id: (
+        replace(raw, source_metadata={
+            **raw.source_metadata, "pending_onboarding": invalid_pending,
+        }) if observation_id == raw_id else original_load(observation_id)
+    )
+    canonical = replace(canonical, source_metadata={
+        **canonical.source_metadata,
+        "degraded_detail": {
+            **canonical.source_metadata["degraded_detail"],
+            "pending_onboarding": invalid_pending,
+        },
+    })
+    with pytest.raises(ObservationError, match="Pending onboarding id was admitted"):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("effective_count", "lineage"))
+def test_explicit_history_propagates_exchange_component_closure_failures(tmp_path, mutation):
+    warehouse, canonical, frame = _daily_partial_carry_universe(tmp_path)
+    raw_id = canonical.request.parameters["official_observation_ids"][0]
+    original_load = warehouse.load_observation
+    original_read = warehouse.read_observation_table
+    if mutation == "effective_count":
+        raw = original_load(raw_id)
+        metadata = deepcopy(dict(raw.source_metadata))
+        metadata["component_closure"]["sh-stock-star"]["endpoint_membership"][
+            "sse-star-stock-list"
+        ]["effective_row_count"] = 2
+        warehouse.load_observation = lambda observation_id: (
+            replace(raw, source_metadata=metadata)
+            if observation_id == raw_id else original_load(observation_id)
+        )
+        match = "effective count mismatch"
+    else:
+        def forged_lineage(observation_id, table):
+            result = original_read(observation_id, table)
+            if observation_id == raw_id and table is MarketTable.INSTRUMENTS:
+                result = result.copy()
+                result.loc[:, "field_lineage"] = json.dumps({"endpoint": "forged"})
+            return result
+
+        warehouse.read_observation_table = forged_lineage
+        match = "no authoritative successful endpoint"
+
+    with pytest.raises(ObservationError, match=match):
+        history_module._validate_explicit_history_universe(
+            warehouse,
+            canonical,
+            frame,
+            HistoryBuildSpec(END, start_date=START, instrument_ids=("688825.SH",)),
+            trusted_predecessor_snapshot_id=None,
+        )
 
 def test_history_source_capture_reuses_verified_date_prefix(tmp_path):
     class RangeProvider:
@@ -1231,6 +1712,9 @@ def test_no_trade_partition_reports_active_evidence_per_instrument():
     )))
     universe = SimpleNamespace(
         provider="exchange-public",
+        request=ProviderRequest(ProviderCapability.INSTRUMENTS, parameters={
+            "as_of_date": END.isoformat(),
+        }),
         source_metadata={"as_of_date": END.isoformat()},
         observed_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
@@ -1295,6 +1779,89 @@ def test_no_trade_partition_reports_active_evidence_per_instrument():
         "510050.SH": ("obs-baostock",),
     }
     assert "510050.SH" in str(caught.value)
+
+
+def test_no_trade_pending_onboarding_membership_is_exactly_bound_to_official_view():
+    observed_at = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    pending = {
+        "510050.SH": {
+            "listed_date": "2026-07-15",
+            "reason": "official_new_instrument_master_future_listed_date",
+            "target_date": END.isoformat(),
+        },
+    }
+    raw_frame = history_module.normalize_table(
+        MarketTable.INSTRUMENTS,
+        _master(),
+        provider="exchange-public",
+        observed_at=observed_at.isoformat(),
+        require_observation_id=False,
+    )
+    wrapper_frame = history_module.normalize_table(
+        MarketTable.INSTRUMENTS,
+        raw_frame.loc[raw_frame["instrument_id"].eq("600000.SH")],
+        provider=history_module.DAILY_PENDING_UNIVERSE_PROVIDER,
+        observed_at=observed_at.isoformat(),
+        require_observation_id=False,
+    )
+    raw = SimpleNamespace(
+        observation_id="obs-official",
+        provider="exchange-public",
+        request=ProviderRequest(ProviderCapability.INSTRUMENTS, parameters={
+            "as_of_date": END.isoformat(),
+        }),
+        source_metadata={"as_of_date": END.isoformat()},
+    )
+    wrapper = SimpleNamespace(
+        provider=history_module.DAILY_PENDING_UNIVERSE_PROVIDER,
+        observed_at=observed_at,
+        request=ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            parameters={
+                "target_date": END.isoformat(),
+                "official_observation_id": raw.observation_id,
+                "pending_onboarding": pending,
+                "pipeline": history_module.DAILY_CARRY_PIPELINE_VERSION,
+            },
+        ),
+        coverage=(CoverageClaim(
+            MarketTable.INSTRUMENTS,
+            True,
+            instrument_ids=("600000.SH",),
+        ),),
+        source_metadata={
+            "kind": history_module.DAILY_PENDING_UNIVERSE_KIND,
+            "official_observation_id": raw.observation_id,
+            "pending_onboarding": pending,
+        },
+    )
+    warehouse = SimpleNamespace(
+        load_observation=lambda observation_id: raw,
+        read_observation_table=lambda observation_id, table: raw_frame,
+    )
+
+    history_module._validate_no_trade_current_membership(
+        warehouse,
+        wrapper,
+        wrapper_frame,
+        predecessor_snapshot_id="snap-predecessor",
+        start_date=END,
+        end_date=END,
+        instrument_ids=("600000.SH",),
+    )
+
+    tampered = wrapper_frame.copy()
+    tampered.loc[:, "price_tick"] += 1e-12
+    with pytest.raises(ValueError, match="exact official-minus-pending view"):
+        history_module._validate_no_trade_current_membership(
+            warehouse,
+            wrapper,
+            tampered,
+            predecessor_snapshot_id="snap-predecessor",
+            start_date=END,
+            end_date=END,
+            instrument_ids=("600000.SH",),
+        )
 
 
 def test_no_trade_partition_reuse_requires_the_exact_validated_boundary(tmp_path):

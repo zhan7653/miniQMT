@@ -9,7 +9,11 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 from fundlab.common.canonical import canonical_json, stable_digest
-from fundlab.marketdata.contracts import PriceLimitState, TradeRuleError
+from fundlab.marketdata.contracts import (
+    ExecutionEvidenceImpact,
+    PriceLimitState,
+    TradeRuleError,
+)
 
 
 @dataclass(frozen=True)
@@ -215,7 +219,10 @@ def audit_provider_price_limits(
         piece["provider"] = str(provider)
         pieces.append(piece)
     if not pieces:
-        raise TradeRuleError("Price-limit audit has no provider observations")
+        raise TradeRuleError(
+            "Price-limit audit has no provider observations",
+            impacts=_price_limit_impacts(bounded[keys]),
+        )
     observed = pd.concat(pieces, ignore_index=True)
     joined = bounded[keys + ["limit_up", "limit_down", "price_tick"]].merge(
         observed,
@@ -237,10 +244,13 @@ def audit_provider_price_limits(
     ).reindex(pd.MultiIndex.from_frame(bounded[keys]), fill_value=0)
     minimum = int(counts.min()) if not counts.empty else 0
     if minimum < 2:
-        key = counts.idxmin() if not counts.empty else ("unknown", "unknown", "raw")
+        insufficient = counts.loc[counts.lt(2)]
+        impacts = _price_limit_impacts_from_index(insufficient.index)
+        key = impacts[0] if impacts else ExecutionEvidenceImpact("unknown", "unknown")
         raise TradeRuleError(
             "Price-limit audit needs two independent provider observations for "
-            f"{key[0]}/{key[1]}"
+            f"{key.instrument_id}/{key.session_date}",
+            impacts=impacts,
         )
     direct_checks = 0
     direct_conflicts = 0
@@ -273,10 +283,13 @@ def audit_provider_price_limits(
         latest_verified = int(direct_counts.ge(2).sum())
         latest_minimum = int(direct_counts.min()) if not direct_counts.empty else 0
         if latest_bounded and latest_minimum < 2:
-            key = direct_counts.idxmin()
+            insufficient = direct_counts.loc[direct_counts.lt(2)]
+            impacts = _price_limit_impacts_from_index(insufficient.index)
+            key = impacts[0]
             raise TradeRuleError(
                 "Price-limit audit needs two direct provider limit values for "
-                f"{key[0]}/{key[1]}"
+                f"{key.instrument_id}/{key.session_date}",
+                impacts=impacts,
             )
     payload = {
         "bounded_sessions": len(bounded),
@@ -293,6 +306,28 @@ def audit_provider_price_limits(
         "source_observation_ids": _provider_observation_ids(provider_bars),
     }
     return PriceLimitAudit(**payload, evidence_hash=stable_digest(payload))
+
+
+def _price_limit_impacts(keys: pd.DataFrame) -> tuple[ExecutionEvidenceImpact, ...]:
+    return tuple(sorted({
+        ExecutionEvidenceImpact(str(row.instrument_id), str(row.session_date)[:10])
+        for row in keys[["instrument_id", "session_date"]].itertuples(index=False)
+    }))
+
+
+def _execution_impacts(rows: pd.DataFrame) -> tuple[ExecutionEvidenceImpact, ...]:
+    """Return exact row impacts without widening a local evidence failure."""
+
+    return _price_limit_impacts(rows)
+
+
+def _price_limit_impacts_from_index(
+    index: pd.MultiIndex,
+) -> tuple[ExecutionEvidenceImpact, ...]:
+    return tuple(sorted({
+        ExecutionEvidenceImpact(str(key[0]), str(key[1])[:10])
+        for key in index.tolist()
+    }))
 
 
 def _provider_observation_ids(
@@ -347,11 +382,17 @@ def resolve_order_quantity_rule(
             ),
         )
     raw_minimum = instrument.get("buy_lot")
-    if raw_minimum is None or pd.isna(raw_minimum) or int(raw_minimum) <= 0:
+    try:
+        minimum = int(raw_minimum)
+    except (TypeError, ValueError, OverflowError):
+        raise TradeRuleError(f"Invalid minimum buy quantity: {instrument_id}") from None
+    if raw_minimum is None or pd.isna(raw_minimum) or minimum <= 0:
         raise TradeRuleError(f"Invalid minimum buy quantity: {instrument_id}")
-    minimum = int(raw_minimum)
     raw_step = instrument.get("quantity_step")
-    step = minimum if raw_step is None or pd.isna(raw_step) else int(raw_step)
+    try:
+        step = minimum if raw_step is None or pd.isna(raw_step) else int(raw_step)
+    except (TypeError, ValueError, OverflowError):
+        raise TradeRuleError(f"Invalid quantity step: {instrument_id}") from None
     if step <= 0:
         raise TradeRuleError(f"Invalid quantity step: {instrument_id}")
     raw_odd_lot = instrument.get("odd_lot_sell_all")
@@ -486,7 +527,8 @@ def materialize_daily_trade_rules(
     if invalid_unknown_st.any():
         row = result.loc[invalid_unknown_st].iloc[0]
         raise TradeRuleError(
-            f"ST state is unknown: {row['instrument_id']}/{row['session_date']}"
+            f"ST state is unknown: {row['instrument_id']}/{row['session_date']}",
+            impacts=_execution_impacts(result.loc[invalid_unknown_st]),
         )
 
     prepared_etf = _prepare_etf_rules(etf_rules)
@@ -510,7 +552,10 @@ def materialize_daily_trade_rules(
                 sample = result.loc[interval].iloc[0]
                 raise TradeRuleError(
                     "ETF session requires exactly one explicit dated rule: "
-                    f"{sample['instrument_id']}/{sample['session_date']}"
+                    f"{sample['instrument_id']}/{sample['session_date']}",
+                    impacts=_execution_impacts(result.loc[
+                        interval & result["_etf_rule_token"].notna()
+                    ]),
                 )
             result.loc[interval, "_etf_rule_token"] = token
             etf_decisions[token] = RuleDecision(
@@ -530,7 +575,8 @@ def materialize_daily_trade_rules(
         sample = result.loc[missing_etf_rule].iloc[0]
         raise TradeRuleError(
             "ETF session requires exactly one explicit dated rule: "
-            f"{sample['instrument_id']}/{sample['session_date']}"
+            f"{sample['instrument_id']}/{sample['session_date']}",
+            impacts=_execution_impacts(result.loc[missing_etf_rule]),
         )
 
     result["_session_bucket"] = 0
@@ -627,7 +673,27 @@ def materialize_daily_trade_rules(
         if result.loc[bounded, "previous_close"].isna().any():
             row = result.loc[bounded & result["previous_close"].isna()].iloc[0]
             raise TradeRuleError(
-                f"Bounded rule has no previous_close: {row['instrument_id']}/{row['session_date']}"
+                f"Bounded rule has no previous_close: {row['instrument_id']}/{row['session_date']}",
+                impacts=_execution_impacts(result.loc[
+                    bounded & result["previous_close"].isna()
+                ]),
+            )
+        bounded_rows = result.loc[bounded]
+        ticks = pd.to_numeric(bounded_rows["price_tick"], errors="coerce")
+        prices = pd.to_numeric(bounded_rows["previous_close"], errors="coerce")
+        invalid_price_or_tick = ticks.isna() | ticks.le(0) | prices.isna()
+        if invalid_price_or_tick.any():
+            raise TradeRuleError(
+                "Bounded rule has invalid price/tick values",
+                impacts=_execution_impacts(bounded_rows.loc[invalid_price_or_tick]),
+            )
+        units_raw = prices / ticks
+        if (units_raw.sub(units_raw.round()).abs() > 1e-6).any():
+            raise TradeRuleError(
+                "Previous close is not aligned to the instrument price tick",
+                impacts=_execution_impacts(bounded_rows.loc[
+                    units_raw.sub(units_raw.round()).abs() > 1e-6
+                ]),
             )
         if decision.upper_multiplier is not None:
             upper_multiplier = decision.upper_multiplier

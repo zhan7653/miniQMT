@@ -180,6 +180,36 @@ def test_provider_price_limit_audit_requires_two_direct_latest_boundaries():
     assert audit.minimum_direct_limit_observations_latest_session == 2
 
 
+def test_provider_price_limit_audit_reports_all_exact_local_impacts():
+    days = ("2026-07-16", "2026-07-17")
+    derived = materialize_daily_trade_rules(
+        _bars("600000.SH", tuple((day, False, False, 10.0) for day in days)),
+        _instrument("600000.SH"),
+        _calendar(*days),
+    )
+    provider = pd.DataFrame([
+        {
+            "instrument_id": "600000.SH", "session_date": day,
+            "price_mode": "raw", "high": 10.8, "low": 9.2,
+            "limit_up": None, "limit_down": None,
+        }
+        for day in days
+    ])
+
+    with pytest.raises(TradeRuleError) as failure:
+        audit_provider_price_limits(derived, {"only-one": provider})
+
+    assert [(item.instrument_id, item.session_date) for item in failure.value.impacts] == [
+        ("600000.SH", "2026-07-16"),
+        ("600000.SH", "2026-07-17"),
+    ]
+
+    malformed = provider.drop(columns=["high"])
+    with pytest.raises(TradeRuleError) as failure:
+        audit_provider_price_limits(derived, {"malformed": malformed})
+    assert failure.value.impacts == ()
+
+
 def test_historical_limit_exception_requires_two_independent_boundary_observations():
     day = "2015-12-18"
     derived = materialize_daily_trade_rules(
@@ -281,6 +311,103 @@ def test_initial_suspension_keeps_unknown_state_without_future_leakage():
     assert pd.isna(row["previous_close"])
     assert pd.isna(row["is_st"])
     assert row[["limit_up", "limit_down"]].isna().all()
+
+
+def test_daily_rule_errors_expose_all_exact_execution_impacts():
+    days = ("2026-07-16", "2026-07-17")
+    bars = _bars("600000.SH", tuple((day, False, False, 10.0) for day in days))
+    bars["is_st"] = pd.Series([pd.NA, pd.NA], dtype="boolean")
+
+    with pytest.raises(TradeRuleError, match="ST state is unknown") as failure:
+        materialize_daily_trade_rules(bars, _instrument("600000.SH"), _calendar(*days))
+
+    assert [(item.instrument_id, item.session_date) for item in failure.value.impacts] == [
+        ("600000.SH", "2026-07-16"),
+        ("600000.SH", "2026-07-17"),
+    ]
+
+    bars = _bars("600000.SH", tuple((day, False, False, 10.0) for day in days))
+    bars["previous_close"] = pd.NA
+    with pytest.raises(TradeRuleError, match="Bounded rule has no previous_close") as failure:
+        materialize_daily_trade_rules(bars, _instrument("600000.SH"), _calendar(*days))
+
+    assert [(item.instrument_id, item.session_date) for item in failure.value.impacts] == [
+        ("600000.SH", "2026-07-16"),
+        ("600000.SH", "2026-07-17"),
+    ]
+
+
+def test_etf_dated_rule_gap_and_conflict_expose_exact_execution_impacts():
+    days = ("2026-07-16", "2026-07-17")
+    bars = _bars("513100.SH", tuple((day, False, False, 2.0) for day in days))
+    instrument = _instrument("513100.SH", asset_type="etf", listed_date="2013-05-15")
+
+    with pytest.raises(TradeRuleError, match="exactly one explicit dated rule") as failure:
+        materialize_daily_trade_rules(bars, instrument, _calendar(*days))
+
+    assert [(item.instrument_id, item.session_date) for item in failure.value.impacts] == [
+        ("513100.SH", "2026-07-16"),
+        ("513100.SH", "2026-07-17"),
+    ]
+
+    rules = pd.DataFrame([
+        {
+            "instrument_id": "513100.SH", "effective_from": date(2015, 1, 19),
+            "effective_to": None, "known_date": date(2015, 1, 9),
+            "price_limit_ratio": 0.10, "sell_delay_sessions": 0,
+            "rule_id": "sse-cross-border-etf-t0-2015-v1", "evidence": "source-a",
+        },
+        {
+            "instrument_id": "513100.SH", "effective_from": date(2020, 1, 1),
+            "effective_to": None, "known_date": date(2019, 12, 20),
+            "price_limit_ratio": 0.10, "sell_delay_sessions": 0,
+            "rule_id": "sse-cross-border-etf-t0-2020-v1", "evidence": "source-b",
+        },
+    ])
+    with pytest.raises(TradeRuleError, match="exactly one explicit dated rule") as failure:
+        materialize_daily_trade_rules(bars, instrument, _calendar(*days), etf_rules=rules)
+
+    assert [(item.instrument_id, item.session_date) for item in failure.value.impacts] == [
+        ("513100.SH", "2026-07-16"),
+        ("513100.SH", "2026-07-17"),
+    ]
+
+
+def test_untrusted_master_quantity_failure_remains_structural():
+    instrument = _instrument("600000.SH")
+    instrument["buy_lot"] = 0
+
+    with pytest.raises(TradeRuleError, match="Invalid minimum buy quantity") as failure:
+        materialize_daily_trade_rules(
+            _bars("600000.SH", (("2026-07-17", False, False, 10.0),)),
+            instrument,
+            _calendar("2026-07-17"),
+        )
+
+    assert failure.value.impacts == ()
+    assert failure.value.instrument_ids == ()
+
+    with pytest.raises(TradeRuleError, match="Rule materialization has no instrument") as failure:
+        materialize_daily_trade_rules(
+            _bars("600000.SH", (("2026-07-17", False, False, 10.0),)),
+            _instrument("600001.SH"),
+            _calendar("2026-07-17"),
+        )
+
+    assert failure.value.impacts == ()
+    assert failure.value.instrument_ids == ()
+
+
+def test_unsupported_asset_type_remains_a_structural_trade_rule_failure():
+    with pytest.raises(TradeRuleError, match="Unsupported rule asset type") as failure:
+        materialize_daily_trade_rules(
+            _bars("600000.SH", (("2026-07-17", False, False, 10.0),)),
+            _instrument("600000.SH", asset_type="bond"),
+            _calendar("2026-07-17"),
+        )
+
+    assert failure.value.impacts == ()
+    assert failure.value.instrument_ids == ()
 
 
 def test_etf_rule_is_never_inferred_from_name_or_code():

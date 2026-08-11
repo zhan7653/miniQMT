@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, timezone
 from itertools import combinations
 import json
 import os
@@ -19,11 +19,15 @@ from fundlab.common.canonical import canonical_json, stable_digest, to_primitive
 from fundlab.marketdata.contracts import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CoverageClaim,
+    IntegrityError,
+    MarketDataError,
     MarketTable,
     ObservationManifest,
+    ObservationError,
     ObservationPayload,
     PriceMode,
     ProviderCapability,
+    ProviderSelectionError,
     ProviderRequest,
     ReadinessProfile,
     SnapshotManifest,
@@ -36,8 +40,9 @@ from fundlab.marketdata.reconciliation import (
     ReconciliationPolicy,
     default_reconciliation_policy,
 )
-from fundlab.marketdata.schema import BUSINESS_SCHEMAS
+from fundlab.marketdata.schema import BUSINESS_SCHEMAS, normalize_table
 from fundlab.marketdata.sources import default_provider_registry
+from fundlab.marketdata.sources.exchange import validate_exchange_component_closure
 from fundlab.marketdata.trade_rules import materialize_order_quantity_rules
 from fundlab.marketdata.warehouse import MarketDataWarehouse
 
@@ -47,8 +52,41 @@ DEFAULT_SOURCE_PAIR = ("tickflow", "baostock")
 HISTORY_BUILD_SCHEMA_VERSION = 6
 NO_TRADE_RESEARCH_PROVIDER = "canonical-no-trade-reconciler-r2-v1"
 NO_TRADE_RESEARCH_VALIDATOR_VERSION = "no-trade-research-r2-v1"
+DAILY_CARRY_UNIVERSE_PROVIDER = "canonical-universe-carry-forward-daily-pipeline-v2"
+DAILY_CARRY_UNIVERSE_KIND = "degraded_universe_carry_forward"
+DAILY_CARRY_PIPELINE_VERSION = "daily-pipeline-v2"
+DAILY_PENDING_UNIVERSE_PROVIDER = "canonical-pending-onboarding-daily-pipeline-v2"
+DAILY_PENDING_UNIVERSE_KIND = "pending_onboarding_scope"
+_OFFICIAL_UNIVERSE_COMPONENT_SCOPES: Mapping[str, Mapping[str, str]] = {
+    "sh-stock-main": {"exchange": "SH", "asset_type": "stock", "board": "main"},
+    "sh-stock-star": {"exchange": "SH", "asset_type": "stock", "board": "star"},
+    "sz-stock": {"exchange": "SZ", "asset_type": "stock"},
+    "sh-etf": {"exchange": "SH", "asset_type": "etf"},
+    "sz-etf": {"exchange": "SZ", "asset_type": "etf"},
+}
+_OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
+    "sh-stock-main": ("sse-main-stock-list",),
+    "sh-stock-star": ("sse-star-stock-list",),
+    "sz-stock": ("szse-a-stock-list",),
+    "sh-etf": ("sse-etf-scale-list", "sse-current-full-etf-list"),
+    "sz-etf": ("szse-etf-scale-daily", "szse-current-etf-list"),
+}
 _HELD_BUILD_LOCKS: set[Path] = set()
 _HELD_BUILD_LOCKS_GUARD = Lock()
+
+
+class _ScopedSourceAcquisitionError(MarketDataError):
+    """A provider-declared, batch-scoped acquisition failure.
+
+    This marker is deliberately created only around ``registry.observe`` for an
+    exact history request.  Warehouse reads, durable observation commits and
+    reconciliation validation must retain their original exceptions so an
+    integrity or persistence fault cannot be mistaken for an upstream gap.
+    """
+
+    def __init__(self, source_error: MarketDataError) -> None:
+        self.source_error_type = type(source_error).__name__
+        super().__init__(str(source_error))
 
 
 class NoTradeSourceActiveError(ValueError):
@@ -241,6 +279,128 @@ def find_no_trade_research_partition(
     return None
 
 
+def _validate_no_trade_current_membership(
+    warehouse: MarketDataWarehouse,
+    universe: ObservationManifest,
+    frame: pd.DataFrame,
+    *,
+    predecessor_snapshot_id: str,
+    start_date: date,
+    end_date: date,
+    instrument_ids: tuple[str, ...],
+) -> None:
+    """Prove no-trade candidates remain in the current admitted official scope."""
+
+    target = set(instrument_ids)
+    frame_ids = tuple(map(str, frame.get("instrument_id", ())))
+    if len(frame_ids) != len(set(frame_ids)) or not target <= set(frame_ids):
+        raise ValueError("No-trade evidence requires current official membership")
+
+    if universe.provider == "exchange-public":
+        if (
+            universe.request.capability is not ProviderCapability.INSTRUMENTS
+            or str(universe.request.parameters.get("as_of_date"))[:10]
+            != end_date.isoformat()
+            or str(universe.source_metadata.get("as_of_date"))[:10]
+            != end_date.isoformat()
+        ):
+            raise ValueError("No-trade evidence requires current official membership")
+        return
+
+    if universe.provider == DAILY_CARRY_UNIVERSE_PROVIDER:
+        _validate_daily_carried_history_universe(
+            warehouse,
+            universe,
+            frame,
+            HistoryBuildSpec(
+                end_date,
+                start_date=start_date,
+                instrument_ids=instrument_ids,
+                universe_as_of=end_date,
+            ),
+        )
+        return
+
+    if universe.provider != DAILY_PENDING_UNIVERSE_PROVIDER:
+        raise ValueError("No-trade evidence requires current official membership")
+
+    parameters = universe.request.parameters
+    metadata = universe.source_metadata
+    pending_request = parameters.get("pending_onboarding")
+    pending_metadata = metadata.get("pending_onboarding")
+    official_id = parameters.get("official_observation_id")
+    claims = tuple(
+        claim for claim in universe.coverage
+        if claim.table is MarketTable.INSTRUMENTS
+    )
+    if (
+        universe.request.capability is not ProviderCapability.CANONICAL_RECONCILIATION
+        or set(parameters) != {
+            "target_date", "official_observation_id", "pending_onboarding", "pipeline",
+        }
+        or set(metadata) != {
+            "kind", "official_observation_id", "pending_onboarding",
+        }
+        or parameters.get("pipeline") != DAILY_CARRY_PIPELINE_VERSION
+        or str(parameters.get("target_date"))[:10] != end_date.isoformat()
+        or metadata.get("kind") != DAILY_PENDING_UNIVERSE_KIND
+        or not isinstance(official_id, str)
+        or not official_id
+        or metadata.get("official_observation_id") != official_id
+        or not isinstance(pending_request, Mapping)
+        or not pending_request
+        or not isinstance(pending_metadata, Mapping)
+        or dict(pending_metadata) != dict(pending_request)
+        or len(claims) != 1
+        or not claims[0].complete
+        or set(claims[0].instrument_ids) != set(frame_ids)
+    ):
+        raise ValueError("No-trade pending-onboarding membership proof is invalid")
+
+    pending_ids = set(map(str, pending_request))
+    if pending_ids & set(frame_ids):
+        raise ValueError("No-trade pending-onboarding scope still contains pending rows")
+    official = warehouse.load_observation(official_id)
+    official_frame = warehouse.read_observation_table(
+        official_id, MarketTable.INSTRUMENTS,
+    )
+    _validate_no_trade_current_membership(
+        warehouse,
+        official,
+        official_frame,
+        predecessor_snapshot_id=predecessor_snapshot_id,
+        start_date=start_date,
+        end_date=end_date,
+        instrument_ids=instrument_ids,
+    )
+    expected = official_frame.loc[
+        ~official_frame["instrument_id"].astype(str).isin(pending_ids)
+    ].reset_index(drop=True)
+    expected = normalize_table(
+        MarketTable.INSTRUMENTS,
+        expected,
+        provider=universe.provider,
+        observed_at=universe.observed_at.astimezone(timezone.utc).isoformat(),
+        require_observation_id=False,
+    )
+    actual = frame.reset_index(drop=True)
+    if not actual.equals(expected):
+        raise ValueError(
+            "No-trade pending-onboarding scope is not the exact official-minus-pending view"
+        )
+    try:
+        pd.testing.assert_frame_equal(
+            actual,
+            expected,
+            check_dtype=True,
+            check_exact=True,
+        )
+    except AssertionError as exc:
+        raise ValueError(
+            "No-trade pending-onboarding scope is not the exact official-minus-pending view"
+        ) from exc
+
+
 def record_no_trade_research_partition(
     warehouse: MarketDataWarehouse,
     *,
@@ -278,12 +438,15 @@ def record_no_trade_research_partition(
     universe_frame = warehouse.read_observation_table(
         universe_observation_id, MarketTable.INSTRUMENTS,
     )
-    if (
-        universe.provider != "exchange-public"
-        or str(universe.source_metadata.get("as_of_date"))[:10] != end_date.isoformat()
-        or not set(target) <= set(map(str, universe_frame["instrument_id"]))
-    ):
-        raise ValueError("No-trade evidence requires current official membership")
+    _validate_no_trade_current_membership(
+        warehouse,
+        universe,
+        universe_frame,
+        predecessor_snapshot_id=predecessor_snapshot_id,
+        start_date=start_date,
+        end_date=end_date,
+        instrument_ids=target,
+    )
     calendar = warehouse.load_observation(calendar_observation_id)
     calendar_quality = calendar.source_metadata.get("calendar_quality")
     if (
@@ -1013,7 +1176,12 @@ class HistoryDatabaseBuilder:
                 instrument_ids,
                 parameters,
             )
-            return self._capture_exact(provider, request, refresh=spec.refresh)
+            return self._capture_exact(
+                provider,
+                request,
+                refresh=spec.refresh,
+                scope_source_acquisition_errors=True,
+            )
 
         # The two required backends are independent I/O channels.  Capture them in
         # parallel, but do not reconcile or checkpoint the batch until both immutable
@@ -1029,8 +1197,8 @@ class HistoryDatabaseBuilder:
                 provider = futures[future]
                 try:
                     observed, was_reused = future.result()
-                except Exception as exc:
-                    failures[provider] = f"{type(exc).__name__}:{str(exc)[:240]}"
+                except _ScopedSourceAcquisitionError as exc:
+                    failures[provider] = f"{exc.source_error_type}:{str(exc)[:240]}"
                 else:
                     source_manifests[provider] = observed
                     reused = reused and was_reused
@@ -1084,12 +1252,15 @@ class HistoryDatabaseBuilder:
             )
             try:
                 adjudicator, was_reused = self._capture_exact(
-                    self.adjudicator_provider, request, refresh=spec.refresh,
+                    self.adjudicator_provider,
+                    request,
+                    refresh=spec.refresh,
+                    scope_source_acquisition_errors=True,
                 )
-            except Exception as exc:
+            except _ScopedSourceAcquisitionError as exc:
                 reason = (
                     f"third_source_error:{self.adjudicator_provider}="
-                    f"{type(exc).__name__}:{str(exc)[:240]}"
+                    f"{exc.source_error_type}:{str(exc)[:240]}"
                 )
                 augmented = {
                     key: tuple(sorted({*value, reason})) if key in conflict_ids else value
@@ -1502,7 +1673,18 @@ class HistoryDatabaseBuilder:
         request: ProviderRequest,
         *,
         refresh: bool,
+        scope_source_acquisition_errors: bool = False,
     ) -> tuple[ObservationManifest, bool]:
+        def observe_exact(observation_request: ProviderRequest) -> ObservationPayload:
+            if not scope_source_acquisition_errors:
+                return self.registry.observe(provider, observation_request)
+            try:
+                return self.registry.observe(provider, observation_request)
+            except (IntegrityError, ProviderSelectionError):
+                raise
+            except ObservationError as exc:
+                raise _ScopedSourceAcquisitionError(exc) from exc
+
         if not refresh:
             matches = self.warehouse.matching_observations(provider=provider, request=request)
             if request.capability is not ProviderCapability.DAILY_BARS_RAW:
@@ -1524,12 +1706,12 @@ class HistoryDatabaseBuilder:
                     request.instrument_ids,
                     request.parameters,
                 )
-                suffix_payload = self.registry.observe(provider, suffix_request)
+                suffix_payload = observe_exact(suffix_request)
                 suffix = self.warehouse.record_observation(suffix_payload)
                 combined = self._record_combined_range(provider, request, prefix, suffix)
                 self._range_observations.pop(provider, None)
                 return combined, False
-        payload = self.registry.observe(provider, request)
+        payload = observe_exact(request)
         recorded = self.warehouse.record_observation(payload)
         self._range_observations.pop(provider, None)
         return recorded, False
@@ -1657,10 +1839,7 @@ class HistoryDatabaseBuilder:
         if not canonical_id:
             return None
         if canonical_id:
-            try:
-                manifest = self.warehouse.load_observation(str(canonical_id))
-            except Exception:
-                return None
+            manifest = self.warehouse.load_observation(str(canonical_id))
             if (
                 manifest.source_metadata.get("kind") != "field_level_reconciliation"
                 or not manifest.source_metadata.get("reconciliation_ready")
@@ -1669,9 +1848,9 @@ class HistoryDatabaseBuilder:
         source_ids = payload.get("source_observation_ids", {})
         if not isinstance(source_ids, Mapping):
             return None
+        for observation_id in source_ids.values():
+            self.warehouse.load_observation(str(observation_id))
         try:
-            for observation_id in source_ids.values():
-                self.warehouse.load_observation(str(observation_id))
             return HistoryBatchResult(
                 str(payload["batch_id"]),
                 tuple(payload.get("requested_instruments", ())),
@@ -2107,6 +2286,19 @@ def _validate_explicit_history_universe(
 ) -> None:
     """Accept only a complete official current-universe proof for new listings."""
 
+    if universe.provider == DAILY_CARRY_UNIVERSE_PROVIDER:
+        raw_ids = _validate_daily_carried_history_universe(
+            warehouse, universe, frame, spec,
+        )
+        _validate_explicit_history_universe_selection(
+            warehouse,
+            frame,
+            spec,
+            trusted_predecessor_snapshot_id=trusted_predecessor_snapshot_id,
+            raw_official_instrument_ids=raw_ids,
+        )
+        return
+
     if universe.provider != "exchange-public":
         raise ValueError(
             "Explicit history universe override must be an exchange-public observation"
@@ -2245,6 +2437,50 @@ def _validate_explicit_history_universe(
             "Explicit history universe rows do not match one exact complete coverage claim"
         )
 
+    _validate_explicit_history_universe_selection(
+        warehouse,
+        frame,
+        spec,
+        trusted_predecessor_snapshot_id=trusted_predecessor_snapshot_id,
+        raw_official_instrument_ids=None,
+    )
+
+
+def _validate_explicit_history_universe_selection(
+    warehouse: MarketDataWarehouse,
+    frame: pd.DataFrame,
+    spec: HistoryBuildSpec,
+    *,
+    trusted_predecessor_snapshot_id: str | None,
+    raw_official_instrument_ids: set[str] | None,
+) -> None:
+    """Validate exact supplement rows after their master provenance is proven."""
+
+    required_columns = {
+        "instrument_id", "exchange", "local_code", "asset_type", "name",
+        "currency", "listed_date", "board", "buy_lot", "price_tick",
+    }
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            "Explicit history universe table misses required metadata columns: "
+            + ",".join(missing_columns)
+        )
+    table_ids = tuple(map(str, frame["instrument_id"]))
+    if not table_ids or len(table_ids) != len(set(table_ids)):
+        raise ValueError(
+            "Explicit history universe table is empty or has duplicate instruments"
+        )
+    expected_exchanges = {"SH", "SZ"}
+    expected_assets = {"stock", "etf"}
+    if (
+        not set(map(str, frame["exchange"])) <= expected_exchanges
+        or not set(map(str, frame["asset_type"])) <= expected_assets
+    ):
+        raise ValueError(
+            "Explicit history universe table contains instruments outside SH/SZ stock/ETF"
+        )
+
     requested = set(spec.instrument_ids)
     if not requested:
         raise ValueError(
@@ -2261,6 +2497,15 @@ def _validate_explicit_history_universe(
     ):
         raise ValueError(
             "Explicit history universe instruments fall outside the build categories"
+        )
+    if (
+        trusted_predecessor_snapshot_id is None
+        and raw_official_instrument_ids is not None
+        and not requested <= raw_official_instrument_ids
+    ):
+        raise ValueError(
+            "New-listing supplement instruments must be present in the successful "
+            "official universe components, not only carried from the predecessor"
         )
 
     trusted_rows: dict[str, Mapping[str, Any]] = {}
@@ -2340,6 +2585,391 @@ def _validate_explicit_history_universe(
             f"missing={invalid_fields!r} listed_dates={invalid_dates!r} "
             f"predecessor_identity={invalid_predecessor_identity!r}"
         )
+
+
+def _validate_daily_carried_history_universe(
+    warehouse: MarketDataWarehouse,
+    universe: ObservationManifest,
+    frame: pd.DataFrame,
+    spec: HistoryBuildSpec,
+) -> set[str]:
+    """Prove a daily partial master is exactly raw-official plus trusted carry rows."""
+
+    parameters = universe.request.parameters
+    metadata = universe.source_metadata
+    if (
+        universe.request.capability is not ProviderCapability.CANONICAL_RECONCILIATION
+        or metadata.get("kind") != DAILY_CARRY_UNIVERSE_KIND
+        or parameters.get("pipeline") != DAILY_CARRY_PIPELINE_VERSION
+        or metadata.get("pipeline") != DAILY_CARRY_PIPELINE_VERSION
+        or str(parameters.get("target_date"))[:10] != spec.end_date.isoformat()
+        or str(metadata.get("target_date"))[:10] != spec.end_date.isoformat()
+        or spec.universe_as_of != spec.end_date
+    ):
+        raise ValueError("Daily carried universe has an invalid canonical identity")
+    predecessor_id = parameters.get("predecessor_snapshot_id")
+    if (
+        not isinstance(predecessor_id, str)
+        or not predecessor_id
+        or metadata.get("predecessor_snapshot_id") != predecessor_id
+    ):
+        raise ValueError("Daily carried universe predecessor binding is invalid")
+    official_ids = parameters.get("official_observation_ids")
+    input_ids = metadata.get("input_observation_ids")
+    if (
+        not isinstance(official_ids, tuple)
+        or len(official_ids) != 1
+        or not isinstance(official_ids[0], str)
+        or not isinstance(input_ids, (tuple, list))
+        or tuple(input_ids) != official_ids
+    ):
+        raise ValueError("Daily carried universe must pin exactly one official raw input")
+    claims = tuple(claim for claim in universe.coverage if claim.table is MarketTable.INSTRUMENTS)
+    canonical_ids = tuple(map(str, frame.get("instrument_id", ())))
+    if (
+        len(claims) != 1
+        or not claims[0].complete
+        or set(claims[0].instrument_ids) != set(canonical_ids)
+        or not canonical_ids
+        or len(canonical_ids) != len(set(canonical_ids))
+    ):
+        raise ValueError("Daily carried universe requires one exact complete canonical claim")
+
+    raw = warehouse.load_observation(official_ids[0])
+    raw_frame = warehouse.read_observation_table(raw.observation_id, MarketTable.INSTRUMENTS)
+    raw_claims = tuple(
+        claim for claim in raw.coverage
+        if claim.table is MarketTable.INSTRUMENTS
+    )
+    raw_complete = len(raw_claims) == 1 and raw_claims[0].complete
+    if not raw_complete or "component_closure" in raw.source_metadata:
+        validate_exchange_component_closure(
+            metadata=raw.source_metadata,
+            frame=raw_frame,
+        )
+    if raw_complete:
+        _validate_daily_complete_official_input(raw, raw_frame, spec)
+    else:
+        _validate_daily_partial_official_input(raw, raw_frame, spec)
+    raw_ids = set(map(str, raw_frame["instrument_id"]))
+    carried_detail = metadata.get("degraded_detail")
+    if (
+        not isinstance(carried_detail, Mapping)
+        or carried_detail.get("unavailable_components")
+        != raw.source_metadata.get("unavailable_components")
+        or carried_detail.get("pending_onboarding")
+        != raw.source_metadata.get("pending_onboarding")
+    ):
+        raise ValueError("Daily carried universe degraded detail does not bind its raw input")
+
+    if warehouse.current_snapshot_id() != predecessor_id:
+        raise ValueError("Daily carried universe predecessor is not the current snapshot")
+    predecessor = warehouse.load_snapshot(predecessor_id)
+    predecessor_scope = predecessor.plan.universe_scope
+    if (
+        predecessor.plan.readiness is not ReadinessProfile.SIMULATION
+        or not predecessor.quality.ready
+        or not predecessor.component_selections
+        or predecessor_scope is None
+        or predecessor_scope.definition != CURRENT_SH_SZ_STOCK_ETF_UNIVERSE
+        or predecessor_scope.history_end + timedelta(days=1) != spec.start_date
+    ):
+        raise ValueError("Daily carried universe predecessor is not a trusted simulation snapshot")
+    predecessor_frame = warehouse.query_loaded_snapshot_table(
+        predecessor, MarketTable.INSTRUMENTS,
+    )
+    predecessor_ids = tuple(map(str, predecessor_frame.get("instrument_id", ())))
+    if not predecessor_ids or len(predecessor_ids) != len(set(predecessor_ids)):
+        raise ValueError("Daily carried universe predecessor master is not exact")
+    if raw_complete:
+        removed_ids = tuple(sorted(set(predecessor_ids) - raw_ids))
+        if (
+            parameters.get("reason")
+            != "official_universe_removed_predecessor_instruments"
+            or not removed_ids
+            or set(carried_detail) != {
+                "reason", "removed_count", "removed_sample", "carried_instruments",
+                "source_snapshot_id", "pending_onboarding", "unavailable_components",
+            }
+            or carried_detail.get("reason")
+            != "official_universe_removed_predecessor_instruments"
+            or carried_detail.get("removed_count") != len(removed_ids)
+            or tuple(carried_detail.get("removed_sample", ())) != removed_ids[:20]
+            or carried_detail.get("carried_instruments") != len(removed_ids)
+            or carried_detail.get("source_snapshot_id") != predecessor_id
+            or carried_detail.get("pending_onboarding") not in ({}, None)
+            or carried_detail.get("unavailable_components") not in ({}, None)
+        ):
+            raise ValueError("Daily complete official carry evidence is not exact")
+    expected = pd.concat((
+        raw_frame,
+        predecessor_frame.loc[~predecessor_frame["instrument_id"].astype(str).isin(raw_ids)],
+    ), ignore_index=True)
+    expected = expected.drop_duplicates("instrument_id", keep="first")
+    expected = normalize_table(
+        MarketTable.INSTRUMENTS,
+        expected,
+        provider=universe.provider,
+        observed_at=universe.observed_at.astimezone(timezone.utc).isoformat(),
+        require_observation_id=False,
+    )
+    actual = frame.reset_index(drop=True)
+    expected = expected.reset_index(drop=True)
+    if not actual.equals(expected):
+        raise ValueError(
+            "Daily carried universe frame is not the exact raw-first/predecessor merge"
+        )
+    try:
+        pd.testing.assert_frame_equal(
+            actual,
+            expected,
+            check_dtype=True,
+            check_exact=True,
+        )
+    except AssertionError as exc:
+        raise ValueError(
+            "Daily carried universe frame is not the exact raw-first/predecessor merge"
+        ) from exc
+    return raw_ids
+
+
+def _validate_daily_complete_official_input(
+    raw: ObservationManifest,
+    frame: pd.DataFrame,
+    spec: HistoryBuildSpec,
+) -> None:
+    raw_ids = tuple(map(str, frame.get("instrument_id", ())))
+    claims = tuple(
+        claim for claim in raw.coverage
+        if claim.table is MarketTable.INSTRUMENTS
+    )
+    requested_scope = raw.source_metadata.get("requested_scope")
+    if (
+        raw.provider != "exchange-public"
+        or raw.source_metadata.get("backend_group") != "exchange-public"
+        or raw.request.capability is not ProviderCapability.INSTRUMENTS
+        or raw.request.instrument_ids
+        or str(raw.request.parameters.get("as_of_date"))[:10]
+        != spec.universe_as_of.isoformat()
+        or str(raw.source_metadata.get("as_of_date"))[:10]
+        != spec.universe_as_of.isoformat()
+        or {
+            str(item).upper() for item in raw.request.parameters.get("exchanges", ())
+        } != {"SH", "SZ"}
+        or {
+            str(item).lower() for item in raw.request.parameters.get("asset_types", ())
+        } != {"stock", "etf"}
+        or not isinstance(requested_scope, Mapping)
+        or {str(item).upper() for item in requested_scope.get("exchanges", ())}
+        != {"SH", "SZ"}
+        or {str(item).lower() for item in requested_scope.get("asset_types", ())}
+        != {"stock", "etf"}
+        or len(claims) != 1
+        or not claims[0].complete
+        or set(claims[0].instrument_ids) != set(raw_ids)
+        or not raw_ids
+        or len(raw_ids) != len(set(raw_ids))
+        or raw.source_metadata.get("unavailable_components") not in ({}, None)
+        or raw.source_metadata.get("pending_onboarding") not in ({}, None)
+    ):
+        raise ValueError("Daily carried universe raw complete input is not exact official scope")
+
+
+def _validate_daily_partial_official_input(
+    raw: ObservationManifest,
+    frame: pd.DataFrame,
+    spec: HistoryBuildSpec,
+) -> None:
+    if (
+        raw.provider != "exchange-public"
+        or raw.source_metadata.get("backend_group") != "exchange-public"
+        or raw.request.capability is not ProviderCapability.INSTRUMENTS
+        or raw.request.instrument_ids
+        or str(raw.request.parameters.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
+        or str(raw.source_metadata.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
+        or {
+            str(item).upper() for item in raw.request.parameters.get("exchanges", ())
+        } != {"SH", "SZ"}
+        or {
+            str(item).lower() for item in raw.request.parameters.get("asset_types", ())
+        } != {"stock", "etf"}
+    ):
+        raise ValueError("Daily carried universe raw input is not the fixed official request")
+    raw_ids = tuple(map(str, frame.get("instrument_id", ())))
+    claims = tuple(claim for claim in raw.coverage if claim.table is MarketTable.INSTRUMENTS)
+    unavailable = raw.source_metadata.get("unavailable_components")
+    pending = raw.source_metadata.get("pending_onboarding")
+    if (
+        len(claims) != 1
+        or claims[0].complete
+        or set(claims[0].instrument_ids) != set(raw_ids)
+        or not isinstance(unavailable, Mapping)
+        or not isinstance(pending, Mapping)
+        or not (unavailable or pending)
+    ):
+        raise ValueError("Daily carried universe raw input must be an exact incomplete observation")
+    detail = raw.source_metadata
+    _validate_daily_partial_endpoint_evidence(detail, unavailable)
+    _validate_daily_partial_pending_and_future(detail, frame, unavailable)
+    for component, component_detail in unavailable.items():
+        expected_scope = _OFFICIAL_UNIVERSE_COMPONENT_SCOPES.get(str(component))
+        endpoints = _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.get(str(component))
+        if expected_scope is None or endpoints is None or not isinstance(component_detail, Mapping):
+            raise ValueError("Daily carried universe has an unknown unavailable component")
+        if (
+            set(component_detail) - {"component", "scope", "endpoints", "failed_endpoint", "error_type", "message"}
+            or dict(component_detail.get("scope", {})) != dict(expected_scope)
+            or tuple(component_detail.get("endpoints", ())) != endpoints
+            or component_detail.get("failed_endpoint") not in endpoints
+            or component_detail.get("error_type") != "ProviderUnavailableError"
+            or not isinstance(component_detail.get("message"), str)
+            or not component_detail["message"].strip()
+        ):
+            raise ValueError("Daily carried universe unavailable component evidence is invalid")
+    required_columns = {"instrument_id", "exchange", "asset_type", "board"}
+    if not required_columns <= set(frame.columns):
+        raise ValueError("Daily carried universe raw input lacks component identity columns")
+    for row in frame.loc[:, sorted(required_columns)].to_dict("records"):
+        if _daily_universe_component(row) in unavailable:
+            raise ValueError("Daily carried universe raw input contains an unavailable component row")
+
+
+def _validate_daily_partial_endpoint_evidence(
+    metadata: Mapping[str, Any],
+    unavailable: Mapping[str, Any],
+) -> None:
+    scope = metadata.get("requested_scope")
+    if (
+        not isinstance(scope, Mapping)
+        or set(scope) != {"exchanges", "asset_types"}
+        or set(scope["exchanges"]) != {"SH", "SZ"}
+        or set(scope["asset_types"]) != {"stock", "etf"}
+    ):
+        raise ValueError("Daily carried universe raw requested scope is invalid")
+    successful = {
+        endpoint
+        for component, endpoints in _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.items()
+        if component not in unavailable
+        for endpoint in endpoints
+    }
+    maps = {
+        "response_sha256": metadata.get("response_sha256"),
+        "endpoint_counts": metadata.get("endpoint_counts"),
+        "endpoint_response_counts": metadata.get("endpoint_response_counts"),
+    }
+    if any(not isinstance(item, Mapping) or set(item) != successful for item in maps.values()):
+        raise ValueError("Daily carried universe endpoint evidence is not component-closed")
+    for endpoint in successful:
+        if (
+            not isinstance(maps["response_sha256"][endpoint], str)
+            or not maps["response_sha256"][endpoint].strip()
+            or not isinstance(maps["endpoint_response_counts"][endpoint], int)
+            or isinstance(maps["endpoint_response_counts"][endpoint], bool)
+            or maps["endpoint_response_counts"][endpoint] <= 0
+            or not isinstance(maps["endpoint_counts"][endpoint], int)
+            or isinstance(maps["endpoint_counts"][endpoint], bool)
+            or maps["endpoint_counts"][endpoint] < 0
+        ):
+            raise ValueError("Daily carried universe endpoint evidence is invalid")
+
+
+def _validate_daily_partial_pending_and_future(
+    metadata: Mapping[str, Any],
+    frame: pd.DataFrame,
+    unavailable: Mapping[str, Any],
+) -> None:
+    """Validate every admitted exclusion against the exchange source contract."""
+
+    pending = metadata["pending_onboarding"]
+    future = metadata.get("as_of_excluded_future_instrument_ids", {})
+    hashes = metadata["response_sha256"]
+    successful_endpoints = set(hashes)
+    raw_ids = set(map(str, frame["instrument_id"]))
+    if not isinstance(future, Mapping):
+        raise ValueError("Daily carried universe future-exclusion evidence is malformed")
+    future_allowed = {
+        "sse-current-full-etf-list", "szse-current-etf-list",
+    } & successful_endpoints
+    if not set(future) <= future_allowed:
+        raise ValueError("Daily carried universe future exclusions name an invalid endpoint")
+    future_ids: set[str] = set()
+    for endpoint, values in future.items():
+        if (
+            not isinstance(values, (list, tuple))
+            or tuple(values) != tuple(sorted(set(map(str, values))))
+            or any(not str(value).endswith((".SH", ".SZ")) for value in values)
+        ):
+            raise ValueError("Daily carried universe future exclusions are not exact IDs")
+        future_ids.update(map(str, values))
+    if future_ids & raw_ids:
+        raise ValueError("Daily carried universe future exclusions overlap admitted rows")
+    for instrument_id, detail in pending.items():
+        if (
+            not isinstance(instrument_id, str)
+            or not instrument_id
+            or instrument_id in raw_ids
+            or not isinstance(detail, Mapping)
+            or not {"missing_fields", "invalid_fields", "conflict_fields", "endpoint", "raw_evidence"}
+            <= set(detail)
+            or set(detail) - {
+                "missing_fields", "invalid_fields", "conflict_fields", "endpoint",
+                "raw_evidence", "membership_evidence",
+            }
+        ):
+            raise ValueError("Daily carried universe pending-onboarding evidence is malformed")
+        fields = tuple(detail[name] for name in (
+            "missing_fields", "invalid_fields", "conflict_fields",
+        ))
+        if (
+            any(
+                not isinstance(value, (list, tuple))
+                or tuple(value) != tuple(sorted(set(map(str, value))))
+                or any(not str(item).strip() for item in value)
+                for value in fields
+            )
+            or not any(fields)
+            or detail["endpoint"] not in successful_endpoints
+        ):
+            raise ValueError("Daily carried universe pending-onboarding fields are invalid")
+        evidence = detail["raw_evidence"]
+        if (
+            not isinstance(evidence, Mapping)
+            or set(evidence) != {"response_sha256", "row"}
+            or evidence["response_sha256"] != hashes[detail["endpoint"]]
+            or not isinstance(evidence["row"], Mapping)
+        ):
+            raise ValueError("Daily carried universe pending raw evidence is invalid")
+        membership = detail.get("membership_evidence")
+        if membership is not None:
+            endpoint_evidence = membership.get("endpoints") if isinstance(membership, Mapping) else None
+            if (
+                "membership" not in detail["conflict_fields"]
+                or not isinstance(endpoint_evidence, Mapping)
+                or len(endpoint_evidence) != 2
+                or any(
+                    endpoint not in successful_endpoints
+                    or not isinstance(value, Mapping)
+                    or set(value) != {"response_sha256", "row"}
+                    or value["response_sha256"] != hashes[endpoint]
+                    for endpoint, value in endpoint_evidence.items()
+                )
+            ):
+                raise ValueError("Daily carried universe pending membership evidence is invalid")
+
+
+def _daily_universe_component(row: Mapping[str, Any]) -> str:
+    exchange = str(row["exchange"])
+    asset_type = str(row["asset_type"])
+    board = str(row.get("board", ""))
+    if exchange == "SH" and asset_type == "stock" and board in {"main", "star"}:
+        return f"sh-stock-{board}"
+    if exchange == "SZ" and asset_type == "stock":
+        return "sz-stock"
+    if exchange == "SH" and asset_type == "etf":
+        return "sh-etf"
+    if exchange == "SZ" and asset_type == "etf":
+        return "sz-etf"
+    raise ValueError("Daily carried universe row is outside fixed component scope")
 
 
 def _select_universe(

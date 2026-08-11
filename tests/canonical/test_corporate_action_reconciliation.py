@@ -8,7 +8,7 @@ import pytest
 from fundlab.common.canonical import canonical_json
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
-    SnapshotNotReadyError,
+    TradeRuleError,
     UniverseScope,
     reconcile_corporate_action_factors,
 )
@@ -131,13 +131,14 @@ def test_actions_and_factors_are_bidirectionally_complete_and_known_at_announcem
 
 
 def test_factor_without_action_blocks_simulation_readiness():
-    with pytest.raises(SnapshotNotReadyError, match="coverage mismatch"):
+    with pytest.raises(TradeRuleError, match="coverage mismatch") as failure:
         reconcile_corporate_action_factors(
             instruments=_instruments(),
             actions=_actions().iloc[:1],
             factors=_factors(),
             universe_scope=_scope(),
         )
+    assert failure.value.instrument_ids == ("510230.SH",)
 
 
 def test_non_position_factor_is_retained_without_becoming_a_holding_action():
@@ -458,13 +459,88 @@ def test_nonzero_factor_economics_cannot_hide_behind_a_different_action_type():
     }
     factors.loc[:, "source_payload"] = canonical_json(payload)
 
-    with pytest.raises(SnapshotNotReadyError, match="cash_per_share.*rights_ratio"):
+    with pytest.raises(TradeRuleError, match="cash_per_share.*rights_ratio") as failure:
         reconcile_corporate_action_factors(
             instruments=_instruments(),
             actions=actions,
             factors=factors,
             universe_scope=_scope(),
         )
+    assert failure.value.instrument_ids == ("510230.SH",)
+
+
+def test_duplicate_semantic_action_failure_carries_exact_instrument_scope():
+    actions = pd.concat((_actions(), _actions().iloc[[0]]), ignore_index=True)
+
+    with pytest.raises(TradeRuleError, match="duplicate semantic") as failure:
+        reconcile_corporate_action_factors(
+            instruments=_instruments(),
+            actions=actions,
+            factors=_factors(),
+            universe_scope=_scope(),
+        )
+
+    assert failure.value.instrument_ids == ("510230.SH",)
+
+
+def test_duplicate_factor_failure_carries_exact_instrument_scope():
+    factors = pd.concat((_factors(), _factors().iloc[[0]]), ignore_index=True)
+
+    with pytest.raises(TradeRuleError, match="duplicate events") as failure:
+        reconcile_corporate_action_factors(
+            instruments=_instruments(),
+            actions=_actions(),
+            factors=factors,
+            universe_scope=_scope(),
+        )
+
+    assert failure.value.instrument_ids == ("510230.SH",)
+
+
+def test_ambiguous_factor_match_carries_exact_instrument_scope():
+    factors = _factors().loc[_factors()["factor_id"].eq("factor-split")].copy()
+    nearby = pd.concat((factors, factors.copy()), ignore_index=True)
+    nearby.loc[:, "effective_date"] = ("2020-08-16", "2020-08-18")
+
+    with pytest.raises(TradeRuleError, match="Ambiguous") as failure:
+        reconcile_corporate_action_factors(
+            instruments=_instruments(),
+            actions=_actions().loc[_actions()["action_id"].eq("split")],
+            factors=nearby,
+            universe_scope=_scope(),
+        )
+
+    assert failure.value.instrument_ids == ("510230.SH",)
+
+
+def test_missing_known_date_carries_exact_instrument_scope():
+    actions = _actions().loc[_actions()["action_id"].eq("split")].copy()
+    actions.loc[:, "known_date"] = None
+
+    with pytest.raises(TradeRuleError, match="no known date") as failure:
+        reconcile_corporate_action_factors(
+            instruments=_instruments(),
+            actions=actions,
+            factors=_factors().loc[_factors()["factor_id"].eq("factor-split")],
+            universe_scope=_scope(),
+        )
+
+    assert failure.value.instrument_ids == ("510230.SH",)
+
+
+def test_unknown_listed_date_carries_exact_instrument_scope():
+    instruments = _instruments().copy()
+    instruments.loc[:, "listed_date"] = None
+
+    with pytest.raises(TradeRuleError, match="unknown listed date") as failure:
+        reconcile_corporate_action_factors(
+            instruments=instruments,
+            actions=_actions().iloc[:0],
+            factors=_factors().iloc[:0],
+            universe_scope=_scope(),
+        )
+
+    assert failure.value.instrument_ids == ("510230.SH",)
 
 
 def test_missing_noncritical_cash_pay_date_is_explicitly_completed_after_factor_check():

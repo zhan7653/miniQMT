@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
+import json
 
 import pandas as pd
 import pytest
@@ -13,6 +15,7 @@ from fundlab.marketdata import (
     ExchangePublicUniverseProvider,
     MarketTable,
     ObservationError,
+    ProviderUnavailableError,
     ProviderCapability,
     ProviderRequest,
     SinaEtfProvider,
@@ -21,6 +24,10 @@ from fundlab.marketdata import (
     XtQuantProvider,
 )
 from fundlab.marketdata.sources.cninfo import CninfoPublicClient, _cninfo_token
+from fundlab.marketdata.sources.exchange import (
+    _validate_component_closure,
+    validate_exchange_component_closure,
+)
 
 
 START = date(2026, 7, 13)
@@ -113,6 +120,18 @@ def test_exchange_provider_pins_exact_current_sh_sz_stock_etf_membership():
         "szse-etf-scale-daily": 1,
         "szse-current-etf-list": 1,
     }
+    sh_etf_closure = observed.source_metadata["component_closure"]["sh-etf"]
+    assert sh_etf_closure["intersection"] == {
+        "left_endpoint": "sse-etf-scale-list",
+        "right_endpoint": "sse-current-full-etf-list",
+        "left_comparable_ids": ["510300.SH"],
+        "right_comparable_ids": ["510300.SH"],
+        "intersection_ids": ["510300.SH"],
+        "membership_conflict_ids": [],
+    }
+    assert sh_etf_closure["endpoint_membership"]["sse-current-full-etf-list"][
+        "comparison_product_class_filtered_ids"
+    ] == ["511990.SH"]
 
 
 def test_exchange_provider_excludes_announced_future_etfs_from_as_of_membership():
@@ -159,32 +178,675 @@ def test_exchange_provider_excludes_announced_future_etfs_from_as_of_membership(
         "sse-current-full-etf-list": ("588530.SH",),
         "szse-current-etf-list": ("159999.SZ",),
     }
+    sh_full = observed.source_metadata["component_closure"]["sh-etf"][
+        "endpoint_membership"
+    ]["sse-current-full-etf-list"]
+    assert sh_full["admission_partitions"]["future_as_of"] == ["588530.SH"]
+    assert "588530.SH" not in sh_full["admission_partitions"]["pending_onboarding"]
 
 
-def test_exchange_provider_rejects_invalid_official_etf_listing_dates():
+def test_exchange_provider_marks_invalid_official_etf_listing_date_pending_by_exact_id():
     class Client(_ExchangeClient):
         def fund_etf_list_sse(self):
             frame = super().fund_etf_list_sse()
             frame.loc[frame["fundCode"].eq("510300"), "listingDate"] = "unknown"
             return frame
 
-    with pytest.raises(Exception, match="invalid listing dates"):
-        ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
-            ProviderCapability.INSTRUMENTS,
-            parameters={"as_of_date": "2026-07-14"},
-        ))
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    assert "510300.SH" not in set(observed.tables[MarketTable.INSTRUMENTS]["instrument_id"])
+    assert observed.source_metadata["pending_onboarding"]["510300.SH"]["invalid_fields"] == (
+        "listed_date",
+    )
+    assert not observed.coverage[0].complete
 
 
-def test_exchange_provider_rejects_membership_without_required_szse_classification():
+def test_exchange_provider_rejects_decoder_type_error_without_availability_carry_forward():
     class Client(_ExchangeClient):
         def fund_etf_scale_szse(self):
             raise TypeError("incompatible spreadsheet decoder")
 
-    with pytest.raises(Exception, match="szse-current-etf-list"):
+    with pytest.raises(ObservationError, match="szse-current-etf-list") as error:
         ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
             ProviderCapability.INSTRUMENTS,
             parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
         ))
+    assert not isinstance(error.value, ProviderUnavailableError)
+
+
+def test_exchange_provider_rejects_requests_json_decoder_error_without_availability_carry_forward():
+    requests = pytest.importorskip("requests")
+
+    class Client(_ExchangeClient):
+        def fund_etf_scale_sse(self, *, date):
+            raise requests.exceptions.InvalidJSONError("invalid exchange JSON")
+
+    with pytest.raises(ObservationError, match="sse-etf-scale-list") as error:
+        ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+        ))
+    assert not isinstance(error.value, ProviderUnavailableError)
+
+
+def test_exchange_provider_keeps_other_components_when_sz_etf_transport_is_unavailable():
+    class Client(_ExchangeClient):
+        def fund_scale_daily_szse(self, *, start_date, end_date, symbol):
+            raise TimeoutError("SZSE request timed out")
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    assert set(observed.tables[MarketTable.INSTRUMENTS]["instrument_id"]) == {
+        "510300.SH", "511990.SH", "000001.SZ", "300001.SZ", "600000.SH", "688001.SH",
+    }
+    assert observed.source_metadata["unavailable_components"] == {
+        "sz-etf": {
+            "component": "sz-etf",
+            "scope": {"exchange": "SZ", "asset_type": "etf"},
+            "endpoints": ["szse-etf-scale-daily", "szse-current-etf-list"],
+            "failed_endpoint": "szse-etf-scale-daily",
+            "error_type": "ProviderUnavailableError",
+            "message": "Exchange endpoint failed (szse-etf-scale-daily): SZSE request timed out",
+        },
+    }
+    assert json.loads(json.dumps(observed.source_metadata["unavailable_components"])) == (
+        observed.source_metadata["unavailable_components"]
+    )
+    assert validate_exchange_component_closure(
+        metadata=observed.source_metadata,
+        frame=observed.tables[MarketTable.INSTRUMENTS],
+    ) == observed.source_metadata["component_closure"]
+    assert not observed.coverage[0].complete
+
+
+def test_public_exchange_component_closure_validator_rejects_unavailable_and_pending_evidence_tampering():
+    class UnavailableClient(_ExchangeClient):
+        def fund_scale_daily_szse(self, *, start_date, end_date, symbol):
+            raise TimeoutError("SZSE request timed out")
+
+    partial = ExchangePublicUniverseProvider(client=UnavailableClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    unavailable_tamper = deepcopy(dict(partial.source_metadata))
+    unavailable_tamper["unavailable_components"]["sz-etf"]["error_type"] = "RuntimeError"
+    with pytest.raises(ObservationError, match="Unavailable component contract mismatch"):
+        validate_exchange_component_closure(
+            metadata=unavailable_tamper,
+            frame=partial.tables[MarketTable.INSTRUMENTS],
+        )
+
+    class PendingClient(_ExchangeClient):
+        def fund_etf_list_sse(self):
+            frame = super().fund_etf_list_sse()
+            frame.loc[frame["fundCode"].eq("510300"), "listingDate"] = "unknown"
+            return frame
+
+    pending_observed = ExchangePublicUniverseProvider(client=PendingClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    pending_tamper = deepcopy(dict(pending_observed.source_metadata))
+    pending_tamper["pending_onboarding"]["510300.SH"]["raw_evidence"]["response_sha256"] = "0" * 64
+    with pytest.raises(ObservationError, match="Pending onboarding raw evidence hash mismatch"):
+        validate_exchange_component_closure(
+            metadata=pending_tamper,
+            frame=pending_observed.tables[MarketTable.INSTRUMENTS],
+        )
+
+
+def test_public_exchange_component_closure_validator_rejects_pending_suffix_and_stock_future_bypasses():
+    class PendingClient(_ExchangeClient):
+        def stock_info_sh_name_code(self, *, symbol):
+            return pd.DataFrame({
+                "证券代码": ["600000" if symbol == "主板A股" else "688001"],
+                "证券简称": [None],
+                "上市日期": ["1999-11-10"],
+            })
+
+    pending_observed = ExchangePublicUniverseProvider(client=PendingClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={
+            "as_of_date": "2026-07-14",
+            "exchanges": ("SH",),
+            "asset_types": ("stock",),
+        },
+    ))
+    suffix_tamper = deepcopy(dict(pending_observed.source_metadata))
+    entry = suffix_tamper["pending_onboarding"].pop("600000.SH")
+    suffix_tamper["pending_onboarding"]["600000.SZ"] = entry
+    endpoint = suffix_tamper["component_closure"]["sh-stock-main"]["endpoint_membership"][
+        "sse-main-stock-list"
+    ]
+    endpoint["raw_ids"] = ["600000.SZ"]
+    endpoint["admission_partitions"]["pending_onboarding"] = ["600000.SZ"]
+    with pytest.raises(ObservationError, match="does not match endpoint identity"):
+        validate_exchange_component_closure(
+            metadata=suffix_tamper,
+            frame=pending_observed.tables[MarketTable.INSTRUMENTS],
+        )
+
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    stock_future_tamper = deepcopy(dict(observed.source_metadata))
+    main = stock_future_tamper["component_closure"]["sh-stock-main"]
+    main["admitted_ids"] = []
+    partitions = main["endpoint_membership"]["sse-main-stock-list"]["admission_partitions"]
+    partitions["admitted"] = []
+    partitions["future_as_of"] = ["600000.SH"]
+    stock_future_tamper["as_of_excluded_future_instrument_ids"]["sse-main-stock-list"] = (
+        "600000.SH",
+    )
+    without_main_stock = observed.tables[MarketTable.INSTRUMENTS].loc[
+        ~observed.tables[MarketTable.INSTRUMENTS]["instrument_id"].eq("600000.SH")
+    ].copy()
+    with pytest.raises(ObservationError, match="Future-as-of is not allowed"):
+        validate_exchange_component_closure(
+            metadata=stock_future_tamper,
+            frame=without_main_stock,
+        )
+
+
+def test_exchange_component_closure_keeps_successful_new_sh_stock_without_sz_etf_evidence():
+    class Client(_ExchangeClient):
+        def stock_info_sh_name_code(self, *, symbol):
+            frame = super().stock_info_sh_name_code(symbol=symbol)
+            if symbol == "主板A股":
+                return pd.concat((frame, pd.DataFrame([{
+                    "证券代码": "601000", "证券简称": "新证据股份", "上市日期": "2026-01-01",
+                }])), ignore_index=True)
+            return frame
+
+        def fund_scale_daily_szse(self, *, start_date, end_date, symbol):
+            raise TimeoutError("SZSE request timed out")
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    closure = observed.source_metadata["component_closure"]
+    assert set(closure) == {"sh-stock-main", "sh-stock-star", "sz-stock", "sh-etf"}
+    sh_main = closure["sh-stock-main"]
+    endpoint = sh_main["endpoint_membership"]["sse-main-stock-list"]
+    assert sh_main["admitted_ids"] == ["600000.SH", "601000.SH"]
+    assert endpoint["raw_ids"] == ["600000.SH", "601000.SH"]
+    assert endpoint["admission_partitions"]["admitted"] == ["600000.SH", "601000.SH"]
+    assert endpoint["raw_row_count"] == observed.source_metadata["endpoint_response_counts"][
+        "sse-main-stock-list"
+    ]
+    assert "sz-etf" not in closure
+    assert "szse-etf-scale-daily" not in observed.source_metadata["response_sha256"]
+    assert "szse-etf-scale-daily" not in observed.source_metadata["endpoint_response_counts"]
+    assert json.loads(json.dumps(closure)) == closure
+
+
+def test_exchange_component_closure_validator_rejects_missing_and_overlapping_partitions():
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    closure = observed.source_metadata["component_closure"]
+    endpoint_counts = observed.source_metadata["endpoint_response_counts"]
+    endpoint = closure["sh-stock-main"]["endpoint_membership"]["sse-main-stock-list"]
+    instrument_id = endpoint["admission_partitions"]["admitted"][0]
+
+    missing = deepcopy(closure)
+    missing["sh-stock-main"]["endpoint_membership"]["sse-main-stock-list"][
+        "admission_partitions"
+    ]["admitted"] = []
+    with pytest.raises(ValueError, match="do not close raw ids"):
+        _validate_component_closure(missing, endpoint_counts)
+
+    overlapping = deepcopy(closure)
+    overlapping["sh-stock-main"]["endpoint_membership"]["sse-main-stock-list"][
+        "admission_partitions"
+    ]["future_as_of"] = [instrument_id]
+    with pytest.raises(ValueError, match="partitions overlap"):
+        _validate_component_closure(overlapping, endpoint_counts)
+
+
+def test_public_exchange_component_closure_validator_rejects_envelope_and_frame_tampering():
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    assert validate_exchange_component_closure(
+        metadata=observed.source_metadata,
+        frame=observed.tables[MarketTable.INSTRUMENTS],
+    ) == observed.source_metadata["component_closure"]
+
+    tampered_metadata = deepcopy(dict(observed.source_metadata))
+    tampered_metadata["endpoint_counts"]["sse-main-stock-list"] = 0
+    with pytest.raises(ObservationError, match="effective count mismatch"):
+        validate_exchange_component_closure(
+            metadata=tampered_metadata,
+            frame=observed.tables[MarketTable.INSTRUMENTS],
+        )
+
+    tampered_frame = observed.tables[MarketTable.INSTRUMENTS].copy()
+    tampered_frame.loc[tampered_frame.index[0], "field_lineage"] = json.dumps({
+        "endpoint": "not-an-authoritative-endpoint",
+    })
+    with pytest.raises(ObservationError, match="no authoritative successful endpoint"):
+        validate_exchange_component_closure(
+            metadata=observed.source_metadata,
+            frame=tampered_frame,
+        )
+
+
+def test_public_exchange_component_closure_validator_rejects_authority_comparator_and_lineage_bypasses():
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    frame = observed.tables[MarketTable.INSTRUMENTS]
+
+    authority_tamper = deepcopy(dict(observed.source_metadata))
+    authority_tamper["component_closure"]["sh-etf"]["endpoint_membership"][
+        "sse-etf-scale-list"
+    ]["authoritative_for_master"] = True
+    with pytest.raises(ObservationError, match="authority contract mismatch"):
+        validate_exchange_component_closure(metadata=authority_tamper, frame=frame)
+
+    comparator_tamper = deepcopy(dict(observed.source_metadata))
+    comparator_tamper["component_closure"]["sh-etf"]["intersection"][
+        "left_comparable_ids"
+    ] = []
+    with pytest.raises(ObservationError, match="left comparable ids mismatch"):
+        validate_exchange_component_closure(metadata=comparator_tamper, frame=frame)
+
+    intentional_tamper = deepcopy(dict(observed.source_metadata))
+    main = intentional_tamper["component_closure"]["sh-stock-main"]
+    instrument_id = main["admitted_ids"].pop()
+    main["endpoint_membership"]["sse-main-stock-list"]["admission_partitions"][
+        "admitted"
+    ].remove(instrument_id)
+    main["endpoint_membership"]["sse-main-stock-list"]["admission_partitions"][
+        "intentionally_out_of_component"
+    ] = [instrument_id]
+    with pytest.raises(ObservationError, match="intentional filter partition mismatch"):
+        validate_exchange_component_closure(metadata=intentional_tamper, frame=frame)
+
+    lineage_tamper = frame.copy()
+    lineage = json.loads(str(lineage_tamper.loc[lineage_tamper.index[0], "field_lineage"]))
+    lineage["upstream"] = "not-exchange-public"
+    lineage_tamper.loc[lineage_tamper.index[0], "field_lineage"] = json.dumps(lineage)
+    with pytest.raises(ObservationError, match="lineage does not match endpoint evidence"):
+        validate_exchange_component_closure(
+            metadata=observed.source_metadata,
+            frame=lineage_tamper,
+        )
+
+    count_tamper = deepcopy(dict(observed.source_metadata))
+    count_tamper["endpoint_counts"]["sse-main-stock-list"] = True
+    with pytest.raises(ObservationError, match="not a non-negative integer"):
+        validate_exchange_component_closure(metadata=count_tamper, frame=frame)
+
+    hash_tamper = deepcopy(dict(observed.source_metadata))
+    hash_tamper["response_sha256"]["sse-main-stock-list"] = ""
+    with pytest.raises(ObservationError, match="not a SHA-256"):
+        validate_exchange_component_closure(metadata=hash_tamper, frame=frame)
+
+    raw_count_tamper = deepcopy(dict(observed.source_metadata))
+    raw_count_tamper["endpoint_response_counts"]["sse-main-stock-list"] = 2
+    raw_count_tamper["component_closure"]["sh-stock-main"]["endpoint_membership"][
+        "sse-main-stock-list"
+    ]["raw_row_count"] = 2
+    with pytest.raises(ObservationError, match="raw row closure mismatch"):
+        validate_exchange_component_closure(metadata=raw_count_tamper, frame=frame)
+
+    scope_tamper = deepcopy(dict(observed.source_metadata))
+    scope_tamper["requested_scope"] = {"exchanges": "SH", "asset_types": "stock"}
+    with pytest.raises(ObservationError, match="Requested scope must use"):
+        validate_exchange_component_closure(metadata=scope_tamper, frame=frame)
+
+    duplicate_frame = pd.concat((frame, frame.iloc[[0]]), ignore_index=True)
+    with pytest.raises(ObservationError, match="duplicate instrument id"):
+        validate_exchange_component_closure(
+            metadata=observed.source_metadata,
+            frame=duplicate_frame,
+        )
+
+    hash_lineage_tamper = frame.copy()
+    lineage = json.loads(str(hash_lineage_tamper.loc[hash_lineage_tamper.index[0], "field_lineage"]))
+    lineage["response_sha256"] = "0" * 64
+    hash_lineage_tamper.loc[hash_lineage_tamper.index[0], "field_lineage"] = json.dumps(lineage)
+    with pytest.raises(ObservationError, match="lineage does not match endpoint evidence"):
+        validate_exchange_component_closure(
+            metadata=observed.source_metadata,
+            frame=hash_lineage_tamper,
+        )
+
+
+def test_public_exchange_component_closure_validator_rejects_frame_identity_scope_tampering():
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    frame = observed.tables[MarketTable.INSTRUMENTS]
+    index = frame.index[0]
+
+    local_tamper = frame.copy()
+    local_tamper.loc[index, "local_code"] = "999999"
+    with pytest.raises(ObservationError, match="identity fields do not match"):
+        validate_exchange_component_closure(metadata=observed.source_metadata, frame=local_tamper)
+
+    exchange_tamper = frame.copy()
+    exchange_tamper.loc[index, "exchange"] = "SH"
+    with pytest.raises(ObservationError, match="identity fields do not match"):
+        validate_exchange_component_closure(metadata=observed.source_metadata, frame=exchange_tamper)
+
+    asset_tamper = frame.copy()
+    asset_tamper.loc[index, "asset_type"] = "etf"
+    with pytest.raises(ObservationError, match="component identity mismatch"):
+        validate_exchange_component_closure(metadata=observed.source_metadata, frame=asset_tamper)
+
+    board_tamper = frame.copy()
+    board_tamper.loc[index, "board"] = "star"
+    with pytest.raises(ObservationError, match="component identity mismatch"):
+        validate_exchange_component_closure(metadata=observed.source_metadata, frame=board_tamper)
+
+
+def test_public_exchange_component_closure_validator_accepts_canonical_json_key_reordering():
+    observed = ExchangePublicUniverseProvider(client=_ExchangeClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+    canonical_round_trip = json.loads(json.dumps(to_primitive(observed.source_metadata), sort_keys=True))
+
+    assert validate_exchange_component_closure(
+        metadata=canonical_round_trip,
+        frame=observed.tables[MarketTable.INSTRUMENTS],
+    ) == canonical_round_trip["component_closure"]
+
+
+def test_exchange_provider_records_exact_second_sz_etf_endpoint_failure():
+    class Client(_ExchangeClient):
+        def fund_etf_scale_szse(self):
+            raise TimeoutError("SZSE ETF list request timed out")
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    unavailable = observed.source_metadata["unavailable_components"]["sz-etf"]
+    assert unavailable["failed_endpoint"] == "szse-current-etf-list"
+    assert unavailable["failed_endpoint"] in unavailable["endpoints"]
+    assert not observed.coverage[0].complete
+
+
+def test_exchange_provider_records_empty_partial_closure_when_all_components_are_unavailable():
+    class Client(_ExchangeClient):
+        def stock_info_sh_name_code(self, *, symbol):
+            raise TimeoutError(symbol)
+
+        def stock_info_sz_name_code(self, *, symbol):
+            raise TimeoutError(symbol)
+
+        def fund_etf_scale_sse(self, *, date):
+            raise TimeoutError(date)
+
+        def fund_scale_daily_szse(self, *, start_date, end_date, symbol):
+            raise TimeoutError(symbol)
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14"},
+    ))
+
+    assert observed.tables[MarketTable.INSTRUMENTS].empty
+    assert set(observed.source_metadata["unavailable_components"]) == {
+        "sh-stock-main", "sh-stock-star", "sz-stock", "sh-etf", "sz-etf",
+    }
+    assert validate_exchange_component_closure(
+        metadata=observed.source_metadata,
+        frame=observed.tables[MarketTable.INSTRUMENTS],
+    ) == {}
+    assert not observed.coverage[0].complete
+
+
+def test_exchange_provider_rejects_malformed_schema_without_availability_carry_forward():
+    class Client(_ExchangeClient):
+        def fund_etf_scale_szse(self):
+            return pd.DataFrame({"基金代码": ["159919"]})
+
+    with pytest.raises(ObservationError, match="malformed schema") as error:
+        ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+        ))
+    assert not isinstance(error.value, ProviderUnavailableError)
+
+
+def test_exchange_provider_keeps_valid_etfs_and_marks_exact_incomplete_metadata_pending():
+    class Client(_ExchangeClient):
+        def fund_etf_scale_sse(self, *, date):
+            return pd.DataFrame({
+                "基金代码": ["510300", "512000"],
+                "基金简称": ["沪深300ETF", "待补齐ETF"],
+            })
+
+        def fund_etf_list_sse(self):
+            return pd.concat((
+                super().fund_etf_list_sse(),
+                pd.DataFrame([{
+                    "fundCode": "512000", "secNameFull": None, "fundAbbr": None,
+                    "listingDate": "2020-01-01", "subClass": None,
+                }]),
+            ), ignore_index=True)
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+    ))
+
+    instruments = observed.tables[MarketTable.INSTRUMENTS]
+    assert set(instruments["instrument_id"]) == {"510300.SH", "511990.SH", "159919.SZ"}
+    assert "512000.SH" not in set(instruments["instrument_id"])
+    pending = observed.source_metadata["pending_onboarding"]
+    assert pending["512000.SH"]["missing_fields"] == (
+        "exchange_product_class", "name",
+    )
+    assert pending["512000.SH"]["invalid_fields"] == ()
+    assert pending["512000.SH"]["conflict_fields"] == ()
+    assert pending["512000.SH"]["endpoint"] == "sse-current-full-etf-list"
+    assert pending["512000.SH"]["raw_evidence"]["row"]["fundCode"] == "512000"
+    assert len(pending["512000.SH"]["raw_evidence"]["response_sha256"]) == 64
+    assert not observed.coverage[0].complete
+
+
+def test_exchange_provider_localizes_exact_etf_membership_disagreement():
+    class Client(_ExchangeClient):
+        def fund_etf_list_sse(self):
+            return pd.concat((
+                super().fund_etf_list_sse(),
+                pd.DataFrame([{
+                    "fundCode": "512000", "secNameFull": "冲突ETF",
+                    "fundAbbr": "冲突ETF", "listingDate": "2020-01-01", "subClass": "03",
+                }]),
+            ), ignore_index=True)
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+    ))
+
+    assert "512000.SH" not in set(observed.tables[MarketTable.INSTRUMENTS]["instrument_id"])
+    pending = observed.source_metadata["pending_onboarding"]["512000.SH"]
+    assert pending["conflict_fields"] == ("membership",)
+    evidence = pending["membership_evidence"]["endpoints"]
+    assert set(evidence) == {"sse-etf-scale-list", "sse-current-full-etf-list"}
+    assert evidence["sse-etf-scale-list"]["row"] is None
+    assert evidence["sse-current-full-etf-list"]["row"]["fundCode"] == "512000"
+    assert not observed.coverage[0].complete
+
+    tampered = deepcopy(dict(observed.source_metadata))
+    tampered["pending_onboarding"]["512000.SH"]["membership_evidence"]["endpoints"].pop(
+        "sse-etf-scale-list"
+    )
+    with pytest.raises(ObservationError, match="Membership evidence endpoint mismatch"):
+        validate_exchange_component_closure(
+            metadata=tampered,
+            frame=observed.tables[MarketTable.INSTRUMENTS],
+        )
+
+
+def test_exchange_provider_quarantines_duplicate_canonical_master_identity():
+    class Client(_ExchangeClient):
+        def fund_etf_list_sse(self):
+            return pd.concat((
+                super().fund_etf_list_sse(),
+                pd.DataFrame([{
+                    "fundCode": "510300", "secNameFull": "冲突名称ETF",
+                    "fundAbbr": "冲突ETF", "listingDate": "2012-05-28", "subClass": "03",
+                }]),
+            ), ignore_index=True)
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+    ))
+
+    assert "510300.SH" not in set(observed.tables[MarketTable.INSTRUMENTS]["instrument_id"])
+    pending = observed.source_metadata["pending_onboarding"]["510300.SH"]
+    assert pending["conflict_fields"] == ("duplicate_identity", "master")
+    raw_records = pending["raw_evidence"]["row"]["records"]
+    assert len(raw_records) == 2
+    assert {record["row"]["secNameFull"] for record in raw_records} == {
+        "沪深300ETF", "冲突名称ETF",
+    }
+    assert {record["response_sha256"] for record in raw_records} == {
+        observed.source_metadata["response_sha256"]["sse-current-full-etf-list"],
+    }
+    full_closure = observed.source_metadata["component_closure"]["sh-etf"][
+        "endpoint_membership"
+    ]["sse-current-full-etf-list"]
+    assert full_closure["duplicate_row_count"] == 1
+    assert full_closure["duplicate_occurrences"] == {"510300.SH": 2}
+    assert full_closure["admission_partitions"]["duplicate_identity"] == ["510300.SH"]
+    assert not observed.coverage[0].complete
+
+
+def test_exchange_provider_quarantines_duplicate_non_authoritative_etf_comparator_rows():
+    class SseScaleDuplicateClient(_ExchangeClient):
+        def fund_etf_scale_sse(self, *, date):
+            return pd.DataFrame({
+                "基金代码": ["510300", "510300"],
+                "基金简称": ["沪深300ETF", "沪深300ETF重复"],
+            })
+
+    sse_observed = ExchangePublicUniverseProvider(client=SseScaleDuplicateClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+    ))
+    sse_pending = sse_observed.source_metadata["pending_onboarding"]["510300.SH"]
+    assert len(sse_pending["raw_evidence"]["row"]["records"]) == 2
+    assert sse_observed.source_metadata["component_closure"]["sh-etf"][
+        "endpoint_membership"
+    ]["sse-etf-scale-list"]["duplicate_occurrences"] == {"510300.SH": 2}
+
+    class SzDetailDuplicateClient(_ExchangeClient):
+        def fund_etf_scale_szse(self):
+            return pd.DataFrame({
+                "基金代码": ["159919", "159919"],
+                "基金简称": ["沪深300ETF", "沪深300ETF重复"],
+                "上市日期": ["2012-05-28", "2012-05-28"],
+                "基金类别": ["ETF", "ETF"],
+                "投资类别": ["跨市场", "跨市场"],
+            })
+
+    sz_observed = ExchangePublicUniverseProvider(client=SzDetailDuplicateClient()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={"as_of_date": "2026-07-14", "asset_types": ("etf",)},
+    ))
+    sz_pending = sz_observed.source_metadata["pending_onboarding"]["159919.SZ"]
+    assert len(sz_pending["raw_evidence"]["row"]["records"]) == 2
+    assert sz_observed.source_metadata["component_closure"]["sz-etf"][
+        "endpoint_membership"
+    ]["szse-current-etf-list"]["duplicate_occurrences"] == {"159919.SZ": 2}
+
+    tampered = deepcopy(dict(sse_observed.source_metadata))
+    tampered["pending_onboarding"]["510300.SH"]["raw_evidence"]["row"]["records"][1][
+        "基金代码"
+    ] = "510301"
+    with pytest.raises(ObservationError, match="Pending duplicate raw record id mismatch"):
+        validate_exchange_component_closure(
+            metadata=tampered,
+            frame=sse_observed.tables[MarketTable.INSTRUMENTS],
+        )
+
+
+def test_exchange_provider_allows_empty_admitted_frame_when_rows_are_pending_onboarding():
+    class Client(_ExchangeClient):
+        def stock_info_sh_name_code(self, *, symbol):
+            return pd.DataFrame({
+                "证券代码": ["600000" if symbol == "主板A股" else "688001"],
+                "证券简称": [None],
+                "上市日期": ["1999-11-10"],
+            })
+
+    observed = ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+        ProviderCapability.INSTRUMENTS,
+        parameters={
+            "as_of_date": "2026-07-14",
+            "exchanges": ("SH",),
+            "asset_types": ("stock",),
+        },
+    ))
+
+    assert observed.tables[MarketTable.INSTRUMENTS].empty
+    assert not observed.coverage[0].complete
+    assert observed.source_metadata["pending_onboarding"] == {
+        "600000.SH": {
+            "missing_fields": ("name",),
+            "invalid_fields": (),
+            "conflict_fields": (),
+            "endpoint": "sse-main-stock-list",
+            "raw_evidence": {
+                "response_sha256": observed.source_metadata["response_sha256"]["sse-main-stock-list"],
+                "row": {"证券代码": "600000", "证券简称": None, "上市日期": "1999-11-10"},
+            },
+        },
+        "688001.SH": {
+            "missing_fields": ("name",),
+            "invalid_fields": (),
+            "conflict_fields": (),
+            "endpoint": "sse-star-stock-list",
+            "raw_evidence": {
+                "response_sha256": observed.source_metadata["response_sha256"]["sse-star-stock-list"],
+                "row": {"证券代码": "688001", "证券简称": None, "上市日期": "1999-11-10"},
+            },
+        },
+    }
+
+
+def test_exchange_provider_rejects_unscoped_invalid_instrument_code():
+    class Client(_ExchangeClient):
+        def stock_info_sh_name_code(self, *, symbol):
+            return pd.DataFrame({
+                "证券代码": ["not-a-code"], "证券简称": ["坏代码"], "上市日期": ["1999-11-10"],
+            })
+
+    with pytest.raises(ObservationError, match="invalid instrument code") as error:
+        ExchangePublicUniverseProvider(client=Client()).observe(ProviderRequest(
+            ProviderCapability.INSTRUMENTS,
+            parameters={
+                "as_of_date": "2026-07-14",
+                "exchanges": ("SH",),
+                "asset_types": ("stock",),
+            },
+        ))
+    assert not isinstance(error.value, ProviderUnavailableError)
 
 
 class _SinaClient:

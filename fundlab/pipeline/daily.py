@@ -1,9 +1,9 @@
 """One idempotent daily cycle: extend the published snapshot, advance paper accounts.
 
-This module only orchestrates.  Systemic trust failures remain fail-closed.
-Small, explicitly bounded instrument-level availability gaps are published as
-non-tradable quarantine rows so the rest of the daily system can advance while
-the full error is kept visible and recoverable.
+This module only orchestrates.  Unpartitionable trust failures remain fail-closed.
+Explicitly bounded instrument-level availability gaps are published as
+non-tradable quarantine rows, regardless of their count, so every unaffected
+dependency can advance while the full error remains visible and recoverable.
 """
 
 from __future__ import annotations
@@ -22,16 +22,19 @@ from typing import Any, Callable, Mapping
 import pandas as pd
 
 from fundlab.common.canonical import canonical_json, stable_digest, to_primitive
+from fundlab.common.atomic_files import atomic_replace_bytes, publish_immutable_bytes
 from fundlab.marketdata import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CanonicalMarketData,
     CorporateActionReconciliationResult,
     CoverageClaim,
     EvidenceCollectionSpec,
+    IntegrityError,
     MarketDataWarehouse,
     MarketDataError,
     MarketIngestionService,
     MarketTable,
+    ProviderUnavailableError,
     ObservationPayload,
     ProviderCapability,
     ProviderRequest,
@@ -40,10 +43,10 @@ from fundlab.marketdata import (
     SimulationIncrementValidator,
     SimulationSnapshotBuilder,
     SimulationStatusCollector,
-    SnapshotNotReadyError,
     SnapshotPlan,
     SourceSlice,
     StatusCollectionSpec,
+    TradeRuleError,
     UniverseScope,
     build_factor_audit_candidates,
     build_dense_simulation_bars,
@@ -59,6 +62,7 @@ from fundlab.marketdata.history import (
     NoTradeSourceActiveError,
     find_no_trade_research_partition,
 )
+from fundlab.marketdata.sources.exchange import validate_exchange_component_closure
 from fundlab.marketdata.simulation_data import reconcile_simulation_status
 from fundlab.marketdata.contracts import (
     DATA_GAP_QUARANTINE_RULE_ID,
@@ -81,12 +85,32 @@ from fundlab.trading import (
 
 
 PIPELINE_VERSION = "daily-pipeline-v2"
+SUPPORTED_REPORT_PIPELINE_VERSIONS = ("daily-pipeline-v1", PIPELINE_VERSION)
 CALENDAR_PROVIDERS = ("baostock", "sina-calendar")
 NO_TRADE_PROVIDERS = ("tickflow", "xtquant", "baostock")
 DIRECT_LIMIT_PROVIDERS = ("xtquant", "eastmoney-efinance")
 FACTOR_AUDIT_PROVIDER = "canonical-tickflow-adjusted-factor-audit-r2-v1"
 FACTOR_AUDIT_VERSION = "adjusted-price-factor-audit-r2-v1"
 DATA_GAP_QUARANTINE_PROVIDER = "fundlab-data-gap-quarantine"
+
+# Exchange-public reports a bounded outage by these fixed source components.
+# Keep this mapping local to the daily consumer: it is the contract that lets
+# a partially observed official universe remain safe to carry forward without
+# treating parser or membership defects as an endpoint outage.
+_OFFICIAL_UNIVERSE_COMPONENT_SCOPES: Mapping[str, Mapping[str, str]] = {
+    "sh-stock-main": {"exchange": "SH", "asset_type": "stock", "board": "main"},
+    "sh-stock-star": {"exchange": "SH", "asset_type": "stock", "board": "star"},
+    "sz-stock": {"exchange": "SZ", "asset_type": "stock"},
+    "sh-etf": {"exchange": "SH", "asset_type": "etf"},
+    "sz-etf": {"exchange": "SZ", "asset_type": "etf"},
+}
+_OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
+    "sh-stock-main": ("sse-main-stock-list",),
+    "sh-stock-star": ("sse-star-stock-list",),
+    "sz-stock": ("szse-a-stock-list",),
+    "sh-etf": ("sse-etf-scale-list", "sse-current-full-etf-list"),
+    "sz-etf": ("szse-etf-scale-daily", "szse-current-etf-list"),
+}
 
 
 class DailyRunInProgress(RuntimeError):
@@ -225,78 +249,98 @@ class DailyPipeline:
         lock_path = Path(self.settings.paths.market_data) / "builds" / ".locks" / "daily-run.lock"
         try:
             with _exclusive_daily_lock(lock_path):
-                predecessor = self.warehouse.load_snapshot(self.warehouse.current_snapshot_id())
-                previous_scope = predecessor.plan.universe_scope
-                if previous_scope is None:
-                    raise DailyPipelineBlocked("resolve", "current snapshot has no universe scope")
+                self._recover_pending_reports()
+                self._repair_published_report_summaries()
+                try:
+                    # A prior process may have completed the canonical pointer
+                    # CAS and failed before exposing its EOD receipt. Recover
+                    # that receipt even when this run is already up to date and
+                    # will not enter the increment builder again.
+                    SimulationSnapshotBuilder(
+                        self.warehouse, self.report_root,
+                    ).recover_pending_reports()
+                    predecessor = self.warehouse.load_snapshot(self.warehouse.current_snapshot_id())
+                    previous_scope = predecessor.plan.universe_scope
+                    if previous_scope is None:
+                        raise DailyPipelineBlocked("resolve", "current snapshot has no universe scope")
 
-                if skip_data:
-                    # Fully offline: no provider is contacted; accounts advance
-                    # against whatever is already published.
-                    resolved_target = target_date
-                    snapshot_id = predecessor.snapshot_id
-                    stages.append(DailyStage("resolve", "ok", {
-                        "predecessor_snapshot_id": predecessor.snapshot_id,
-                        "predecessor_end": previous_scope.history_end.isoformat(),
-                        "calendar": "skipped (--skip-data)",
-                    }))
-                    stages.append(DailyStage("data", "skipped", {"reason": "--skip-data"}))
-                else:
-                    calendar_obs, calendar_frame = self._validated_calendar(
-                        previous_scope.history_start,
-                    )
-                    resolved_target = target_date or self._latest_completed_session(calendar_frame)
-                    stages.append(DailyStage("resolve", "ok", {
-                        "predecessor_snapshot_id": predecessor.snapshot_id,
-                        "predecessor_end": previous_scope.history_end.isoformat(),
-                        "calendar_observation_id": calendar_obs,
-                        "target_date": resolved_target.isoformat(),
-                    }))
-                    if resolved_target <= previous_scope.history_end:
-                        stages.append(DailyStage("data", "up_to_date", {
-                            "published_end": previous_scope.history_end.isoformat(),
-                        }))
+                    if skip_data:
+                        # Fully offline: no provider is contacted; accounts advance
+                        # against whatever is already published.
+                        resolved_target = target_date
                         snapshot_id = predecessor.snapshot_id
+                        stages.append(DailyStage("resolve", "ok", {
+                            "predecessor_snapshot_id": predecessor.snapshot_id,
+                            "predecessor_end": previous_scope.history_end.isoformat(),
+                            "calendar": "skipped (--skip-data)",
+                        }))
+                        stages.append(DailyStage("data", "skipped", {"reason": "--skip-data"}))
                     else:
-                        snapshot_id = self._extend_data(
-                            stages,
-                            predecessor=predecessor,
-                            previous_scope=previous_scope,
-                            calendar_observation_id=calendar_obs,
-                            calendar_frame=calendar_frame,
-                            target=resolved_target,
+                        calendar_obs, calendar_frame = self._validated_calendar(
+                            previous_scope.history_start,
                         )
+                        resolved_target = target_date or self._latest_completed_session(calendar_frame)
+                        stages.append(DailyStage("resolve", "ok", {
+                            "predecessor_snapshot_id": predecessor.snapshot_id,
+                            "predecessor_end": previous_scope.history_end.isoformat(),
+                            "calendar_observation_id": calendar_obs,
+                            "target_date": resolved_target.isoformat(),
+                        }))
+                        if resolved_target <= previous_scope.history_end:
+                            stages.append(DailyStage("data", "up_to_date", {
+                                "published_end": previous_scope.history_end.isoformat(),
+                            }))
+                            snapshot_id = predecessor.snapshot_id
+                        else:
+                            snapshot_id = self._extend_data(
+                                stages,
+                                predecessor=predecessor,
+                                previous_scope=previous_scope,
+                                calendar_observation_id=calendar_obs,
+                                calendar_frame=calendar_frame,
+                                target=resolved_target,
+                            )
 
-                if snapshot_id is not None:
-                    persistent_quarantine = self._snapshot_degraded_quarantine(
-                        self.warehouse.load_snapshot(snapshot_id)
-                    )
-                    if (
-                        persistent_quarantine is not None
-                        and not any(item.name == "quarantine" for item in stages)
-                    ):
-                        stages.append(DailyStage(
-                            "quarantine", "degraded", persistent_quarantine,
-                        ))
+                    if snapshot_id is not None:
+                        persistent_quarantine = self._snapshot_degraded_quarantine(
+                            self.warehouse.load_snapshot(snapshot_id)
+                        )
+                        if (
+                            persistent_quarantine is not None
+                            and not any(item.name == "quarantine" for item in stages)
+                        ):
+                            stages.append(DailyStage(
+                                "quarantine", "degraded", persistent_quarantine,
+                            ))
 
-                if skip_accounts:
-                    stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
-                else:
-                    accounts = self._advance_accounts(stages)
+                    if skip_accounts:
+                        stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
+                    else:
+                        accounts = self._advance_accounts(stages)
+                except DailyPipelineBlocked as exc:
+                    status = "blocked"
+                    stages.append(DailyStage(exc.stage, "blocked", {
+                        "reason": exc.reason, **exc.detail,
+                    }))
+                except Exception as exc:
+                    status = "blocked"
+                    stages.append(DailyStage("run", "blocked", {
+                        "reason": str(exc),
+                        "error_type": type(exc).__name__,
+                    }))
+                status = self._report_status(status, stages)
+                report_path = self._write_report(
+                    status, resolved_target, snapshot_id, stages, accounts,
+                )
+                return DailyRunResult(
+                    status, resolved_target, snapshot_id, stages, accounts, report_path,
+                )
         except DailyRunInProgress:
             status = "blocked"
             stages.append(DailyStage("lock", "blocked", {
                 "reason": "another daily run is already in progress",
             }))
-        except DailyPipelineBlocked as exc:
-            status = "blocked"
-            stages.append(DailyStage(exc.stage, "blocked", {
-                "reason": exc.reason, **exc.detail,
-            }))
-        if status == "ok" and any(item.status == "blocked" for item in stages):
-            status = "blocked"
-        if status == "ok" and any(item.status == "degraded" for item in stages):
-            status = "degraded"
+        status = self._report_status(status, stages)
         report_path = self._write_report(status, resolved_target, snapshot_id, stages, accounts)
         return DailyRunResult(status, resolved_target, snapshot_id, stages, accounts, report_path)
 
@@ -452,14 +496,53 @@ class DailyPipeline:
                 str((universe.degraded_detail or {}).get("reason", "carried_universe")),
             ),
         )
-        new_ids = tuple(sorted(official_ids - previous_ids))
-        target_ids = tuple(sorted(official_ids))
+        discovered_new_ids = tuple(sorted(official_ids - previous_ids))
+        provider_pending = (universe.degraded_detail or {}).get(
+            "pending_onboarding", {},
+        )
+        unavailable_components = (universe.degraded_detail or {}).get(
+            "unavailable_components", {},
+        )
+        if not isinstance(provider_pending, Mapping):
+            raise DailyPipelineBlocked(
+                "universe", "official universe pending-onboarding detail is malformed"
+            )
+        if not isinstance(unavailable_components, Mapping):
+            raise DailyPipelineBlocked(
+                "universe", "official universe unavailable-components detail is malformed"
+            )
+        pending_onboarding = {
+            str(instrument_id): dict(detail)
+            for instrument_id, detail in provider_pending.items()
+        }
+        pending_onboarding.update(self._pending_onboarding_metadata(
+            official_frame, discovered_new_ids, target,
+        ))
+        pending_onboarding_ids = tuple(sorted(
+            set(pending_onboarding) - previous_ids
+        ))
+        new_ids = tuple(sorted(set(discovered_new_ids) - set(pending_onboarding_ids)))
+        target_ids = tuple(sorted(official_ids - set(pending_onboarding_ids)))
+        if pending_onboarding_ids:
+            official_frame = official_frame.loc[
+                official_frame["instrument_id"].astype(str).isin(target_ids)
+            ].copy().reset_index(drop=True)
+            universe_obs = self._record_pending_onboarding_universe(
+                target=target,
+                frame=official_frame,
+                official_observation_id=universe.observation_id,
+                pending_onboarding=pending_onboarding,
+            )
         stages.append(DailyStage(
-            "universe", "degraded" if universe.degraded_detail else "ok", {
+            "universe", "degraded" if (
+                universe.degraded_detail or pending_onboarding
+            ) else "ok", {
             "universe_observation_id": universe_obs,
             "official_instruments": len(official_ids),
-            "new_instruments": len(new_ids),
+            "new_instruments": len(discovered_new_ids),
+            "published_scope_instruments": len(target_ids),
             **dict(universe.degraded_detail or {}),
+            "pending_onboarding": pending_onboarding,
         }))
 
         builder = HistoryDatabaseBuilder(
@@ -489,13 +572,17 @@ class DailyPipeline:
             refresh_universe=refresh_historical_universe,
         )
         build_report = json.loads(Path(build.report).read_text(encoding="utf-8"))
-        included_ids = set(map(str, build_report.get("included_instrument_ids", ())))
-        excluded: Mapping[str, Any] = build_report.get("excluded", {})
-        if build.snapshot_id is None:
-            raise DailyPipelineBlocked("bars", "history build produced no reconciled partition", {
-                "blockers": build.blockers,
-            })
-        stages.append(DailyStage("bars", "ok", {
+        included_ids, excluded = self._closed_history_build_scope(
+            build_report, target_ids,
+        )
+        if included_ids and build.snapshot_id is None:
+            raise DailyPipelineBlocked(
+                "bars", "history build omitted its included research partition", {
+                    "included_instrument_ids": tuple(sorted(included_ids)),
+                    "blockers": build.blockers,
+                },
+            )
+        stages.append(DailyStage("bars", "degraded" if excluded else "ok", {
             "build_id": build.build_id,
             "snapshot_id": build.snapshot_id,
             "included": len(included_ids),
@@ -533,62 +620,91 @@ class DailyPipeline:
             )
 
         research_source_id = build.snapshot_id
-        supplement_snapshot_ids: tuple[str, ...] = ()
+        supplement_snapshot_ids: list[str] = []
         build_partition_ids = tuple(
             map(str, build_report.get("canonical_observation_ids", ()))
         )
-        official_master_missing = tuple(sorted({
-            *new_master_missing,
-            *carried_master_missing,
-        }))
-        if official_master_missing:
+        supplement_partitions: set[str] = set()
+        for supplement_kind, supplement_ids, supplement_universe_observation_id, trusted_predecessor_snapshot_id in (
+            (
+                "new_instruments",
+                new_master_missing,
+                universe_obs,
+                None,
+            ),
+            (
+                "carried_instruments",
+                carried_master_missing,
+                universe_obs,
+                predecessor.snapshot_id,
+            ),
+        ):
+            if not supplement_ids:
+                continue
             try:
-                supplement_id, supplement_partitions, detail = (
+                supplement_id, partitions, detail = (
                     self._build_new_instrument_supplement(
                         builder=builder,
-                        universe_observation_id=universe_obs,
+                        universe_observation_id=supplement_universe_observation_id,
                         official_frame=official_frame,
-                        instrument_ids=official_master_missing,
+                        instrument_ids=supplement_ids,
                         start=increment_start,
                         end=target,
-                        trusted_predecessor_snapshot_id=(
-                            predecessor.snapshot_id if carried_master_missing else None
-                        ),
+                        trusted_predecessor_snapshot_id=trusted_predecessor_snapshot_id,
                     )
                 )
-            except Exception as exc:
+            except (ProviderUnavailableError, TradeRuleError) as exc:
+                scoped_ids = self._exact_trade_rule_error_scope(
+                    exc, set(supplement_ids),
+                ) if isinstance(exc, TradeRuleError) else supplement_ids
+                if not scoped_ids:
+                    raise DailyPipelineBlocked(
+                        "new_instruments",
+                        "new-instrument supplement failure has no exact requested scope", {
+                            "error_type": type(exc).__name__,
+                        },
+                    ) from exc
                 self._add_quarantine_reasons(
                     quarantine_reasons,
-                    official_master_missing,
+                    scoped_ids,
                     source="new_instruments",
                     blockers=(f"{type(exc).__name__}:{str(exc)[:500]}",),
                 )
                 stages.append(DailyStage(
-                    "new_instruments" if new_master_missing else "carried_instruments",
+                    supplement_kind,
                     "degraded",
                     {
-                        "instrument_ids": official_master_missing,
+                        "instrument_ids": scoped_ids,
                         "error_type": type(exc).__name__,
                         "error": str(exc)[:500],
                         "policy": "retain_official_master_and_quarantine_missing_prices",
                     },
                 ))
+            except Exception as exc:
+                raise DailyPipelineBlocked(
+                    "new_instruments",
+                    "new-instrument supplement failed outside endpoint availability",
+                    {"error_type": type(exc).__name__},
+                ) from exc
             else:
-                supplement_snapshot_ids = (supplement_id,)
-                build_partition_ids = tuple(sorted({
-                    *build_partition_ids,
-                    *supplement_partitions,
-                }))
+                supplement_snapshot_ids.append(supplement_id)
+                supplement_partitions.update(partitions)
                 detail = {
                     **detail,
-                    "new_instrument_ids": new_master_missing,
-                    "carried_instrument_ids": carried_master_missing,
+                    "new_instrument_ids": (
+                        supplement_ids if supplement_kind == "new_instruments" else ()
+                    ),
+                    "carried_instrument_ids": (
+                        supplement_ids if supplement_kind == "carried_instruments" else ()
+                    ),
                 }
-                stages.append(DailyStage(
-                    "new_instruments" if new_master_missing else "carried_instruments",
-                    "ok",
-                    detail,
-                ))
+                stages.append(DailyStage(supplement_kind, "ok", detail))
+        supplement_snapshot_ids_tuple = tuple(supplement_snapshot_ids)
+        if supplement_partitions:
+            build_partition_ids = tuple(sorted({
+                *build_partition_ids,
+                *supplement_partitions,
+            }))
 
         no_trade_observation_id: str | None = None
         confirmed_no_trade_ids: tuple[str, ...] = ()
@@ -604,19 +720,34 @@ class DailyPipeline:
                     quarantine_reasons=quarantine_reasons,
                     universe_size=len(target_ids),
                 )
-            except Exception as exc:
+            except (ProviderUnavailableError, TradeRuleError) as exc:
+                scoped_ids = self._exact_trade_rule_error_scope(
+                    exc, set(no_trade_only),
+                ) if isinstance(exc, TradeRuleError) else no_trade_only
+                if not scoped_ids:
+                    raise DailyPipelineBlocked(
+                        "no_trade", "no-trade failure has no exact requested scope", {
+                            "error_type": type(exc).__name__,
+                        },
+                    ) from exc
                 self._add_quarantine_reasons(
                     quarantine_reasons,
-                    no_trade_only,
+                    scoped_ids,
                     source="no_trade",
                     blockers=(f"{type(exc).__name__}:{str(exc)[:500]}",),
                 )
                 stages.append(DailyStage("no_trade", "degraded", {
-                    "instruments": no_trade_only,
+                    "instruments": scoped_ids,
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:500],
                     "policy": "quarantine_unresolved_missing_prices",
                 }))
+            except Exception as exc:
+                raise DailyPipelineBlocked(
+                    "no_trade",
+                    "no-trade confirmation failed outside endpoint availability",
+                    {"error_type": type(exc).__name__},
+                ) from exc
             else:
                 no_trade_observation_id = no_trade.observation_id
                 confirmed_no_trade_ids = no_trade.confirmed_instrument_ids
@@ -635,6 +766,7 @@ class DailyPipeline:
                 universe_observation_id=universe_obs,
                 calendar_observation_id=calendar_observation_id,
                 official_frame=official_frame,
+                calendar_frame=calendar_frame,
                 start=increment_start,
                 end=target,
                 instrument_ids=bar_quarantine_ids,
@@ -644,13 +776,13 @@ class DailyPipeline:
             )
 
         if (
-            supplement_snapshot_ids
+            supplement_snapshot_ids_tuple
             or no_trade_observation_id is not None
             or quarantine_research_observation_id is not None
         ):
             research_source_id = self._combine_partitions(
                 main_snapshot_id=build.snapshot_id,
-                supplement_snapshot_ids=supplement_snapshot_ids,
+                supplement_snapshot_ids=supplement_snapshot_ids_tuple,
                 no_trade_observation_id=no_trade_observation_id,
                 no_trade_ids=confirmed_no_trade_ids,
                 quarantine_observation_id=quarantine_research_observation_id,
@@ -660,6 +792,13 @@ class DailyPipeline:
                 end=target,
             )
 
+        if research_source_id is None:
+            raise DailyPipelineBlocked(
+                "research", "no exact research partition was available after quarantine", {
+                    "target_instrument_ids": target_ids,
+                    "build_blockers": build.blockers,
+                },
+            )
         research = derive_current_research_snapshot(
             self.warehouse,
             self.report_root,
@@ -671,13 +810,80 @@ class DailyPipeline:
             publish=False,
         )
         if research.status != "complete" or research.missing_instrument_ids:
-            raise DailyPipelineBlocked("research", "current research increment is incomplete", {
-                "status": research.status,
-                "missing_sample": tuple(research.missing_instrument_ids[:20]),
-            })
-        stages.append(DailyStage("research", "ok", {
-            "snapshot_id": research.snapshot_id,
-            "instruments": research.included_instruments,
+            missing_ids = tuple(sorted(map(str, research.missing_instrument_ids)))
+            if (
+                not missing_ids
+                or not set(missing_ids) <= set(target_ids)
+            ):
+                raise DailyPipelineBlocked("research", "current research increment is incomplete", {
+                    "status": research.status,
+                    "missing_sample": missing_ids[:20],
+                })
+            # The derivation verifies these IDs against the official target
+            # master and the successfully loaded source snapshots.  Its exact
+            # set is therefore sufficient to materialize bounded DATA_GAP rows.
+            self._add_quarantine_reasons(
+                quarantine_reasons,
+                missing_ids,
+                source="research",
+                blockers=("verified_current_research_missing_instrument",),
+            )
+            repair_observation_id = self._record_quarantined_research_partition(
+                predecessor_snapshot_id=predecessor.snapshot_id,
+                universe_observation_id=universe_obs,
+                calendar_observation_id=calendar_observation_id,
+                official_frame=official_frame,
+                calendar_frame=calendar_frame,
+                start=increment_start,
+                end=target,
+                instrument_ids=missing_ids,
+                reasons={
+                    item: tuple(quarantine_reasons[item]) for item in missing_ids
+                },
+            )
+            repaired_source_id = self._combine_partitions(
+                main_snapshot_id=research.snapshot_id,
+                supplement_snapshot_ids=(),
+                no_trade_observation_id=None,
+                no_trade_ids=(),
+                quarantine_observation_id=repair_observation_id,
+                quarantine_ids=missing_ids,
+                target_ids=target_ids,
+                start=increment_start,
+                end=target,
+                main_excluded_instrument_ids=missing_ids,
+            )
+            research = derive_current_research_snapshot(
+                self.warehouse,
+                self.report_root,
+                source_snapshot_id=repaired_source_id,
+                universe_observation_id=universe_obs,
+                universe_as_of=target,
+                start_date=increment_start,
+                end_date=target,
+                publish=False,
+            )
+            if research.status != "complete" or research.missing_instrument_ids:
+                raise DailyPipelineBlocked("research", "current research remains incomplete after exact quarantine", {
+                    "status": research.status,
+                    "missing_sample": tuple(research.missing_instrument_ids[:20]),
+                    "quarantine_instrument_ids": missing_ids,
+                })
+            research_status = "degraded"
+            research_detail: Mapping[str, Any] = {
+                "snapshot_id": research.snapshot_id,
+                "instruments": research.included_instruments,
+                "quarantine_instrument_ids": missing_ids,
+                "repair_observation_id": repair_observation_id,
+            }
+        else:
+            research_status = "ok"
+            research_detail = {
+                "snapshot_id": research.snapshot_id,
+                "instruments": research.included_instruments,
+            }
+        stages.append(DailyStage("research", research_status, {
+            **research_detail,
         }))
 
         status_results = {}
@@ -693,15 +899,12 @@ class DailyPipeline:
                     batch_size=50,
                 ))
             except Exception as exc:
-                result = _DegradedCollectionResult(
-                    "incomplete",
-                    f"unavailable-status-{provider}-{target.isoformat()}",
-                    len(target_ids),
-                    0,
-                    (),
-                    (f"{type(exc).__name__}:{str(exc)[:500]}",),
-                    target_ids,
-                )
+                raise DailyPipelineBlocked(
+                    "status", "status collection raised before a scoped result", {
+                        "provider": provider,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
             status_results[provider] = result
             if result.status != "complete":
                 unresolved_ids = tuple(getattr(
@@ -798,16 +1001,12 @@ class DailyPipeline:
                     ),
                 ))
             except Exception as exc:
-                error = f"{type(exc).__name__}:{str(exc)[:500]}"
-                result = _DegradedCollectionResult(
-                    "incomplete",
-                    f"unavailable-evidence-{kind}-{target.isoformat()}",
-                    len(kind_ids),
-                    0,
-                    (),
-                    (error,),
-                    kind_ids,
-                )
+                raise DailyPipelineBlocked(
+                    "evidence", "evidence collection raised before a scoped result", {
+                        "kind": kind,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
             evidence_results[kind] = result
             if result.status != "complete":
                 unresolved_ids = tuple(getattr(
@@ -903,6 +1102,10 @@ class DailyPipeline:
                 description=f"daily pipeline EOD increment through {target.isoformat()}",
             )
         except MarketDataError as exc:
+            # Exact instrument/session evidence gaps are converted to guards
+            # inside the validator through a typed impact contract.  An error
+            # that escapes here has no proven local scope; never infer one from
+            # arbitrary exception text or widen it to a whole instrument.
             retryable = self._retryable_direct_limit_validation_failure(
                 str(exc), direct_limit_results,
             )
@@ -922,12 +1125,13 @@ class DailyPipeline:
             validated_guard.get("validator_added_reasons", {})
             if isinstance(validated_guard, Mapping) else {}
         )
+        reported_validation_guard = dict(validator_added_guard)
         stages.append(DailyStage(
             "validate",
-            "degraded" if validator_added_guard else "ok",
+            "degraded" if reported_validation_guard else "ok",
             {
                 "observation_id": validated.observation_id,
-                "validator_added_execution_guard": validator_added_guard,
+                "validator_added_execution_guard": reported_validation_guard,
             },
         ))
 
@@ -974,10 +1178,7 @@ class DailyPipeline:
         ).sort_values("instrument_id", kind="stable").reset_index(drop=True)
         try:
             observed, _ = self.ingestion.capture_resumable("exchange-public", request)
-            frame = self.warehouse.read_observation_table(
-                observed.observation_id, MarketTable.INSTRUMENTS,
-            )
-        except Exception as exc:
+        except ProviderUnavailableError as exc:
             detail = {
                 "reason": "official_universe_unavailable",
                 "error_type": type(exc).__name__,
@@ -999,33 +1200,386 @@ class DailyPipeline:
                 detail,
                 tuple(sorted(map(str, prior["instrument_id"]))),
             )
+        except Exception as exc:
+            raise DailyPipelineBlocked(
+                "universe", "official universe failed outside endpoint availability", {
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
+        try:
+            frame = self.warehouse.read_observation_table(
+                observed.observation_id, MarketTable.INSTRUMENTS,
+            )
+        except Exception as exc:
+            raise DailyPipelineBlocked(
+                "universe", "official universe observation cannot be read", {
+                    "error_type": type(exc).__name__,
+                    "observation_id": observed.observation_id,
+                },
+            ) from exc
 
         official_ids = set(map(str, frame["instrument_id"]))
         prior_ids = set(map(str, prior["instrument_id"]))
+        if not isinstance(observed.source_metadata, Mapping):
+            raise DailyPipelineBlocked(
+                "universe", "official universe source metadata is malformed"
+            )
+        raw_pending = observed.source_metadata.get("pending_onboarding", {})
+        if not isinstance(raw_pending, Mapping) or any(
+            not str(instrument_id).strip() or not isinstance(detail, Mapping)
+            for instrument_id, detail in raw_pending.items()
+        ):
+            raise DailyPipelineBlocked(
+                "universe", "official universe pending-onboarding metadata is malformed"
+            )
+        pending_onboarding = {
+            str(instrument_id): dict(detail)
+            for instrument_id, detail in raw_pending.items()
+        }
+        instrument_claims = [
+            claim for claim in observed.coverage
+            if claim.table is MarketTable.INSTRUMENTS
+        ]
+        raw_unavailable = observed.source_metadata.get("unavailable_components", {})
+        requires_component_closure = (
+            bool(raw_unavailable)
+            or bool(pending_onboarding)
+            or len(instrument_claims) != 1
+            or not instrument_claims[0].complete
+        )
+        # New provider observations carry a self-contained component closure.
+        # Old complete observations remain reusable, but partial evidence never
+        # gets that compatibility escape hatch.
+        if requires_component_closure or "component_closure" in observed.source_metadata:
+            try:
+                validate_exchange_component_closure(
+                    metadata=observed.source_metadata,
+                    frame=frame,
+                )
+            except Exception as exc:
+                raise DailyPipelineBlocked(
+                    "universe", "official universe component closure is invalid", {
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
+        unavailable_components = self._official_unavailable_components(
+            observed, frame, pending_onboarding=bool(pending_onboarding),
+        )
         removed = tuple(sorted(prior_ids - official_ids))
+        pending_existing_ids = tuple(sorted(prior_ids & set(pending_onboarding)))
         if not removed:
-            return _UniverseResolution(observed.observation_id, frame)
+            detail = {
+                "reason": "official_universe_component_unavailable",
+                "removed_count": 0,
+                "removed_sample": (),
+                "carried_instruments": 0,
+                "source_snapshot_id": predecessor.snapshot_id,
+                "pending_onboarding": pending_onboarding,
+                "unavailable_components": unavailable_components,
+            }
+            if unavailable_components:
+                carried = self._record_carried_universe(
+                    target=target,
+                    frame=frame,
+                    predecessor_snapshot_id=predecessor.snapshot_id,
+                    official_observation_id=observed.observation_id,
+                    reason="official_universe_component_unavailable",
+                    detail=detail,
+                )
+                return _UniverseResolution(
+                    carried,
+                    frame,
+                    detail,
+                    pending_existing_ids,
+                )
+            return _UniverseResolution(
+                observed.observation_id,
+                frame,
+                (detail if pending_onboarding or unavailable_components else None),
+                pending_existing_ids,
+            )
         carried_rows = prior.loc[prior["instrument_id"].astype(str).isin(removed)]
         merged = pd.concat((frame, carried_rows), ignore_index=True)
         merged = merged.drop_duplicates("instrument_id", keep="first").sort_values(
             "instrument_id", kind="stable",
         ).reset_index(drop=True)
         detail = {
-            "reason": "official_universe_removed_predecessor_instruments",
+            "reason": (
+                "official_universe_component_unavailable"
+                if unavailable_components
+                else "official_universe_removed_predecessor_instruments"
+            ),
             "removed_count": len(removed),
             "removed_sample": removed[:20],
             "carried_instruments": len(removed),
             "source_snapshot_id": predecessor.snapshot_id,
+            "pending_onboarding": pending_onboarding,
+            "unavailable_components": unavailable_components,
         }
         carried = self._record_carried_universe(
             target=target,
             frame=merged,
             predecessor_snapshot_id=predecessor.snapshot_id,
             official_observation_id=observed.observation_id,
-            reason="official_universe_removed_predecessor_instruments",
+            reason=str(detail["reason"]),
             detail=detail,
         )
-        return _UniverseResolution(carried, merged, detail, removed)
+        return _UniverseResolution(
+            carried,
+            merged,
+            detail,
+            tuple(sorted({*removed, *pending_existing_ids})),
+        )
+
+    @staticmethod
+    def _official_unavailable_components(
+        observed,
+        frame: pd.DataFrame,
+        *,
+        pending_onboarding: bool,
+    ) -> dict[str, Mapping[str, Any]]:
+        """Validate exact exchange endpoint outages against returned rows.
+
+        A component failure can be carried only when the provider supplies an
+        explicit fixed component scope and has omitted every row in that
+        scope.  Anything else is an unpartitionable source/schema failure.
+        """
+
+        raw = observed.source_metadata.get("unavailable_components", {})
+        if not isinstance(raw, Mapping):
+            raise DailyPipelineBlocked(
+                "universe", "official universe unavailable-components metadata is malformed"
+            )
+        requested_scope = observed.source_metadata.get("requested_scope")
+        if (
+            not isinstance(requested_scope, Mapping)
+            or set(requested_scope) != {"exchanges", "asset_types"}
+            or not isinstance(requested_scope["exchanges"], (list, tuple))
+            or not isinstance(requested_scope["asset_types"], (list, tuple))
+            or set(requested_scope["exchanges"]) != {"SH", "SZ"}
+            or set(requested_scope["asset_types"]) != {"stock", "etf"}
+        ):
+            raise DailyPipelineBlocked(
+                "universe", "official universe requested scope is malformed"
+            )
+        required = {"scope", "endpoints", "failed_endpoint", "error_type", "message"}
+        normalized: dict[str, Mapping[str, Any]] = {}
+        for component, detail in raw.items():
+            component = str(component)
+            expected_scope = _OFFICIAL_UNIVERSE_COMPONENT_SCOPES.get(component)
+            expected_endpoints = _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.get(component)
+            if expected_scope is None or not isinstance(detail, Mapping):
+                raise DailyPipelineBlocked(
+                    "universe", "official universe unavailable component is unknown or malformed",
+                    {"component": component},
+                )
+            keys = set(detail)
+            if not required <= keys or keys - (required | {"component"}):
+                raise DailyPipelineBlocked(
+                    "universe", "official universe unavailable component detail has invalid shape",
+                    {"component": component},
+                )
+            if "component" in detail and detail["component"] != component:
+                raise DailyPipelineBlocked(
+                    "universe", "official universe unavailable component identity disagrees",
+                    {"component": component},
+                )
+            scope = detail["scope"]
+            endpoints = detail["endpoints"]
+            failed_endpoint = detail["failed_endpoint"]
+            error_type = detail["error_type"]
+            message = detail["message"]
+            if (
+                not isinstance(scope, Mapping)
+                or dict(scope) != dict(expected_scope)
+                or not isinstance(endpoints, (list, tuple))
+                or tuple(endpoints) != expected_endpoints
+                or not isinstance(failed_endpoint, str)
+                or failed_endpoint not in expected_endpoints
+                or error_type != ProviderUnavailableError.__name__
+                or not isinstance(message, str)
+                or not message.strip()
+            ):
+                raise DailyPipelineBlocked(
+                    "universe", "official universe unavailable component detail is invalid",
+                    {"component": component},
+                )
+            # Carry the validated source object unchanged.  The canonical
+            # wrapper must bind its degraded detail exactly to the persisted
+            # raw input, including the provider's optional component echo.
+            normalized[component] = dict(detail)
+
+        required_columns = {"instrument_id", "exchange", "asset_type", "board"}
+        if not required_columns <= set(frame.columns):
+            raise DailyPipelineBlocked(
+                "universe", "official universe frame lacks component identity columns",
+                {"missing_columns": tuple(sorted(required_columns - set(frame.columns)))},
+            )
+        frame_ids = tuple(sorted(map(str, frame["instrument_id"])))
+        claims = [
+            claim for claim in observed.coverage
+            if claim.table is MarketTable.INSTRUMENTS
+        ]
+        expected_complete = not normalized and not pending_onboarding
+        if (
+            len(claims) != 1
+            or claims[0].complete != expected_complete
+            or tuple(claims[0].instrument_ids) != frame_ids
+        ):
+            raise DailyPipelineBlocked(
+                "universe", "official universe component coverage is inconsistent",
+                {
+                    "expected_complete": expected_complete,
+                    "frame_instrument_count": len(frame_ids),
+                },
+            )
+        for row in frame.loc[:, ["instrument_id", "exchange", "asset_type", "board"]].to_dict("records"):
+            component = DailyPipeline._official_universe_component_for_row(row)
+            if component in normalized:
+                raise DailyPipelineBlocked(
+                    "universe", "official universe contains rows from an unavailable component",
+                    {
+                        "component": component,
+                        "instrument_id": str(row["instrument_id"]),
+                    },
+                )
+        return normalized
+
+    @staticmethod
+    def _official_universe_component_for_row(row: Mapping[str, Any]) -> str:
+        exchange = str(row["exchange"]).strip()
+        asset_type = str(row["asset_type"]).strip()
+        board = str(row["board"]).strip()
+        if exchange == "SH" and asset_type == "stock":
+            if board in {"main", "star"}:
+                return f"sh-stock-{board}"
+        elif exchange == "SZ" and asset_type == "stock":
+            return "sz-stock"
+        elif exchange == "SH" and asset_type == "etf":
+            return "sh-etf"
+        elif exchange == "SZ" and asset_type == "etf":
+            return "sz-etf"
+        raise DailyPipelineBlocked(
+            "universe", "official universe row is outside the fixed component contract",
+            {"instrument_id": str(row["instrument_id"])},
+        )
+
+    @staticmethod
+    def _pending_onboarding_metadata(
+        official_frame: pd.DataFrame,
+        new_instrument_ids: tuple[str, ...],
+        target: date,
+    ) -> dict[str, Mapping[str, Any]]:
+        """Return only genuinely new listings whose base master cannot be trusted.
+
+        Such a row must not be copied into a quarantine partition: doing so
+        would turn an incomplete official response into an instrument master.
+        Existing instruments retain the predecessor's trusted master and can
+        therefore still receive a bounded data-gap quarantine.
+        """
+
+        required = (
+            "exchange", "local_code", "asset_type", "name", "currency",
+            "listed_date", "board", "buy_lot", "price_tick",
+        )
+        pending: dict[str, Mapping[str, Any]] = {}
+        for instrument_id in new_instrument_ids:
+            rows = official_frame.loc[
+                official_frame["instrument_id"].astype(str).eq(instrument_id)
+            ]
+            if len(rows) != 1:
+                pending[instrument_id] = {
+                    "reason": "official_new_instrument_master_not_exact",
+                    "row_count": len(rows),
+                }
+                continue
+            row = rows.iloc[0]
+            asset_type = str(row.get("asset_type", "")).strip()
+            if asset_type not in {"stock", "etf"}:
+                pending[instrument_id] = {
+                    "reason": "official_new_instrument_master_unsupported_asset_type",
+                    "asset_type": asset_type,
+                }
+                continue
+            required_for_asset = (
+                (*required, "exchange_product_class")
+                if asset_type == "etf" else required
+            )
+            missing = tuple(
+                field for field in required_for_asset
+                if row.get(field) is None
+                or pd.isna(row.get(field))
+                or not str(row.get(field)).strip()
+            )
+            if missing:
+                pending[instrument_id] = {
+                    "reason": "official_new_instrument_master_missing_fields",
+                    "missing_fields": missing,
+                }
+                continue
+            try:
+                listed = date.fromisoformat(str(row["listed_date"]))
+            except (TypeError, ValueError):
+                pending[instrument_id] = {
+                    "reason": "official_new_instrument_master_invalid_listed_date",
+                    "listed_date": str(row.get("listed_date")),
+                }
+                continue
+            if listed > target:
+                pending[instrument_id] = {
+                    "reason": "official_new_instrument_master_future_listed_date",
+                    "listed_date": listed.isoformat(),
+                    "target_date": target.isoformat(),
+                }
+        return pending
+
+    @staticmethod
+    def _closed_history_build_scope(
+        report: Mapping[str, Any],
+        target_instrument_ids: tuple[str, ...],
+    ) -> tuple[set[str], Mapping[str, Any]]:
+        """Require a complete, disjoint per-instrument build accounting.
+
+        A no-snapshot build is usable only when this report proves exactly why
+        every requested instrument is absent.  Anything malformed or outside
+        the requested scope is a shared invariant failure, not a quarantine.
+        """
+
+        included_raw = report.get("included_instrument_ids")
+        excluded = report.get("excluded")
+        if not isinstance(included_raw, (list, tuple)) or not isinstance(excluded, Mapping):
+            raise DailyPipelineBlocked("bars", "history build report has no closed instrument scope")
+        included = tuple(map(str, included_raw))
+        target = set(map(str, target_instrument_ids))
+        excluded_ids = set(map(str, excluded))
+        if (
+            len(included) != len(set(included))
+            or set(included) & excluded_ids
+            or not set(included) <= target
+            or not excluded_ids <= target
+            or set(included) | excluded_ids != target
+        ):
+            raise DailyPipelineBlocked(
+                "bars", "history build report does not exactly close the target scope", {
+                    "target_instrument_ids": tuple(sorted(target)),
+                    "included_instrument_ids": included,
+                    "excluded_instrument_ids": tuple(sorted(excluded_ids)),
+                },
+            )
+        invalid_reasons = {
+            instrument_id: value
+            for instrument_id, value in excluded.items()
+            if not isinstance(value, (list, tuple))
+            or not value
+            or any(not str(reason).strip() for reason in value)
+        }
+        if invalid_reasons:
+            raise DailyPipelineBlocked(
+                "bars", "history build exclusions lack exact reasons", {
+                    "invalid_exclusions": invalid_reasons,
+                },
+            )
+        return set(included), excluded
 
     def _record_carried_universe(
         self,
@@ -1069,7 +1623,51 @@ class DailyPipeline:
                 "target_date": target,
                 "predecessor_snapshot_id": predecessor_snapshot_id,
                 "input_observation_ids": input_ids,
+                "pipeline": PIPELINE_VERSION,
                 "degraded_detail": dict(detail),
+            },
+        )
+        return self.warehouse.record_observation(payload).observation_id
+
+    def _record_pending_onboarding_universe(
+        self,
+        *,
+        target: date,
+        frame: pd.DataFrame,
+        official_observation_id: str,
+        pending_onboarding: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        """Publish a bounded official master without inventing pending rows."""
+
+        instrument_ids = tuple(sorted(map(str, frame["instrument_id"])))
+        request = ProviderRequest(
+            ProviderCapability.CANONICAL_RECONCILIATION,
+            parameters={
+                "target_date": target.isoformat(),
+                "official_observation_id": official_observation_id,
+                "pending_onboarding": to_primitive(pending_onboarding),
+                "pipeline": PIPELINE_VERSION,
+            },
+        )
+        provider = f"canonical-pending-onboarding-{PIPELINE_VERSION}"
+        matches = self.warehouse.matching_observations(provider=provider, request=request)
+        if matches:
+            return matches[-1].observation_id
+        payload = ObservationPayload(
+            provider,
+            self.warehouse.load_observation(official_observation_id).observed_at,
+            request,
+            {MarketTable.INSTRUMENTS: frame},
+            (CoverageClaim(
+                MarketTable.INSTRUMENTS,
+                True,
+                instrument_ids=instrument_ids,
+                detail="Exact official master excluding pending onboarding rows",
+            ),),
+            {
+                "kind": "pending_onboarding_scope",
+                "official_observation_id": official_observation_id,
+                "pending_onboarding": to_primitive(pending_onboarding),
             },
         )
         return self.warehouse.record_observation(payload).observation_id
@@ -1101,6 +1699,63 @@ class DailyPipeline:
             for claim in latest.coverage
         )
         return not complete or latest.observed_at.date() < target
+
+    def _capture_exact_source(
+        self,
+        *,
+        provider: str,
+        request: ProviderRequest,
+        instrument_ids: tuple[str, ...],
+    ) -> tuple[Any, bool]:
+        """Reuse or acquire one exact source request without hiding commits.
+
+        Provider observation failures are bounded by the caller's exact request
+        scope.  The durable observation write deliberately happens outside the
+        source-error boundary: warehouse/persistence failures remain global.
+        """
+
+        table_by_capability = {
+            ProviderCapability.INSTRUMENTS: MarketTable.INSTRUMENTS,
+            ProviderCapability.DAILY_BARS_RAW: MarketTable.DAILY_BARS,
+            ProviderCapability.DAILY_BARS_ADJUSTED: MarketTable.DAILY_BARS,
+            ProviderCapability.DAILY_STATUS: MarketTable.DAILY_BARS,
+            ProviderCapability.CORPORATE_ACTIONS: MarketTable.CORPORATE_ACTIONS,
+            ProviderCapability.ADJUSTMENT_FACTORS: MarketTable.ADJUSTMENT_FACTORS,
+        }
+        table = table_by_capability.get(request.capability)
+        for manifest in reversed(self.warehouse.matching_observations(
+            provider=provider, request=request,
+        )):
+            if table is None:
+                continue
+            if any(
+                claim.table is table
+                and claim.complete
+                and (
+                    request.start_date is None
+                    or claim.start_date is not None
+                    and claim.end_date is not None
+                    and claim.start_date <= request.start_date <= request.end_date <= claim.end_date
+                )
+                and (
+                    not request.instrument_ids
+                    or not claim.instrument_ids
+                    or set(request.instrument_ids) <= set(claim.instrument_ids)
+                )
+                for claim in manifest.coverage
+            ):
+                return manifest, True
+        try:
+            payload = self.registry.observe(provider, request)
+        except MarketDataError as exc:
+            if isinstance(exc, IntegrityError):
+                raise
+            raise TradeRuleError(
+                f"exact source unavailable: {provider}",
+                instrument_ids=instrument_ids,
+            ) from exc
+        # Keep record_observation out of the source-error handler.
+        return self.warehouse.record_observation(payload), False
 
     def _collect_direct_limit_observations(
         self,
@@ -1148,8 +1803,14 @@ class DailyPipeline:
                 frame = self.warehouse.read_observation_table(
                     manifest.observation_id, MarketTable.DAILY_BARS,
                 )
-            except Exception:
-                return
+            except Exception as exc:
+                raise DailyPipelineBlocked(
+                    "limits", "stored direct-limit observation cannot be read", {
+                        "provider": provider,
+                        "observation_id": manifest.observation_id,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
             if frame.empty or "instrument_id" not in frame:
                 return
             frame = frame.loc[
@@ -1211,13 +1872,29 @@ class DailyPipeline:
                     parameters,
                 )
                 try:
-                    manifest = self.ingestion.capture(provider, request)
-                except Exception as exc:
+                    payload = self.registry.observe(provider, request)
+                except MarketDataError as exc:
+                    if isinstance(exc, IntegrityError):
+                        raise DailyPipelineBlocked(
+                            "limits", "direct-limit provider integrity failure", {
+                                "provider": provider,
+                                "instrument_ids": batch,
+                            },
+                        ) from exc
                     detail = f"{type(exc).__name__}:{str(exc)[:240]}"
                     request_errors.append(f"{','.join(batch[:3])}:{detail}")
                     for instrument_id in batch:
                         errors_by_instrument.setdefault(instrument_id, set()).add(detail)
                     continue
+                except Exception as exc:
+                    raise DailyPipelineBlocked(
+                        "limits", "direct-limit collection failed outside endpoint availability", {
+                            "provider": provider,
+                            "instrument_ids": batch,
+                            "error_type": type(exc).__name__,
+                        },
+                    ) from exc
+                manifest = self.warehouse.record_observation(payload)
                 absorb(manifest)
 
         unresolved = tuple(sorted(requested_set - set(selected)))
@@ -1270,6 +1947,20 @@ class DailyPipeline:
         if not isinstance(errors, (list, tuple)) or not errors:
             return False
         return all(DailyPipeline._retryable_failure_text(error) for error in errors)
+
+    @staticmethod
+    def _exact_trade_rule_error_scope(
+        exc: Exception,
+        allowed_instrument_ids: set[str],
+    ) -> tuple[str, ...]:
+        """Return a typed, closed error scope; never infer it from text."""
+
+        if not isinstance(exc, TradeRuleError):
+            return ()
+        instrument_ids = set(map(str, exc.instrument_ids))
+        if not instrument_ids or not instrument_ids <= allowed_instrument_ids:
+            return ()
+        return tuple(sorted(instrument_ids))
 
     @staticmethod
     def _only_retryable_collection_blockers(
@@ -1607,22 +2298,15 @@ class DailyPipeline:
             or included != tuple(sorted(instrument_ids))
             or excluded
         ):
-            raise DailyPipelineBlocked(
-                "new_instruments",
+            raise TradeRuleError(
                 "new-instrument evidence did not produce an exact reconciled partition",
-                {
-                    "instrument_ids": instrument_ids,
-                    "included": included,
-                    "excluded": excluded,
-                    "blockers": result.blockers,
-                },
+                instrument_ids=instrument_ids,
             )
         partitions = tuple(map(str, report.get("canonical_observation_ids", ())))
         if not partitions:
-            raise DailyPipelineBlocked(
-                "new_instruments",
+            raise TradeRuleError(
                 "new-instrument partition has no canonical observation evidence",
-                {"instrument_ids": instrument_ids},
+                instrument_ids=instrument_ids,
             )
         return result.snapshot_id, partitions, {
             "instrument_ids": instrument_ids,
@@ -1661,7 +2345,11 @@ class DailyPipeline:
             ProviderCapability.DAILY_BARS_RAW, start, end, instrument_ids,
         )
         for provider in NO_TRADE_PROVIDERS:
-            observed, _ = self.ingestion.capture_resumable(provider, request)
+            observed, _ = self._capture_exact_source(
+                provider=provider,
+                request=request,
+                instrument_ids=instrument_ids,
+            )
             source_ids.append(observed.observation_id)
         common = {
             "predecessor_snapshot_id": predecessor_snapshot_id,
@@ -1800,6 +2488,7 @@ class DailyPipeline:
         universe_observation_id: str,
         calendar_observation_id: str,
         official_frame: pd.DataFrame,
+        calendar_frame: pd.DataFrame,
         start: date,
         end: date,
         instrument_ids: tuple[str, ...],
@@ -1832,7 +2521,25 @@ class DailyPipeline:
                 "bars", "quarantine instrument master is incomplete",
                 {"instrument_ids": instrument_ids},
             )
-        bars = empty_table(MarketTable.DAILY_BARS, include_lineage=True)
+        scope = UniverseScope(
+            CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
+            end,
+            start,
+            end,
+            survivorship_bias=True,
+            instrument_ids=instrument_ids,
+        )
+        bars = self._build_quarantine_bars(
+            instruments=instruments,
+            calendar=calendar_frame,
+            scope=scope,
+            quarantine_detail={
+                "instrument_ids": instrument_ids,
+                "consecutive_sessions": {},
+                "reasons_by_instrument": reasons,
+            },
+            source_observation_id=universe_observation_id,
+        )
         dependencies = tuple(sorted({
             universe_observation_id,
             calendar_observation_id,
@@ -1846,7 +2553,7 @@ class DailyPipeline:
             "end_date": end,
             "universe_definition": CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
             "universe_as_of": end,
-            "row_count": 0,
+            "row_count": len(bars),
             "degraded": True,
             "reasons_by_instrument": reasons,
             "source_observation_ids": dependencies,
@@ -1875,7 +2582,7 @@ class DailyPipeline:
                     start,
                     end,
                     instrument_ids,
-                    "No trusted price rows published; simulation materializes non-tradable quarantine",
+                    "No trusted price rows published; non-tradable quarantine bars are materialized",
                 ),
             ),
             {
@@ -1891,7 +2598,7 @@ class DailyPipeline:
     def _combine_partitions(
         self,
         *,
-        main_snapshot_id: str,
+        main_snapshot_id: str | None,
         supplement_snapshot_ids: tuple[str, ...],
         no_trade_observation_id: str | None,
         no_trade_ids: tuple[str, ...],
@@ -1900,9 +2607,38 @@ class DailyPipeline:
         target_ids: tuple[str, ...],
         start: date,
         end: date,
+        main_excluded_instrument_ids: tuple[str, ...] = (),
     ) -> str:
-        main = self.warehouse.load_snapshot(main_snapshot_id)
-        selections = [*main.plan.selections]
+        selections: list[SourceSlice] = []
+        if main_snapshot_id is not None:
+            main = self.warehouse.load_snapshot(main_snapshot_id)
+            excluded = set(map(str, main_excluded_instrument_ids))
+            instrument_tables = {
+                MarketTable.INSTRUMENTS,
+                MarketTable.DAILY_BARS,
+                MarketTable.CORPORATE_ACTIONS,
+                MarketTable.ADJUSTMENT_FACTORS,
+            }
+            for selection in main.plan.selections:
+                if not excluded or selection.table not in instrument_tables:
+                    selections.append(selection)
+                    continue
+                scoped_ids = (
+                    set(map(str, selection.instrument_ids))
+                    if selection.instrument_ids else set(target_ids)
+                )
+                remaining = tuple(sorted(scoped_ids - excluded))
+                if not remaining:
+                    continue
+                selections.append(SourceSlice(
+                    selection.observation_id,
+                    selection.table,
+                    selection.reason,
+                    remaining,
+                    selection.start_date,
+                    selection.end_date,
+                    selection.priority,
+                ))
         for snapshot_id in supplement_snapshot_ids:
             supplement = self.warehouse.load_snapshot(snapshot_id)
             selections.extend(supplement.plan.selections)
@@ -1991,8 +2727,10 @@ class DailyPipeline:
                 increment_scope.history_end,
                 candidate_ids,
             )
-            baostock, baostock_reused = self.ingestion.capture_resumable(
-                "baostock", baostock_request,
+            baostock, baostock_reused = self._capture_exact_source(
+                provider="baostock",
+                request=baostock_request,
+                instrument_ids=candidate_ids,
             )
             baostock_factors = self.warehouse.read_observation_table(
                 baostock.observation_id, MarketTable.ADJUSTMENT_FACTORS,
@@ -2013,33 +2751,36 @@ class DailyPipeline:
                     ]
                 }))
                 if not prior_open:
-                    raise SnapshotNotReadyError(
-                        "Adjusted-price factor audit has no prior open session"
+                    raise TradeRuleError(
+                        "Adjusted-price factor audit has no prior open session",
+                        instrument_ids=tuple(sorted(unresolved)),
                     )
                 audit_start = date.fromisoformat(prior_open[-1])
                 audit_ids = tuple(sorted(unresolved))
                 request_parameters = {
                     "batch_size": min(self.settings.daily.batch_size, 100),
                 }
-                raw, raw_reused = self.ingestion.capture_resumable(
-                    "tickflow",
-                    ProviderRequest(
+                raw, raw_reused = self._capture_exact_source(
+                    provider="tickflow",
+                    request=ProviderRequest(
                         ProviderCapability.DAILY_BARS_RAW,
                         audit_start,
                         increment_scope.history_end,
                         audit_ids,
                         request_parameters,
                     ),
+                    instrument_ids=audit_ids,
                 )
-                adjusted, adjusted_was_reused = self.ingestion.capture_resumable(
-                    "tickflow",
-                    ProviderRequest(
+                adjusted, adjusted_was_reused = self._capture_exact_source(
+                    provider="tickflow",
+                    request=ProviderRequest(
                         ProviderCapability.DAILY_BARS_ADJUSTED,
                         audit_start,
                         increment_scope.history_end,
                         audit_ids,
                         request_parameters,
                     ),
+                    instrument_ids=audit_ids,
                 )
                 adjusted_reused = {
                     "raw": raw_reused,
@@ -2205,9 +2946,18 @@ class DailyPipeline:
             adjusted_bars["price_mode"].astype(str).eq("adjusted"),
             [*keys, "close"],
         ].rename(columns={"close": "adjusted_close"})
-        if raw.duplicated(keys).any() or adjusted.duplicated(keys).any():
-            raise SnapshotNotReadyError(
-                "Adjusted-price factor audit source has duplicate daily keys"
+        duplicate_instrument_ids = {
+            *map(str, raw.loc[
+                raw.duplicated(keys, keep=False), "instrument_id",
+            ]),
+            *map(str, adjusted.loc[
+                adjusted.duplicated(keys, keep=False), "instrument_id",
+            ]),
+        }
+        if duplicate_instrument_ids:
+            raise TradeRuleError(
+                "Adjusted-price factor audit source has duplicate daily keys",
+                instrument_ids=tuple(sorted(duplicate_instrument_ids)),
             )
         joined = raw.merge(adjusted, on=keys, how="inner", validate="one_to_one")
         joined["raw_close"] = pd.to_numeric(joined["raw_close"], errors="coerce")
@@ -2224,6 +2974,7 @@ class DailyPipeline:
         )
         rows: list[dict[str, Any]] = []
         failures: list[str] = []
+        failure_instrument_ids: set[str] = set()
         for instrument_id, events in sorted(candidates.items()):
             instrument = joined.loc[
                 joined["instrument_id"].astype(str).eq(instrument_id)
@@ -2237,6 +2988,7 @@ class DailyPipeline:
                 ]
                 if before.empty or len(event) != 1:
                     failures.append(f"{instrument_id}/{event_date}:missing_ratio_boundary")
+                    failure_instrument_ids.add(instrument_id)
                     continue
                 prior_ratio = float(before.iloc[0]["adjustment_ratio"])
                 event_ratio = float(event.iloc[0]["adjustment_ratio"])
@@ -2251,6 +3003,7 @@ class DailyPipeline:
                         f"{instrument_id}/{event_date}:expected={expected:.12g},"
                         f"observed={multiplier:.12g},relative={relative:.6g}"
                     )
+                    failure_instrument_ids.add(instrument_id)
                     continue
                 evidence = {
                     "provider": "tickflow",
@@ -2285,8 +3038,9 @@ class DailyPipeline:
                     }),
                 })
         if failures:
-            raise SnapshotNotReadyError(
-                "Adjusted-price factor audit failed: " + "; ".join(failures[:10])
+            raise TradeRuleError(
+                "Adjusted-price factor audit failed: " + "; ".join(failures[:10]),
+                instrument_ids=tuple(sorted(failure_instrument_ids)),
             )
         return pd.DataFrame(
             rows,
@@ -2328,10 +3082,6 @@ class DailyPipeline:
         available_ids = tuple(sorted(
             set(increment_scope.instrument_ids) - set(quarantine_ids)
         ))
-        if not available_ids:
-            raise DailyPipelineBlocked(
-                "quarantine", "instrument data gaps cover the whole daily universe"
-            )
         execution_guard = set(map(str, execution_guard_ids)) & set(available_ids)
         all_date_guard = (
             set(map(str, all_date_execution_guard_ids)) & set(available_ids)
@@ -2488,23 +3238,20 @@ class DailyPipeline:
                 )
                 break
             except Exception as exc:
-                error = f"{type(exc).__name__}:{str(exc)[:1000]}"
-                mentioned = set(re.findall(r"\b\d{6}\.(?:SH|SZ)\b", error))
-                affected = mentioned & remaining_event_ids
-                if not affected:
-                    try:
-                        affected = set(build_factor_audit_candidates(
-                            instruments=event_instruments,
-                            actions=actions,
-                            factors=factors,
-                            universe_scope=event_scope,
-                            daily_bars=event_bars,
-                        ))
-                    except Exception:
-                        affected = set()
-                    affected &= remaining_event_ids
-                if not affected:
+                typed_scope = self._exact_trade_rule_error_scope(
+                    exc, remaining_event_ids,
+                )
+                if typed_scope:
+                    affected = set(typed_scope)
+                elif isinstance(exc, ProviderUnavailableError):
                     affected = set(remaining_event_ids)
+                else:
+                    raise DailyPipelineBlocked(
+                        "factor_reconciliation",
+                        "factor reconciliation failed outside approved isolation scope",
+                        {"error_type": type(exc).__name__},
+                    ) from exc
+                error = f"{type(exc).__name__}:{str(exc)[:1000]}"
                 for instrument_id in affected:
                     guard_reasons[instrument_id] = (
                         *guard_reasons.get(instrument_id, ()),
@@ -2800,13 +3547,17 @@ class DailyPipeline:
             & research_bars["price_mode"].astype(str).eq("raw")
         ].copy()
         keys = ["instrument_id", "session_date"]
-        if research.duplicated(keys).any():
-            raise DailyPipelineBlocked(
-                "research", "execution-guard research prices contain duplicate daily keys"
-            )
+        duplicate_keys = {
+            (str(row["instrument_id"]), str(row["session_date"])[:10])
+            for row in research.loc[
+                research.duplicated(keys, keep=False)
+            ].to_dict("records")
+        }
         research_by_key = {
             (str(row["instrument_id"]), str(row["session_date"])[:10]): row
             for row in research.to_dict("records")
+            if (str(row["instrument_id"]), str(row["session_date"])[:10])
+            not in duplicate_keys
         }
         open_by_exchange = {
             str(exchange): tuple(sorted(map(str, group.loc[
@@ -2827,17 +3578,23 @@ class DailyPipeline:
                     continue
                 if session < listed or (delisted is not None and session > delisted):
                     continue
-                upstream = research_by_key.get((instrument_id, session), {})
+                key = (instrument_id, session)
+                duplicate_key = key in duplicate_keys
+                upstream = research_by_key.get(key, {})
                 row = dict(upstream)
                 upstream_lineage = row.get("field_lineage")
+                row_reasons = tuple(reasons.get(instrument_id, ())) + (
+                    ("duplicate_research_price_key",) if duplicate_key else ()
+                )
                 lineage = {
                     "kind": "daily_execution_evidence_gap_guard_v1",
                     "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
-                    "reasons": tuple(reasons.get(instrument_id, ())),
+                    "reasons": row_reasons,
                     "price_semantics": (
                         "trusted_research_price_preserved"
                         if upstream else "no_trusted_price_available"
                     ),
+                    "duplicate_research_price_key": duplicate_key,
                     "execution": "prohibited_and_deferred",
                     "upstream_lineage": upstream_lineage,
                     "upstream_observation_id": row.get("source_observation_id"),
@@ -2975,13 +3732,26 @@ class DailyPipeline:
                 account, market, repository, service, published_end,
             ))
         blocked = [item for item in results if item["status"] == "blocked"]
+        committed = [
+            item for item in results
+            if item["status"] in {"ok", "degraded"}
+            and int(item.get("sessions_advanced", 0)) > 0
+        ]
+        degraded = [item for item in results if item["status"] == "degraded"]
+        if blocked:
+            stage_status = "degraded" if committed else "blocked"
+        elif degraded:
+            stage_status = "degraded"
+        else:
+            stage_status = "ok"
         stages.append(DailyStage(
             "accounts",
-            "blocked" if blocked else "ok",
+            stage_status,
             {
                 "snapshot_id": market.snapshot_id,
                 "published_end": published_end.isoformat(),
-                "advanced": sum(1 for item in results if item["status"] == "ok"),
+                "advanced": len(committed),
+                "degraded": [item["account_id"] for item in degraded],
                 "blocked": [item["account_id"] for item in blocked],
             },
         ))
@@ -3014,7 +3784,7 @@ class DailyPipeline:
                 }
             try:
                 account_record = repository.account(account.account_id)
-            except Exception:
+            except KeyError:
                 account_record = repository.create_account(
                     account.account_id,
                     account.name,
@@ -3063,36 +3833,77 @@ class DailyPipeline:
                         sessions[0],
                         initial_emitted_weight=previous_weight,
                     )
-            for session in sessions:
-                source = (
-                    self._intent_source(account, session)
-                    if account.strategy == "agent-file"
-                    else persistent_source
-                )
-                assert source is not None
-                outcome = service.run_daily(
+            try:
+                for session in sessions:
+                    source = (
+                        self._intent_source(account, session)
+                        if account.strategy == "agent-file"
+                        else persistent_source
+                    )
+                    assert source is not None
+                    outcome = service.run_daily(
+                        account.account_id,
+                        session,
+                        source,
+                    )
+                    last_run_id = outcome.run.run_id
+            except Exception as exc:
+                committed_run_id, committed_sessions = self._committed_account_progress(
+                    repository,
                     account.account_id,
-                    session,
-                    source,
+                    sessions,
+                    selected_parent,
                 )
-                last_run_id = outcome.run.run_id
+                if committed_sessions == 0:
+                    raise
+                return self._account_partial_failure(
+                    account,
+                    repository,
+                    committed_run_id,
+                    committed_sessions,
+                    exc,
+                )
+            committed_run_id, committed_sessions = self._committed_account_progress(
+                repository,
+                account.account_id,
+                sessions,
+                selected_parent,
+            )
+            if committed_sessions < len(sessions):
+                promotion_error = RuntimeError(
+                    "daily run completed without promoting every submitted session"
+                )
+                if committed_sessions == 0:
+                    raise promotion_error
+                return self._account_partial_failure(
+                    account,
+                    repository,
+                    committed_run_id,
+                    committed_sessions,
+                    promotion_error,
+                )
+            last_run_id = committed_run_id
             payload: dict[str, Any] = {
                 "account_id": account.account_id,
                 "status": "ok",
                 "strategy": account.strategy,
-                "sessions_advanced": len(sessions),
-                "head": max(
-                    published_end,
-                    date.min if selected_parent is None else
-                    repository.run(selected_parent).binding.end_date,
-                ).isoformat(),
+                "sessions_advanced": committed_sessions,
+                "head": self._account_head(repository, last_run_id),
             }
             if last_run_id is not None:
-                feedback = build_simulation_feedback(repository, last_run_id)
                 payload["run_id"] = last_run_id
-                payload["quality"] = feedback.quality
-                payload["equity"] = str(feedback.final_equity)
-                payload["overall_return"] = str(feedback.overall_return)
+                try:
+                    feedback = build_simulation_feedback(repository, last_run_id)
+                except Exception as exc:
+                    payload.update({
+                        "status": "degraded",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    })
+                else:
+                    payload["quality"] = feedback.quality
+                    payload["equity"] = str(feedback.final_equity)
+                    payload["overall_return"] = str(feedback.overall_return)
             return payload
         except Exception as exc:
             return {
@@ -3102,6 +3913,56 @@ class DailyPipeline:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             }
+
+    @staticmethod
+    def _account_head(repository: TradingRepository, run_id: str | None) -> str | None:
+        if run_id is None:
+            return None
+        return repository.run(run_id).binding.end_date.isoformat()
+
+    @staticmethod
+    def _committed_account_progress(
+        repository: TradingRepository,
+        account_id: str,
+        sessions: tuple[date, ...],
+        selected_parent: str | None,
+    ) -> tuple[str | None, int]:
+        """Read repository truth after a service error that may follow promotion.
+
+        ``SimulationService`` verifies a run after its atomic COMPLETE/head
+        transaction.  A verification exception can therefore escape even
+        though the session is already the selected account head.  Reporting
+        only calls that returned normally would mislabel committed state as
+        blocked, so derive progress from the selected head instead.
+        """
+
+        _, selected_run_id = repository.selected_state(account_id)
+        if selected_run_id is None or selected_run_id == selected_parent:
+            return selected_run_id, 0
+        selected_end = repository.run(selected_run_id).binding.end_date
+        committed = sum(1 for session in sessions if session <= selected_end)
+        return selected_run_id, committed
+
+    def _account_partial_failure(
+        self,
+        account: DailyAccountSettings,
+        repository: TradingRepository,
+        last_run_id: str | None,
+        sessions_advanced: int,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        """Expose committed work accurately when a later account session fails."""
+
+        return {
+            "account_id": account.account_id,
+            "status": "degraded",
+            "strategy": account.strategy,
+            "sessions_advanced": sessions_advanced,
+            "head": self._account_head(repository, last_run_id),
+            "run_id": last_run_id,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
 
     def _intent_source(
         self,
@@ -3174,6 +4035,173 @@ class DailyPipeline:
 
     # --------------------------------------------------------------- report
 
+    @staticmethod
+    def _report_status(status: str, stages: list[DailyStage]) -> str:
+        if status == "ok" and any(item.status == "blocked" for item in stages):
+            return "blocked"
+        if status == "ok" and any(item.status == "degraded" for item in stages):
+            return "degraded"
+        return status
+
+    @staticmethod
+    def _report_filename(payload: Mapping[str, Any]) -> tuple[str, str]:
+        """Return the public filenames, with full bytes enforcing token collisions."""
+
+        target = payload["target_date"]
+        day = "unknown" if target is None else str(target)
+        token = stable_digest(payload)[:10]
+        return f"daily-{day}-{token}.json", f"daily-{day}-{token}.md"
+
+    @staticmethod
+    def _report_bytes(payload: Mapping[str, Any]) -> tuple[bytes, bytes]:
+        return (
+            (canonical_json(payload) + "\n").encode("utf-8"),
+            DailyPipeline._markdown_summary(payload).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _parse_report_payload(
+        path: Path, *, require_current_pipeline: bool,
+    ) -> dict[str, Any]:
+        """Accept a supported report payload tied to its digest filename.
+
+        Pending reports are write-ahead checkpoints for this implementation and
+        therefore must be current-version only.  Published JSON is an older,
+        durable public record and may use an explicitly supported predecessor.
+        """
+
+        match = re.fullmatch(
+            r"daily-(unknown|\d{4}-\d{2}-\d{2})-([0-9a-f]{10})\.json",
+            path.name,
+        )
+        if match is None:
+            raise ValueError(f"Unrecognized pending daily report: {path}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid daily report JSON: {path}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"Daily report must be a JSON object: {path}")
+        required = {
+            "pipeline", "generated_at", "status", "target_date", "snapshot_id",
+            "stages", "accounts",
+        }
+        pipeline_version = value.get("pipeline")
+        if (
+            set(value) != required
+            or pipeline_version not in SUPPORTED_REPORT_PIPELINE_VERSIONS
+            or require_current_pipeline and pipeline_version != PIPELINE_VERSION
+        ):
+            raise ValueError(f"Invalid daily report payload: {path}")
+        target = value["target_date"]
+        if target is None:
+            expected_day = "unknown"
+        elif isinstance(target, str):
+            try:
+                date.fromisoformat(target)
+            except ValueError as exc:
+                raise ValueError(f"Invalid daily report target date: {path}") from exc
+            expected_day = target
+        else:
+            raise ValueError(f"Invalid daily report target date: {path}")
+        if (
+            not isinstance(value["generated_at"], str)
+            or value["status"] not in {"ok", "up_to_date", "degraded", "blocked"}
+            or value["snapshot_id"] is not None and not isinstance(value["snapshot_id"], str)
+            or not isinstance(value["stages"], list)
+            or not isinstance(value["accounts"], list)
+            or any(
+                not isinstance(stage, dict)
+                or set(stage) != {"name", "status", "detail"}
+                or not isinstance(stage["name"], str)
+                or not isinstance(stage["status"], str)
+                or not isinstance(stage["detail"], dict)
+                for stage in value["stages"]
+            )
+            or any(not isinstance(account, dict) for account in value["accounts"])
+            or match.group(1) != expected_day
+            or match.group(2) != stable_digest(value)[:10]
+        ):
+            raise ValueError(f"Daily report filename or payload verification failed: {path}")
+        return value
+
+    @staticmethod
+    def _cleanup_pending_file(path: Path) -> None:
+        """Best-effort cleanup after the public JSON commit has succeeded."""
+
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            # Another same-content writer can briefly replace this mutable
+            # checkpoint on Windows.  It remains safe and recoverable.
+            return
+
+    def _recover_pending_reports(self) -> None:
+        """Finish all verified reports left after failed report commits.
+
+        A pending JSON is not public.  Its digest filename and regenerated
+        markdown must agree before it can be promoted, so a random file in the
+        pending directory cannot become a public report.
+        """
+
+        pending_root = self.daily_report_root / ".pending"
+        if not pending_root.exists():
+            return
+        pending_jsons = sorted(pending_root.glob("daily-*.json"))
+        if not pending_jsons:
+            return
+        for pending_json in pending_jsons:
+            payload = self._parse_report_payload(
+                pending_json, require_current_pipeline=True,
+            )
+            json_name, md_name = self._report_filename(payload)
+            if pending_json.name != json_name:
+                raise ValueError(f"Pending daily report has an unexpected filename: {pending_json}")
+            json_bytes, markdown_bytes = self._report_bytes(payload)
+            pending_markdown = pending_root / md_name
+            if pending_markdown.exists():
+                if pending_markdown.read_bytes() != markdown_bytes:
+                    raise ValueError(
+                        f"Pending daily report markdown verification failed: {pending_markdown}"
+                    )
+            else:
+                atomic_replace_bytes(pending_markdown, markdown_bytes)
+
+            public_json = self.daily_report_root / json_name
+            public_markdown = self.daily_report_root / md_name
+            if public_json.exists():
+                # JSON is the public commit marker.  Once it is verified as
+                # this exact report, a missing or corrupt Markdown sidecar is
+                # repaired deterministically instead of treated as an
+                # immutable-file collision.
+                if public_json.read_bytes() != json_bytes:
+                    raise ValueError(f"Immutable file collision: {public_json}")
+                if (
+                    not public_markdown.exists()
+                    or public_markdown.read_bytes() != markdown_bytes
+                ):
+                    atomic_replace_bytes(public_markdown, markdown_bytes)
+            else:
+                publish_immutable_bytes(public_markdown, markdown_bytes)
+                publish_immutable_bytes(public_json, json_bytes)
+            self._cleanup_pending_file(pending_markdown)
+            self._cleanup_pending_file(pending_json)
+
+    def _repair_published_report_summaries(self) -> None:
+        """Regenerate a missing or corrupt Markdown sidecar from the JSON commit marker."""
+
+        if not self.daily_report_root.exists():
+            return
+        for public_json in sorted(self.daily_report_root.glob("daily-*.json")):
+            payload = self._parse_report_payload(
+                public_json, require_current_pipeline=False,
+            )
+            _, markdown_name = self._report_filename(payload)
+            public_markdown = self.daily_report_root / markdown_name
+            _, markdown_bytes = self._report_bytes(payload)
+            if not public_markdown.exists() or public_markdown.read_bytes() != markdown_bytes:
+                atomic_replace_bytes(public_markdown, markdown_bytes)
+
     def _write_report(
         self,
         status: str,
@@ -3181,27 +4209,33 @@ class DailyPipeline:
         snapshot_id: str | None,
         stages: list[DailyStage],
         accounts: list[dict[str, Any]],
-    ) -> Path | None:
-        try:
-            self.daily_report_root.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "pipeline": PIPELINE_VERSION,
-                "generated_at": self.now_fn().isoformat(),
-                "status": status,
-                "target_date": None if target is None else target.isoformat(),
-                "snapshot_id": snapshot_id,
-                "stages": [to_primitive(item) for item in stages],
-                "accounts": accounts,
-            }
-            token = stable_digest(payload)[:10]
-            day = "unknown" if target is None else target.isoformat()
-            path = self.daily_report_root / f"daily-{day}-{token}.json"
-            path.write_text(canonical_json(payload), encoding="utf-8", newline="\n")
-            summary = self.daily_report_root / f"daily-{day}-{token}.md"
-            summary.write_text(self._markdown_summary(payload), encoding="utf-8", newline="\n")
-            return path
-        except Exception:
-            return None
+    ) -> Path:
+        self.daily_report_root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pipeline": PIPELINE_VERSION,
+            "generated_at": self.now_fn().isoformat(),
+            "status": status,
+            "target_date": None if target is None else target.isoformat(),
+            "snapshot_id": snapshot_id,
+            "stages": [to_primitive(item) for item in stages],
+            "accounts": accounts,
+        }
+        json_name, markdown_name = self._report_filename(payload)
+        json_bytes, markdown_bytes = self._report_bytes(payload)
+        pending_root = self.daily_report_root / ".pending"
+        pending_json = pending_root / json_name
+        pending_markdown = pending_root / markdown_name
+        # Both pending files are mutable checkpoints.  Only the final JSON is
+        # a public commit marker, and it is published after the markdown.
+        atomic_replace_bytes(pending_json, json_bytes)
+        atomic_replace_bytes(pending_markdown, markdown_bytes)
+        public_markdown = self.daily_report_root / markdown_name
+        public_json = self.daily_report_root / json_name
+        publish_immutable_bytes(public_markdown, markdown_bytes)
+        publish_immutable_bytes(public_json, json_bytes)
+        self._cleanup_pending_file(pending_markdown)
+        self._cleanup_pending_file(pending_json)
+        return public_json
 
     @staticmethod
     def _markdown_summary(payload: Mapping[str, Any]) -> str:

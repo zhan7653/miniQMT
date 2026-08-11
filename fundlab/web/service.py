@@ -581,9 +581,19 @@ class DashboardService:
         ):
             raise DashboardError(f"非法报告文件名: {file_name}")
         path = Path(self.settings.daily.report_root) / file_name
-        if not path.is_file():
+        try:
+            exists = path.is_file()
+        except OSError as exc:
+            raise DashboardError(f"报告无法读取: {file_name}") from exc
+        if not exists:
             raise DashboardError(f"报告不存在: {file_name}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardError(f"报告损坏或无法读取: {file_name}") from exc
+        if not isinstance(payload, Mapping):
+            raise DashboardError(f"报告内容不是对象: {file_name}")
+        return dict(payload)
 
     # ------------------------------------------------------ agent decisions
 
@@ -1205,9 +1215,18 @@ def _daily_report_summaries(
     for file_name, _, _ in files:
         try:
             payload = json.loads((directory / file_name).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
             continue
         stages = payload.get("stages") or []
+        if not isinstance(stages, list):
+            stages = []
+        stage_items = [item for item in stages if isinstance(item, Mapping)]
+        accounts = payload.get("accounts") or []
+        if not isinstance(accounts, list):
+            accounts = []
+        account_items = [item for item in accounts if isinstance(item, Mapping)]
         entries.append({
             "file": file_name,
             "generated_at": payload.get("generated_at"),
@@ -1215,10 +1234,10 @@ def _daily_report_summaries(
             "target_date": payload.get("target_date"),
             "snapshot_id": payload.get("snapshot_id"),
             "stage_names": [
-                f"{item.get('name')}:{item.get('status')}" for item in stages
+                f"{item.get('name')}:{item.get('status')}" for item in stage_items
             ],
             "blocked_stage": next(
-                (item.get("name") for item in stages if item.get("status") == "blocked"),
+                (item.get("name") for item in stage_items if item.get("status") == "blocked"),
                 None,
             ),
             "accounts": [
@@ -1227,7 +1246,7 @@ def _daily_report_summaries(
                     "status": item.get("status"),
                     "equity": item.get("equity"),
                 }
-                for item in payload.get("accounts") or []
+                for item in account_items
             ],
         })
     entries.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)

@@ -1,8 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+from fundlab.common.atomic_files import publish_immutable_bytes
 from fundlab.marketdata import (
     IntegrityError,
     CoverageClaim,
@@ -12,11 +16,13 @@ from fundlab.marketdata import (
     ObservationPayload,
     ProviderCapability,
     ProviderRequest,
+    QualityReport,
     ReadinessProfile,
     SIMULATION_PARTITION_VALIDATOR_VERSION,
     SnapshotComponentSelection,
     SnapshotNotReadyError,
     SnapshotPlan,
+    SnapshotState,
     SourceSlice,
     UniverseScope,
     SimulationIncrementValidator,
@@ -48,6 +54,162 @@ def _snapshot(warehouse: MarketDataWarehouse):
         "accepted canonical fixture",
         universe_scope=fixture_universe_scope(),
     ))
+
+
+class _EodReportWarehouse:
+    """Small verified-current double for report-publication fault injection."""
+
+    predecessor_snapshot_id = "snap-" + "a" * 24
+    candidate_snapshot_id = "snap-" + "b" * 24
+
+    def __init__(self, *, cas_outcome: str) -> None:
+        self.root = Path(".")
+        self.current = self.predecessor_snapshot_id
+        self.cas_outcome = cas_outcome
+
+    def load_snapshot(self, snapshot_id: str):
+        if snapshot_id not in {
+            self.predecessor_snapshot_id, self.candidate_snapshot_id,
+        }:
+            raise ValueError(f"unverified test snapshot: {snapshot_id}")
+        return SimpleNamespace(snapshot_id=snapshot_id)
+
+    def current_snapshot_id(self) -> str:
+        return self.current
+
+    def publish_if_current(self, expected: str, successor: str) -> None:
+        assert expected == self.predecessor_snapshot_id
+        assert successor == self.candidate_snapshot_id
+        if self.cas_outcome == "before_failure":
+            raise RuntimeError("injected CAS failure before replace")
+        self.current = successor
+        if self.cas_outcome == "after_failure":
+            raise RuntimeError("injected CAS failure after replace")
+
+
+def _patch_eod_extension(monkeypatch):
+    snapshot = SimpleNamespace(
+        snapshot_id=_EodReportWarehouse.candidate_snapshot_id,
+        quality=QualityReport(SnapshotState.READY),
+    )
+
+    def extend(_self, **_kwargs):
+        return snapshot, {"audit": "verified"}
+
+    monkeypatch.setattr(IncrementalCanonicalPublisher, "extend", extend)
+
+
+def _run_eod_report_extension(
+    builder: SimulationSnapshotBuilder,
+    *,
+    publish: bool = True,
+):
+    return builder.extend(
+        predecessor_snapshot_id=_EodReportWarehouse.predecessor_snapshot_id,
+        calendar_observation_id="obs-" + "c" * 24,
+        increment_observation_ids=("obs-" + "d" * 24,),
+        universe_scope=fixture_universe_scope(),
+        description="fault-injected EOD report fixture",
+        publish=publish,
+    )
+
+
+def test_eod_report_is_hidden_when_cas_fails_before_current(tmp_path, monkeypatch):
+    _patch_eod_extension(monkeypatch)
+    reports = tmp_path / "reports"
+    warehouse = _EodReportWarehouse(cas_outcome="before_failure")
+
+    with pytest.raises(RuntimeError, match="before replace"):
+        _run_eod_report_extension(SimulationSnapshotBuilder(warehouse, reports))
+
+    assert not tuple(reports.glob("simulation-eod-*.json"))
+    assert len(tuple((reports / ".pending").glob("*.pending.json"))) == 1
+
+    # A valid pending report whose candidate is not current is intentionally
+    # retained; it must not block a later normal attempt or publish itself.
+    warehouse.cas_outcome = "success"
+    result = _run_eod_report_extension(SimulationSnapshotBuilder(warehouse, reports))
+    assert result.published and result.report.is_file()
+
+
+def test_eod_report_recovers_after_finalize_failure_idempotently(tmp_path, monkeypatch):
+    _patch_eod_extension(monkeypatch)
+    reports = tmp_path / "reports"
+    warehouse = _EodReportWarehouse(cas_outcome="success")
+    builder = SimulationSnapshotBuilder(warehouse, reports)
+    from fundlab.marketdata import simulation_data
+
+    original_write = simulation_data._write_immutable_json
+    failed = False
+
+    def fail_formal_once(path, payload):
+        nonlocal failed
+        if path.parent == reports and not failed:
+            failed = True
+            raise OSError("injected formal-report failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(simulation_data, "_write_immutable_json", fail_formal_once)
+    with pytest.raises(OSError, match="formal-report"):
+        _run_eod_report_extension(builder)
+    assert not tuple(reports.glob("simulation-eod-*.json"))
+    assert len(tuple((reports / ".pending").glob("*.pending.json"))) == 1
+
+    result = _run_eod_report_extension(builder)
+    assert result.published
+    assert result.report.is_file()
+    assert not tuple((reports / ".pending").glob("*.pending.json"))
+
+    repeated = _run_eod_report_extension(builder)
+    assert repeated.published and repeated.report == result.report
+    assert len(tuple(reports.glob("simulation-eod-*.json"))) == 1
+
+
+def test_eod_report_finalizes_when_cas_raises_after_current(tmp_path, monkeypatch):
+    _patch_eod_extension(monkeypatch)
+    reports = tmp_path / "reports"
+    warehouse = _EodReportWarehouse(cas_outcome="after_failure")
+
+    result = _run_eod_report_extension(SimulationSnapshotBuilder(warehouse, reports))
+
+    assert result.published
+    assert result.report.is_file()
+    assert not tuple((reports / ".pending").glob("*.pending.json"))
+
+
+def test_unpublished_eod_candidate_keeps_its_visible_report_without_pending(
+    tmp_path, monkeypatch,
+):
+    _patch_eod_extension(monkeypatch)
+    reports = tmp_path / "reports"
+    warehouse = _EodReportWarehouse(cas_outcome="before_failure")
+
+    result = _run_eod_report_extension(
+        SimulationSnapshotBuilder(warehouse, reports), publish=False,
+    )
+
+    assert not result.published
+    assert result.report.is_file()
+    assert warehouse.current == warehouse.predecessor_snapshot_id
+    assert not tuple((reports / ".pending").glob("*.pending.json"))
+    assert result.report.read_text(encoding="utf-8").find('"published":false') >= 0
+
+
+def test_immutable_publish_rejects_concurrent_winner_with_different_bytes(tmp_path):
+    path = tmp_path / "report.json"
+    def publish(payload: bytes) -> bytes | str:
+        try:
+            publish_immutable_bytes(path, payload)
+        except ValueError:
+            return "collision"
+        return payload
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(publish, (b"winner", b"loser")))
+
+    assert results.count("collision") == 1
+    winning = next(item for item in results if item != "collision")
+    assert path.read_bytes() == winning
 
 
 def test_zero_copy_bootstrap_preserves_public_rows_and_separates_components(tmp_path):

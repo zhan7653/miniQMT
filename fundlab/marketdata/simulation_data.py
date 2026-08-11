@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 import json
-import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -12,13 +11,21 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from fundlab.common.atomic_files import (
+    atomic_replace_bytes,
+    fsync_parent_directory,
+    publish_immutable_bytes,
+)
 from fundlab.common.canonical import canonical_json, stable_digest, to_primitive
 from fundlab.marketdata.contracts import (
     CURRENT_SH_SZ_STOCK_ETF_UNIVERSE,
     CorporateActionType,
     CoverageClaim,
     DATA_GAP_QUARANTINE_RULE_ID,
+    ExecutionEvidenceImpact,
     EXECUTION_EVIDENCE_GAP_RULE_ID,
+    IntegrityError,
+    MarketDataError,
     MarketTable,
     ObservationManifest,
     ObservationPayload,
@@ -28,6 +35,7 @@ from fundlab.marketdata.contracts import (
     SIMULATION_PARTITION_VALIDATOR_VERSION,
     SnapshotManifest,
     SnapshotNotReadyError,
+    TradeRuleError,
     UniverseScope,
 )
 from fundlab.marketdata.providers import ProviderRegistry
@@ -50,6 +58,7 @@ SIMULATION_STATUS_CANONICAL_PROVIDER = "canonical-simulation-status-r2-v1"
 ETF_ACTION_CANONICAL_PROVIDER = "canonical-etf-actions-r2-v5"
 STOCK_ACTION_CANONICAL_PROVIDER = "canonical-stock-actions-r2-v1"
 _JSON_MISSING = "\u0000"
+_EOD_PENDING_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -371,7 +380,9 @@ class SimulationEvidenceCollector:
                     if candidate.provider == expected_provider and candidate.request == expected_request:
                         _require_complete_claim(candidate, table, request)
                         manifest = candidate
-                except Exception:
+                except IntegrityError:
+                    raise
+                except MarketDataError:
                     manifest = None
             if manifest is None and not spec.refresh:
                 if spec.kind.endswith("-actions"):
@@ -389,13 +400,15 @@ class SimulationEvidenceCollector:
                 for candidate in reversed(matches):
                     try:
                         _require_complete_claim(candidate, table, request)
-                    except Exception:
+                    except IntegrityError:
+                        raise
+                    except MarketDataError:
                         continue
                     manifest = candidate
                     break
             if manifest is None:
-                try:
-                    if spec.kind.endswith("-actions"):
+                if spec.kind.endswith("-actions"):
+                    try:
                         raw_observations = {
                             item.observation_id: item
                             for instrument_id in batch
@@ -430,15 +443,33 @@ class SimulationEvidenceCollector:
                             raise SnapshotNotReadyError(
                                 f"{spec.kind} batch returned no canonical evidence"
                             )
-                    else:
-                        candidate = self.warehouse.record_observation(
-                            self.registry.observe(provider, request)
-                        )
-                    _require_complete_claim(candidate, table, request)
+                        _require_complete_claim(candidate, table, request)
+                        manifest = candidate
+                    except IntegrityError:
+                        raise
+                    except MarketDataError:
+                        # _collect_action_batch reports provider acquisition
+                        # failures as a typed batch blocker itself.  Anything
+                        # that escapes here is canonicalization or durable
+                        # storage work and must fail closed.
+                        raise
+                else:
+                    try:
+                        payload = self.registry.observe(provider, request)
+                    except IntegrityError:
+                        raise
+                    except MarketDataError as exc:
+                        blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                        continue
+                    candidate = self.warehouse.record_observation(payload)
+                    try:
+                        _require_complete_claim(candidate, table, request)
+                    except IntegrityError:
+                        raise
+                    except MarketDataError as exc:
+                        blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                        continue
                     manifest = candidate
-                except Exception as exc:
-                    blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
-                    continue
             completed[batch_id] = manifest.observation_id
             observation_ids.append(manifest.observation_id)
             _write_atomic_json(checkpoint, {
@@ -782,10 +813,10 @@ class SimulationEvidenceCollector:
                     },
                 )
                 try:
-                    manifest = self.warehouse.record_observation(
-                        self.registry.observe("cninfo-public", request)
-                    )
-                except Exception as exc:
+                    payload = self.registry.observe("cninfo-public", request)
+                except IntegrityError:
+                    raise
+                except MarketDataError as exc:
                     detail = f"{type(exc).__name__}:{str(exc)[:240]}"
                     detail_request_attempts.append({
                         "round": round_index + 1,
@@ -796,6 +827,7 @@ class SimulationEvidenceCollector:
                     for instrument_id in batch:
                         recovery_errors[instrument_id] = detail
                     continue
+                manifest = self.warehouse.record_observation(payload)
                 raw_observations.append(manifest)
                 absorb(manifest)
                 detail_request_attempts.append({
@@ -941,6 +973,11 @@ class SimulationEvidenceCollector:
                 awaiting.add(instrument_id)
 
         unresolved = set(target_ids) - selected_ids
+        # A correction is an exact historical fact conflict, not a reason to
+        # discard clean evidence for every other stock in this increment.
+        # Keep the affected instruments unresolved so the daily publisher can
+        # quarantine only their dependency scope.
+        unresolved.update(historical_corrections)
         unresolved.update(awaiting)
         for instrument_id in unresolved:
             if instrument_id in invalid_details:
@@ -1003,7 +1040,7 @@ class SimulationEvidenceCollector:
 
         complete_ids = tuple(sorted(stock_set - unresolved))
         observation_ids: tuple[str, ...] = ()
-        if complete_ids and not historical_corrections:
+        if complete_ids:
             current_actions = current_actions.loc[
                 current_actions["instrument_id"].astype(str).isin(complete_ids)
             ].reset_index(drop=True)
@@ -1313,8 +1350,10 @@ class SimulationStatusCollector:
                         )
                     else:
                         _require_complete_claim(candidate, MarketTable.DAILY_BARS, request)
-                except Exception:
-                    restored_id = None
+                except IntegrityError:
+                    raise
+                except MarketDataError:
+                    raise
             if restored_id:
                 observation_ids.append(restored_id)
                 continue
@@ -1335,54 +1374,74 @@ class SimulationStatusCollector:
                                 calendar,
                                 scope,
                             )
-                    except Exception:
+                    except SnapshotNotReadyError:
+                        # This is an already-matched source claim for the
+                        # exact request.  Invalid coverage can be safely
+                        # bypassed and reacquired; it is not durable output.
                         continue
                     source_manifest = candidate
                     break
                 if source_manifest is None:
-                    source_manifest = self.warehouse.record_observation(
-                        self.registry.observe(spec.provider_name, request)
-                    )
-                if spec.provider_name == "xtquant":
-                    _require_sparse_status_source(source_manifest, request)
-                else:
-                    _require_complete_status_claim(
-                        source_manifest,
-                        request,
-                        instruments.loc[instruments["instrument_id"].isin(batch)],
-                        calendar,
-                        scope,
-                    )
+                    try:
+                        payload = self.registry.observe(spec.provider_name, request)
+                    except IntegrityError:
+                        raise
+                    except MarketDataError as exc:
+                        blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                        continue
+                    source_manifest = self.warehouse.record_observation(payload)
+                try:
+                    if spec.provider_name == "xtquant":
+                        _require_sparse_status_source(source_manifest, request)
+                    else:
+                        _require_complete_status_claim(
+                            source_manifest,
+                            request,
+                            instruments.loc[instruments["instrument_id"].isin(batch)],
+                            calendar,
+                            scope,
+                        )
+                except SnapshotNotReadyError as exc:
+                    blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                    continue
                 frame = self.warehouse.read_observation_table(
                     source_manifest.observation_id, MarketTable.DAILY_BARS,
                 )
                 research = context.research_bars.loc[
                     context.research_bars["instrument_id"].astype(str).isin(batch)
                 ].copy()
-                _validate_status_scope(
-                    instruments.loc[instruments["instrument_id"].isin(batch)],
-                    frame,
-                    calendar,
-                    scope,
-                    required_active_keys=set(map(
-                        tuple, research[["instrument_id", "session_date"]].astype(str).to_numpy(),
-                    )),
-                    mode=spec.provider_name,
-                )
+                try:
+                    _validate_status_scope(
+                        instruments.loc[instruments["instrument_id"].isin(batch)],
+                        frame,
+                        calendar,
+                        scope,
+                        required_active_keys=set(map(
+                            tuple, research[["instrument_id", "session_date"]].astype(str).to_numpy(),
+                        )),
+                        mode=spec.provider_name,
+                    )
+                except SnapshotNotReadyError as exc:
+                    blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                    continue
                 manifest = source_manifest
                 if spec.provider_name == "xtquant":
-                    dense_status, status_quality = canonicalize_suspension_status(
-                        instruments=instruments.loc[
-                            instruments["instrument_id"].isin(batch)
-                        ],
-                        research_bars=research,
-                        status_bars=frame,
-                        calendar=calendar,
-                        universe_scope=scope,
-                        status_observation_id=source_manifest.observation_id,
-                        source_snapshot_id=spec.source_snapshot_id,
-                        calendar_observation_id=spec.calendar_observation_id,
-                    )
+                    try:
+                        dense_status, status_quality = canonicalize_suspension_status(
+                            instruments=instruments.loc[
+                                instruments["instrument_id"].isin(batch)
+                            ],
+                            research_bars=research,
+                            status_bars=frame,
+                            calendar=calendar,
+                            universe_scope=scope,
+                            status_observation_id=source_manifest.observation_id,
+                            source_snapshot_id=spec.source_snapshot_id,
+                            calendar_observation_id=spec.calendar_observation_id,
+                        )
+                    except SnapshotNotReadyError as exc:
+                        blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
+                        continue
                     canonical_request = ProviderRequest(
                         ProviderCapability.CANONICAL_RECONCILIATION,
                         scope.history_start,
@@ -1431,9 +1490,10 @@ class SimulationStatusCollector:
                             },
                         ))
                     _require_complete_claim(manifest, MarketTable.DAILY_BARS, request)
-            except Exception as exc:
-                blockers.append(f"{batch_id}:{type(exc).__name__}:{str(exc)[:240]}")
-                continue
+            except IntegrityError:
+                raise
+            except MarketDataError:
+                raise
             completed[batch_id] = manifest.observation_id
             observation_ids.append(manifest.observation_id)
             _write_atomic_json(checkpoint, {
@@ -2092,46 +2152,76 @@ class SimulationIncrementValidator:
                     universe_observation_id=candidate_observation_id,
                 ).rules
                 break
-            except Exception as exc:
-                error = f"{type(exc).__name__}:{str(exc)[:1000]}"
-                mentioned = set(re.findall(r"\b\d{6}\.(?:SH|SZ)\b", error))
-                affected = mentioned & eligible_etfs
-                if not affected:
-                    affected = set(eligible_etfs)
-                for instrument_id in affected:
-                    validator_execution_guard[instrument_id] = (
-                        f"etf_rules:{error}",
+            except TradeRuleError as exc:
+                affected = set(exc.instrument_ids) & eligible_etfs
+                if not affected or set(exc.instrument_ids) - eligible_etfs:
+                    # A structural ETF-rule error has no safely local scope.
+                    # Do not infer one from its message or the active universe.
+                    raise
+                impacts = tuple(sorted({
+                    ExecutionEvidenceImpact(
+                        instrument_id,
+                        str(session_date)[:10],
                     )
-                affected_mask = bars["instrument_id"].astype(str).isin(affected)
-                for index in bars.index[affected_mask]:
-                    value = bars.at[index, "field_lineage"]
-                    try:
-                        lineage = json.loads(str(value)) if str(value).strip() else {}
-                    except json.JSONDecodeError:
-                        lineage = {"upstream_lineage": str(value)}
-                    instrument_id = str(bars.at[index, "instrument_id"])
-                    lineage["daily_execution_evidence_gap_guard_v1"] = {
-                        "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
-                        "reasons": validator_execution_guard[instrument_id],
-                        "execution": "prohibited_and_deferred",
-                    }
-                    bars.at[index, "field_lineage"] = canonical_json(lineage)
-                execution_guard_mask |= affected_mask
+                    for instrument_id in affected
+                    for session_date in bars.loc[
+                        bars["instrument_id"].astype(str).eq(instrument_id),
+                        "session_date",
+                    ]
+                }))
+                new_guard = _guard_execution_evidence_rows(
+                    bars,
+                    impacts,
+                    reason="etf_rules:typed_instrument_evidence_gap",
+                    validator_reasons=validator_execution_guard,
+                )
+                if not new_guard.any():
+                    raise
+                execution_guard_mask |= new_guard
                 eligible_etfs.difference_update(affected)
-        rule_input = bars.copy(deep=True)
-        # Rule materialization needs a non-active placeholder while quarantine
-        # rows deliberately keep tradability unknown.  Restore the unknown
-        # state immediately after deriving all other daily rule attributes.
-        non_execution_mask = quarantine_mask | execution_guard_mask
-        guarded_prices = bars.loc[
-            execution_guard_mask,
-            ["open", "high", "low", "close", "volume", "amount"],
-        ].copy()
-        rule_input.loc[non_execution_mask, "suspended"] = True
-        rule_input.loc[non_execution_mask, "is_st"] = pd.NA
-        bars = materialize_daily_trade_rules(
-            rule_input, instruments, rule_calendar, etf_rules=etf_rules,
-        )
+        while True:
+            rule_input = bars.copy(deep=True)
+            # Rule materialization needs a non-active placeholder while
+            # quarantined and evidence-guarded rows deliberately keep
+            # tradability unknown.  Restore the unknown state after deriving
+            # all other daily rule attributes.
+            non_execution_mask = quarantine_mask | execution_guard_mask
+            guarded_prices = bars.loc[
+                execution_guard_mask,
+                ["open", "high", "low", "close", "volume", "amount"],
+            ].copy()
+            rule_input.loc[non_execution_mask, "suspended"] = True
+            rule_input.loc[non_execution_mask, "is_st"] = pd.NA
+            try:
+                bars = materialize_daily_trade_rules(
+                    rule_input, instruments, rule_calendar, etf_rules=etf_rules,
+                )
+                break
+            except TradeRuleError as exc:
+                if not exc.impacts:
+                    raise
+                impact_ids = {impact.instrument_id for impact in exc.impacts}
+                master_ids = set(map(str, instruments["instrument_id"]))
+                if not impact_ids <= master_ids:
+                    # A missing instrument master cannot be made safe merely
+                    # by hiding its bars: rule materialization has no trusted
+                    # master to carry into the published partition.
+                    raise
+                materializable_before = int((~non_execution_mask).sum())
+                new_guard = _guard_execution_evidence_rows(
+                    bars,
+                    exc.impacts,
+                    reason=f"trade_rule_materialization:{str(exc)}",
+                    validator_reasons=validator_execution_guard,
+                )
+                if not new_guard.any():
+                    raise
+                execution_guard_mask |= new_guard
+                materializable_after = int((~(
+                    quarantine_mask | execution_guard_mask
+                )).sum())
+                if materializable_after >= materializable_before:
+                    raise
         if quarantine_mask.any():
             bars.loc[quarantine_mask, "suspended"] = pd.NA
             bars.loc[quarantine_mask, "trade_rule_id"] = DATA_GAP_QUARANTINE_RULE_ID
@@ -2143,6 +2233,9 @@ class SimulationIncrementValidator:
                 execution_guard_mask,
                 ["open", "high", "low", "close", "volume", "amount"],
             ] = guarded_prices
+            for column in ("suspended", "is_st"):
+                if pd.api.types.is_bool_dtype(bars[column]):
+                    bars[column] = bars[column].astype("boolean")
             bars.loc[execution_guard_mask, "suspended"] = pd.NA
             bars.loc[execution_guard_mask, "is_st"] = pd.NA
             bars.loc[execution_guard_mask, "trade_rule_id"] = (
@@ -2161,8 +2254,19 @@ class SimulationIncrementValidator:
         bars, exception_audit = apply_corroborated_historical_limit_exceptions(
             bars,
             provider_bars,
-            protected_dates=(universe_scope.history_end,),
         )
+        target_exception_impacts = tuple(
+            _execution_evidence_impact_from_key(key)
+            for key in exception_audit["exception_keys"]
+            if str(key[1])[:10] == universe_scope.history_end.isoformat()
+        )
+        if target_exception_impacts:
+            execution_guard_mask |= _guard_execution_evidence_rows(
+                bars,
+                target_exception_impacts,
+                reason="historical_price_limit_exception:target_session",
+                validator_reasons=validator_execution_guard,
+            )
         if execution_guard_mask.any():
             bars.loc[execution_guard_mask, "trade_rule_id"] = (
                 EXECUTION_EVIDENCE_GAP_RULE_ID
@@ -2170,21 +2274,41 @@ class SimulationIncrementValidator:
             bars.loc[execution_guard_mask, "trade_rule_known_date"] = bars.loc[
                 execution_guard_mask, "session_date"
             ]
-        latest_historical_exception = bars.loc[
-            bars["session_date"].astype(str).eq(universe_scope.history_end.isoformat())
-            & bars["trade_rule_id"].astype(str).eq(
-                "cn-historical-exchange-exception-corroborated-v1"
+        while True:
+            try:
+                price_limit_audit = audit_provider_price_limits(
+                    bars.loc[~execution_guard_mask].reset_index(drop=True),
+                    provider_bars,
+                    required_direct_limit_date=universe_scope.history_end,
+                )
+                break
+            except TradeRuleError as exc:
+                if not exc.impacts:
+                    raise
+                new_guard = _guard_execution_evidence_rows(
+                    bars,
+                    exc.impacts,
+                    reason=f"price_limit_audit:{str(exc)}",
+                    validator_reasons=validator_execution_guard,
+                )
+                if not new_guard.any():
+                    raise
+                execution_guard_mask |= new_guard
+        # Audit retries may add guards after rule materialization.  Reassert
+        # the execution-only state for the final exact mask before readiness
+        # validation and persistence.
+        if execution_guard_mask.any():
+            for column in ("suspended", "is_st"):
+                if pd.api.types.is_bool_dtype(bars[column]):
+                    bars[column] = bars[column].astype("boolean")
+            bars.loc[execution_guard_mask, "suspended"] = pd.NA
+            bars.loc[execution_guard_mask, "is_st"] = pd.NA
+            bars.loc[execution_guard_mask, "trade_rule_id"] = (
+                EXECUTION_EVIDENCE_GAP_RULE_ID
             )
-        ]
-        if not latest_historical_exception.empty:
-            raise SnapshotNotReadyError(
-                "Latest EOD rules cannot use a historical price-limit exception"
-            )
-        price_limit_audit = audit_provider_price_limits(
-            bars.loc[~execution_guard_mask].reset_index(drop=True),
-            provider_bars,
-            required_direct_limit_date=universe_scope.history_end,
-        )
+            bars.loc[execution_guard_mask, "trade_rule_known_date"] = bars.loc[
+                execution_guard_mask, "session_date"
+            ]
 
         scoped_tables = {
             MarketTable.INSTRUMENTS: instruments,
@@ -2480,6 +2604,84 @@ class SimulationIncrementValidator:
         )
 
 
+def _execution_evidence_impact_from_key(
+    key: tuple[str, str, str],
+) -> ExecutionEvidenceImpact:
+    """Translate our own historical-exception key contract into a guard key."""
+
+    return ExecutionEvidenceImpact(str(key[0]), str(key[1])[:10])
+
+
+def _guard_execution_evidence_rows(
+    bars: pd.DataFrame,
+    impacts: tuple[ExecutionEvidenceImpact, ...],
+    *,
+    reason: str,
+    validator_reasons: dict[str, tuple[str, ...]],
+) -> pd.Series:
+    """Mark only explicitly impacted rows as non-executable.
+
+    An impact that cannot be matched to the current exact partition is a
+    contract violation, not permission to expand the guard scope.
+    """
+
+    impact_keys = {
+        (impact.instrument_id, impact.session_date)
+        for impact in impacts
+    }
+    available_keys = {
+        (str(row.instrument_id), str(row.session_date)[:10])
+        for row in bars[["instrument_id", "session_date"]].itertuples(index=False)
+    }
+    outside = sorted(impact_keys - available_keys)
+    if outside:
+        rendered = ", ".join(f"{instrument_id}/{session_date}" for instrument_id, session_date in outside)
+        raise SnapshotNotReadyError(
+            "Execution evidence impacts are outside the exact partition: " + rendered
+        )
+
+    mask = pd.Series(False, index=bars.index)
+    for impact in impacts:
+        row_mask = (
+            bars["instrument_id"].astype(str).eq(impact.instrument_id)
+            & bars["session_date"].astype(str).str[:10].eq(impact.session_date)
+        )
+        already_guarded = bars["field_lineage"].astype(str).str.contains(
+            "daily_execution_evidence_gap_guard_v1",
+            regex=False,
+            na=False,
+        )
+        new_rows = row_mask & ~already_guarded
+        key = impact.instrument_id
+        existing = validator_reasons.get(key, ())
+        dated_reason = f"{reason}@{impact.session_date}"
+        validator_reasons[key] = tuple(sorted(set((*existing, dated_reason))))
+        for index in bars.index[row_mask]:
+            value = bars.at[index, "field_lineage"]
+            try:
+                lineage = json.loads(str(value)) if str(value).strip() else {}
+            except json.JSONDecodeError:
+                lineage = {"upstream_lineage": str(value)}
+            if not isinstance(lineage, dict):
+                lineage = {"upstream_lineage": lineage}
+            lineage["daily_execution_evidence_gap_guard_v1"] = {
+                "rule_id": EXECUTION_EVIDENCE_GAP_RULE_ID,
+                "reasons": validator_reasons[key],
+                "execution": "prohibited_and_deferred",
+            }
+            bars.at[index, "field_lineage"] = canonical_json(lineage)
+        mask |= new_rows
+    if mask.any():
+        for column in ("suspended", "is_st"):
+            if pd.api.types.is_bool_dtype(bars[column]):
+                bars[column] = bars[column].astype("boolean")
+        bars.loc[mask, "suspended"] = pd.NA
+        bars.loc[mask, "is_st"] = pd.NA
+        bars.loc[mask, "trade_rule_id"] = EXECUTION_EVIDENCE_GAP_RULE_ID
+        bars.loc[mask, "trade_rule_known_date"] = bars.loc[mask, "session_date"]
+    return mask
+
+
 def _declared_input_observation_ids(
     manifest: ObservationManifest,
 ) -> tuple[str, ...]:
@@ -2539,6 +2741,11 @@ class SimulationSnapshotBuilder:
 
         from fundlab.marketdata.incremental import IncrementalCanonicalPublisher
 
+        # A previous process may have completed its pointer CAS but died before
+        # making the corresponding report visible.  Recovery only promotes an
+        # already-current, fully verified candidate; it never publishes a
+        # snapshot merely because a pending report mentions it.
+        self.recover_pending_reports()
         snapshot, incremental_audit = IncrementalCanonicalPublisher(
             self.warehouse,
         ).extend(
@@ -2549,11 +2756,6 @@ class SimulationSnapshotBuilder:
             description=description,
         )
         published = False
-        if publish:
-            self.warehouse.publish_if_current(
-                predecessor_snapshot_id, snapshot.snapshot_id,
-            )
-            published = True
         report_payload = {
             "decision_source": "https://github.com/zhan7653/miniQMT/issues/7",
             "decision_revision": 2,
@@ -2565,17 +2767,47 @@ class SimulationSnapshotBuilder:
             "increment_observation_ids": tuple(sorted(set(increment_observation_ids))),
             "incremental_audit": incremental_audit,
             "quality": snapshot.quality,
-            "published": published,
+            "published": publish,
         }
-        self.report_root.mkdir(parents=True, exist_ok=True)
-        report_hash = stable_digest(report_payload)[:16]
-        report = self.report_root / f"simulation-eod-{snapshot.snapshot_id}-{report_hash}.json"
-        primitive = to_primitive(report_payload)
-        if report.exists():
-            if json.loads(report.read_text(encoding="utf-8")) != primitive:
-                raise ValueError(f"Immutable simulation EOD report collision: {report}")
-        else:
-            report.write_text(canonical_json(report_payload), encoding="utf-8", newline="\n")
+        if not publish:
+            # A candidate-only build is an explicit public CLI workflow.  It
+            # has no pointer CAS to recover, so retain its existing visible
+            # immutable report and never create a publication pending record.
+            report = self._formal_report_path(report_payload)
+            _write_immutable_json(report, report_payload)
+            return SimulationBuildResult(
+                snapshot.snapshot_id,
+                snapshot.quality.ready,
+                False,
+                report,
+                snapshot.quality.errors,
+            )
+        pending = self._stage_pending_report(
+            predecessor_snapshot_id, snapshot.snapshot_id, report_payload,
+        )
+        report = pending.path
+        if publish:
+            try:
+                self.warehouse.publish_if_current(
+                    predecessor_snapshot_id, snapshot.snapshot_id,
+                )
+            except Exception:
+                # Some pointer implementations can report an error after the
+                # replace reached disk.  Re-read through the warehouse's
+                # verified-current path before deciding whether this pending
+                # payload may be finalized.
+                if self._promote_if_current(pending):
+                    published = True
+                    report = self._formal_report_path(pending.report)
+                else:
+                    raise
+            else:
+                if not self._promote_if_current(pending):
+                    raise SnapshotNotReadyError(
+                        "EOD pointer changed before report promotion"
+                    )
+                published = True
+                report = self._formal_report_path(pending.report)
         return SimulationBuildResult(
             snapshot.snapshot_id,
             snapshot.quality.ready,
@@ -2583,6 +2815,111 @@ class SimulationSnapshotBuilder:
             report,
             snapshot.quality.errors,
         )
+
+    def _pending_root(self) -> Path:
+        return self.report_root / ".pending"
+
+    def _stage_pending_report(
+        self,
+        expected_current_snapshot_id: str,
+        candidate_snapshot_id: str,
+        report_payload: Mapping[str, Any],
+    ) -> "_PendingEodReport":
+        report = to_primitive(report_payload)
+        if not isinstance(report, Mapping):  # defensive: reports are objects
+            raise ValueError("Simulation EOD report must be an object")
+        payload = {
+            "schema_version": _EOD_PENDING_SCHEMA_VERSION,
+            "kind": "simulation_eod_report_pending",
+            "candidate_snapshot_id": candidate_snapshot_id,
+            "expected_current_snapshot_id": expected_current_snapshot_id,
+            "report": report,
+        }
+        digest = stable_digest(payload)[:24]
+        path = self._pending_root() / (
+            f"simulation-eod-{candidate_snapshot_id}-{digest}.pending.json"
+        )
+        _write_immutable_json(path, payload)
+        return self._load_pending_report(path)
+
+    def _load_pending_report(self, path: Path) -> "_PendingEodReport":
+        match = re.fullmatch(
+            r"simulation-eod-(snap-[0-9a-f]{24})-([0-9a-f]{24})\.pending\.json",
+            path.name,
+        )
+        if match is None:
+            raise ValueError(f"Unrecognized pending EOD report name: {path}")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"Pending EOD report is not an object: {path}")
+        payload = dict(raw)
+        if (
+            payload.get("schema_version") != _EOD_PENDING_SCHEMA_VERSION
+            or payload.get("kind") != "simulation_eod_report_pending"
+            or stable_digest(payload)[:24] != match.group(2)
+        ):
+            raise ValueError(f"Pending EOD report identity mismatch: {path}")
+        candidate = payload.get("candidate_snapshot_id")
+        expected = payload.get("expected_current_snapshot_id")
+        report = payload.get("report")
+        if not isinstance(candidate, str) or candidate != match.group(1):
+            raise ValueError(f"Pending EOD candidate mismatch: {path}")
+        if not isinstance(expected, str) or not isinstance(report, Mapping):
+            raise ValueError(f"Pending EOD payload is incomplete: {path}")
+        if (
+            report.get("kind") != "simulation_eod_extension"
+            or report.get("snapshot_id") != candidate
+            or report.get("predecessor_snapshot_id") != expected
+            or report.get("published") is not True
+        ):
+            raise ValueError(f"Pending EOD report binding mismatch: {path}")
+        # Do not trust a filename or JSON body to name a snapshot.  Both the
+        # candidate and the predecessor are loaded through immutable-manifest
+        # verification before this pending file can be used for recovery.
+        if self.warehouse.load_snapshot(candidate).snapshot_id != candidate:
+            raise ValueError(f"Pending EOD candidate is not verified: {path}")
+        if self.warehouse.load_snapshot(expected).snapshot_id != expected:
+            raise ValueError(f"Pending EOD predecessor is not verified: {path}")
+        return _PendingEodReport(path, candidate, expected, dict(report))
+
+    def _formal_report_path(self, report: Mapping[str, Any]) -> Path:
+        candidate = str(report["snapshot_id"])
+        return self.report_root / (
+            f"simulation-eod-{candidate}-{stable_digest(report)[:16]}.json"
+        )
+
+    def _promote_if_current(self, pending: "_PendingEodReport") -> bool:
+        if self.warehouse.current_snapshot_id() != pending.candidate_snapshot_id:
+            return False
+        report = self._formal_report_path(pending.report)
+        _write_immutable_json(report, pending.report)
+        try:
+            pending.path.unlink()
+            fsync_parent_directory(pending.path)
+        except OSError:
+            # The durable formal artifact is already present.  Leaving a stale
+            # pending file is safe: the next recovery verifies and promotes it
+            # idempotently before attempting to remove it again.
+            pass
+        return True
+
+    def recover_pending_reports(self) -> None:
+        """Finalize verified EOD receipts without publishing any snapshot."""
+
+        root = self._pending_root()
+        if not root.exists():
+            return
+        for path in sorted(root.glob("*.pending.json")):
+            pending = self._load_pending_report(path)
+            self._promote_if_current(pending)
+
+
+@dataclass(frozen=True)
+class _PendingEodReport:
+    path: Path
+    candidate_snapshot_id: str
+    expected_current_snapshot_id: str
+    report: Mapping[str, Any]
 
 
 def _chunks(values: tuple[str, ...], size: int):
@@ -2918,14 +3255,15 @@ def _collect_action_batch(
                 _evidence_parameters(spec.kind, recovery_batch, instruments),
             )
             try:
-                manifest = warehouse.record_observation(
-                    registry.observe(source_provider, request)
-                )
-            except Exception as exc:
+                payload = registry.observe(source_provider, request)
+            except IntegrityError:
+                raise
+            except MarketDataError as exc:
                 recovery_errors.append(
                     f"{','.join(recovery_batch)}:{type(exc).__name__}:{str(exc)[:240]}"
                 )
                 continue
+            manifest = warehouse.record_observation(payload)
             raw_observations.append(manifest)
             absorb(manifest)
 
@@ -3468,12 +3806,10 @@ def _action_comparison_value(value: Any) -> Any:
 
 
 def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
-    primitive = to_primitive(payload)
-    if path.exists():
-        if json.loads(path.read_text(encoding="utf-8")) != primitive:
-            raise ValueError(f"Immutable JSON collision: {path}")
-        return
-    _write_atomic_json(path, payload)
+    try:
+        publish_immutable_bytes(path, canonical_json(payload).encode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"Immutable JSON collision: {path}") from exc
 
 
 def _read_json_if_present(path: Path) -> Mapping[str, Any]:
@@ -3486,7 +3822,4 @@ def _read_json_if_present(path: Path) -> Mapping[str, Any]:
 
 
 def _write_atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(canonical_json(payload), encoding="utf-8", newline="\n")
-    os.replace(temporary, path)
+    atomic_replace_bytes(path, canonical_json(payload).encode("utf-8"))

@@ -40,8 +40,11 @@ uv run fundlab daily status
 ```
 
 Accounts, the session cutoff, and the agent decision directory live in the `daily:` section of
-`config/fundlab.yaml`. Exit code 0 means ok, already up to date, or explicitly `degraded`; exit
-code 2 is reserved for failures that physically prevent a trustworthy durable/atomic publication.
+`config/fundlab.yaml`. Exit code 0 means ok, already up to date, or explicitly `degraded`, with a
+committed daily JSON report. Exit code 2 is reserved for an unpartitionable integrity/publication
+failure, a missing audit receipt, or an account stage where every failing enabled account makes
+no new commit. Hidden pending receipts are verified and finalized under the daily lock on the next
+run before that run continues normally.
 Normal prices are never discarded because an instrument or auxiliary evidence source failed.
 Instrument price gaps use explicit quarantine (last trusted valuation, no execution, deferred due
 orders) without a count or consecutive-day cutoff that could block unrelated prices. Missing
@@ -60,8 +63,10 @@ with catch-up and retries:
 pwsh -File scripts/register-daily-task.ps1
 ```
 
-Operational requirement: the local MiniQMT client must be running so the `xtquant` provider can
-serve data. If it is offline the data stage blocks cleanly and the next run resumes.
+The local MiniQMT client should be running so the `xtquant` provider can serve complete data. If it
+is offline, every exactly attributable price gap is quarantined independently—even when that is the
+whole current universe—while any independently verified scope continues. The next run resumes the
+same immutable observations instead of invalidating the last trusted snapshot.
 
 The canonical calendar carries exchange-announced future sessions (`daily.calendar_horizon_days`
 past today, both calendar sources agreeing over the full window), so the account clock advances
