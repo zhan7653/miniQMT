@@ -41,6 +41,11 @@ from fundlab.marketdata import (
 )
 from fundlab.marketdata.history import _exclusive_build_lock
 from fundlab.marketdata.schema import empty_table
+from tests.canonical.exchange_fixtures import (
+    OFFICIAL_COMPONENT_ENDPOINTS,
+    OFFICIAL_COMPONENT_SCOPES,
+    with_component_closure,
+)
 
 
 START = date(2026, 7, 13)
@@ -411,17 +416,17 @@ def _daily_partial_carry_universe(tmp_path):
         component: {
             "component": component,
             "scope": dict(scope),
-            "endpoints": list(history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS[component]),
-            "failed_endpoint": history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS[component][0],
+            "endpoints": list(OFFICIAL_COMPONENT_ENDPOINTS[component]),
+            "failed_endpoint": OFFICIAL_COMPONENT_ENDPOINTS[component][0],
             "error_type": "ProviderUnavailableError",
             "message": f"bounded {component} outage",
         }
-        for component, scope in history_module._OFFICIAL_UNIVERSE_COMPONENT_SCOPES.items()
+        for component, scope in OFFICIAL_COMPONENT_SCOPES.items()
         if component != "sh-stock-star"
     }
     successful = {
         endpoint
-        for component, endpoints in history_module._OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.items()
+        for component, endpoints in OFFICIAL_COMPONENT_ENDPOINTS.items()
         if component not in unavailable
         for endpoint in endpoints
     }
@@ -435,44 +440,13 @@ def _daily_partial_carry_universe(tmp_path):
         "endpoint_counts": {endpoint: 1 for endpoint in successful},
         "endpoint_response_counts": {endpoint: 1 for endpoint in successful},
         "as_of_excluded_future_instrument_ids": {},
-        "component_closure": {
-            "sh-stock-star": {
-                "component": "sh-stock-star",
-                "scope": {"exchange": "SH", "asset_type": "stock", "board": "star"},
-                "endpoints": ["sse-star-stock-list"],
-                "admitted_ids": ["688825.SH"],
-                "endpoint_membership": {
-                    "sse-star-stock-list": {
-                        "response_sha256": "a" * 64,
-                        "raw_row_count": 1,
-                        "effective_row_count": 1,
-                        "raw_ids": ["688825.SH"],
-                        "comparison_product_class_values": {},
-                        "comparison_product_class_filtered_ids": [],
-                        "authoritative_for_master": True,
-                        "duplicate_occurrences": {},
-                        "duplicate_row_count": 0,
-                        "admission_partitions": {
-                            "admitted": ["688825.SH"],
-                            "pending_onboarding": [],
-                            "future_as_of": [],
-                            "duplicate_identity": [],
-                            "membership_conflict": [],
-                            "intentionally_out_of_component": [],
-                        },
-                    },
-                },
-            },
-        },
     }
     raw_frame = _official_master().loc[
         lambda value: value["instrument_id"].eq("688825.SH")
     ].reset_index(drop=True)
-    raw_frame["field_lineage"] = json.dumps({
-        "upstream": "exchange-public",
-        "endpoint": "sse-star-stock-list",
-        "response_sha256": "a" * 64,
-    })
+    raw_frame = with_component_closure(
+        raw_frame, raw_metadata, tuple(sorted(unavailable)),
+    )
     raw = warehouse.record_observation(ObservationPayload(
         "exchange-public",
         datetime(2026, 7, 18, 0, 3, tzinfo=timezone.utc),

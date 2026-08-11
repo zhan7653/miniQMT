@@ -57,20 +57,6 @@ DAILY_CARRY_UNIVERSE_KIND = "degraded_universe_carry_forward"
 DAILY_CARRY_PIPELINE_VERSION = "daily-pipeline-v2"
 DAILY_PENDING_UNIVERSE_PROVIDER = "canonical-pending-onboarding-daily-pipeline-v2"
 DAILY_PENDING_UNIVERSE_KIND = "pending_onboarding_scope"
-_OFFICIAL_UNIVERSE_COMPONENT_SCOPES: Mapping[str, Mapping[str, str]] = {
-    "sh-stock-main": {"exchange": "SH", "asset_type": "stock", "board": "main"},
-    "sh-stock-star": {"exchange": "SH", "asset_type": "stock", "board": "star"},
-    "sz-stock": {"exchange": "SZ", "asset_type": "stock"},
-    "sh-etf": {"exchange": "SH", "asset_type": "etf"},
-    "sz-etf": {"exchange": "SZ", "asset_type": "etf"},
-}
-_OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
-    "sh-stock-main": ("sse-main-stock-list",),
-    "sh-stock-star": ("sse-star-stock-list",),
-    "sz-stock": ("szse-a-stock-list",),
-    "sh-etf": ("sse-etf-scale-list", "sse-current-full-etf-list"),
-    "sz-etf": ("szse-etf-scale-daily", "szse-current-etf-list"),
-}
 _HELD_BUILD_LOCKS: set[Path] = set()
 _HELD_BUILD_LOCKS_GUARD = Lock()
 
@@ -2738,33 +2724,14 @@ def _validate_daily_complete_official_input(
     frame: pd.DataFrame,
     spec: HistoryBuildSpec,
 ) -> None:
+    _validate_daily_official_request_identity(raw, spec)
     raw_ids = tuple(map(str, frame.get("instrument_id", ())))
     claims = tuple(
         claim for claim in raw.coverage
         if claim.table is MarketTable.INSTRUMENTS
     )
-    requested_scope = raw.source_metadata.get("requested_scope")
     if (
-        raw.provider != "exchange-public"
-        or raw.source_metadata.get("backend_group") != "exchange-public"
-        or raw.request.capability is not ProviderCapability.INSTRUMENTS
-        or raw.request.instrument_ids
-        or str(raw.request.parameters.get("as_of_date"))[:10]
-        != spec.universe_as_of.isoformat()
-        or str(raw.source_metadata.get("as_of_date"))[:10]
-        != spec.universe_as_of.isoformat()
-        or {
-            str(item).upper() for item in raw.request.parameters.get("exchanges", ())
-        } != {"SH", "SZ"}
-        or {
-            str(item).lower() for item in raw.request.parameters.get("asset_types", ())
-        } != {"stock", "etf"}
-        or not isinstance(requested_scope, Mapping)
-        or {str(item).upper() for item in requested_scope.get("exchanges", ())}
-        != {"SH", "SZ"}
-        or {str(item).lower() for item in requested_scope.get("asset_types", ())}
-        != {"stock", "etf"}
-        or len(claims) != 1
+        len(claims) != 1
         or not claims[0].complete
         or set(claims[0].instrument_ids) != set(raw_ids)
         or not raw_ids
@@ -2780,21 +2747,7 @@ def _validate_daily_partial_official_input(
     frame: pd.DataFrame,
     spec: HistoryBuildSpec,
 ) -> None:
-    if (
-        raw.provider != "exchange-public"
-        or raw.source_metadata.get("backend_group") != "exchange-public"
-        or raw.request.capability is not ProviderCapability.INSTRUMENTS
-        or raw.request.instrument_ids
-        or str(raw.request.parameters.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
-        or str(raw.source_metadata.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
-        or {
-            str(item).upper() for item in raw.request.parameters.get("exchanges", ())
-        } != {"SH", "SZ"}
-        or {
-            str(item).lower() for item in raw.request.parameters.get("asset_types", ())
-        } != {"stock", "etf"}
-    ):
-        raise ValueError("Daily carried universe raw input is not the fixed official request")
+    _validate_daily_official_request_identity(raw, spec)
     raw_ids = tuple(map(str, frame.get("instrument_id", ())))
     claims = tuple(claim for claim in raw.coverage if claim.table is MarketTable.INSTRUMENTS)
     unavailable = raw.source_metadata.get("unavailable_components")
@@ -2808,168 +2761,33 @@ def _validate_daily_partial_official_input(
         or not (unavailable or pending)
     ):
         raise ValueError("Daily carried universe raw input must be an exact incomplete observation")
-    detail = raw.source_metadata
-    _validate_daily_partial_endpoint_evidence(detail, unavailable)
-    _validate_daily_partial_pending_and_future(detail, frame, unavailable)
-    for component, component_detail in unavailable.items():
-        expected_scope = _OFFICIAL_UNIVERSE_COMPONENT_SCOPES.get(str(component))
-        endpoints = _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.get(str(component))
-        if expected_scope is None or endpoints is None or not isinstance(component_detail, Mapping):
-            raise ValueError("Daily carried universe has an unknown unavailable component")
-        if (
-            set(component_detail) - {"component", "scope", "endpoints", "failed_endpoint", "error_type", "message"}
-            or dict(component_detail.get("scope", {})) != dict(expected_scope)
-            or tuple(component_detail.get("endpoints", ())) != endpoints
-            or component_detail.get("failed_endpoint") not in endpoints
-            or component_detail.get("error_type") != "ProviderUnavailableError"
-            or not isinstance(component_detail.get("message"), str)
-            or not component_detail["message"].strip()
-        ):
-            raise ValueError("Daily carried universe unavailable component evidence is invalid")
-    required_columns = {"instrument_id", "exchange", "asset_type", "board"}
-    if not required_columns <= set(frame.columns):
-        raise ValueError("Daily carried universe raw input lacks component identity columns")
-    for row in frame.loc[:, sorted(required_columns)].to_dict("records"):
-        if _daily_universe_component(row) in unavailable:
-            raise ValueError("Daily carried universe raw input contains an unavailable component row")
 
 
-def _validate_daily_partial_endpoint_evidence(
-    metadata: Mapping[str, Any],
-    unavailable: Mapping[str, Any],
+def _validate_daily_official_request_identity(
+    raw: ObservationManifest,
+    spec: HistoryBuildSpec,
 ) -> None:
-    scope = metadata.get("requested_scope")
+    requested_scope = raw.source_metadata.get("requested_scope")
     if (
-        not isinstance(scope, Mapping)
-        or set(scope) != {"exchanges", "asset_types"}
-        or set(scope["exchanges"]) != {"SH", "SZ"}
-        or set(scope["asset_types"]) != {"stock", "etf"}
+        raw.provider != "exchange-public"
+        or raw.source_metadata.get("backend_group") != "exchange-public"
+        or raw.request.capability is not ProviderCapability.INSTRUMENTS
+        or raw.request.instrument_ids
+        or str(raw.request.parameters.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
+        or str(raw.source_metadata.get("as_of_date"))[:10] != spec.universe_as_of.isoformat()
+        or {
+            str(item).upper() for item in raw.request.parameters.get("exchanges", ())
+        } != {"SH", "SZ"}
+        or {
+            str(item).lower() for item in raw.request.parameters.get("asset_types", ())
+        } != {"stock", "etf"}
+        or not isinstance(requested_scope, Mapping)
+        or {str(item).upper() for item in requested_scope.get("exchanges", ())}
+        != {"SH", "SZ"}
+        or {str(item).lower() for item in requested_scope.get("asset_types", ())}
+        != {"stock", "etf"}
     ):
-        raise ValueError("Daily carried universe raw requested scope is invalid")
-    successful = {
-        endpoint
-        for component, endpoints in _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.items()
-        if component not in unavailable
-        for endpoint in endpoints
-    }
-    maps = {
-        "response_sha256": metadata.get("response_sha256"),
-        "endpoint_counts": metadata.get("endpoint_counts"),
-        "endpoint_response_counts": metadata.get("endpoint_response_counts"),
-    }
-    if any(not isinstance(item, Mapping) or set(item) != successful for item in maps.values()):
-        raise ValueError("Daily carried universe endpoint evidence is not component-closed")
-    for endpoint in successful:
-        if (
-            not isinstance(maps["response_sha256"][endpoint], str)
-            or not maps["response_sha256"][endpoint].strip()
-            or not isinstance(maps["endpoint_response_counts"][endpoint], int)
-            or isinstance(maps["endpoint_response_counts"][endpoint], bool)
-            or maps["endpoint_response_counts"][endpoint] <= 0
-            or not isinstance(maps["endpoint_counts"][endpoint], int)
-            or isinstance(maps["endpoint_counts"][endpoint], bool)
-            or maps["endpoint_counts"][endpoint] < 0
-        ):
-            raise ValueError("Daily carried universe endpoint evidence is invalid")
-
-
-def _validate_daily_partial_pending_and_future(
-    metadata: Mapping[str, Any],
-    frame: pd.DataFrame,
-    unavailable: Mapping[str, Any],
-) -> None:
-    """Validate every admitted exclusion against the exchange source contract."""
-
-    pending = metadata["pending_onboarding"]
-    future = metadata.get("as_of_excluded_future_instrument_ids", {})
-    hashes = metadata["response_sha256"]
-    successful_endpoints = set(hashes)
-    raw_ids = set(map(str, frame["instrument_id"]))
-    if not isinstance(future, Mapping):
-        raise ValueError("Daily carried universe future-exclusion evidence is malformed")
-    future_allowed = {
-        "sse-current-full-etf-list", "szse-current-etf-list",
-    } & successful_endpoints
-    if not set(future) <= future_allowed:
-        raise ValueError("Daily carried universe future exclusions name an invalid endpoint")
-    future_ids: set[str] = set()
-    for endpoint, values in future.items():
-        if (
-            not isinstance(values, (list, tuple))
-            or tuple(values) != tuple(sorted(set(map(str, values))))
-            or any(not str(value).endswith((".SH", ".SZ")) for value in values)
-        ):
-            raise ValueError("Daily carried universe future exclusions are not exact IDs")
-        future_ids.update(map(str, values))
-    if future_ids & raw_ids:
-        raise ValueError("Daily carried universe future exclusions overlap admitted rows")
-    for instrument_id, detail in pending.items():
-        if (
-            not isinstance(instrument_id, str)
-            or not instrument_id
-            or instrument_id in raw_ids
-            or not isinstance(detail, Mapping)
-            or not {"missing_fields", "invalid_fields", "conflict_fields", "endpoint", "raw_evidence"}
-            <= set(detail)
-            or set(detail) - {
-                "missing_fields", "invalid_fields", "conflict_fields", "endpoint",
-                "raw_evidence", "membership_evidence",
-            }
-        ):
-            raise ValueError("Daily carried universe pending-onboarding evidence is malformed")
-        fields = tuple(detail[name] for name in (
-            "missing_fields", "invalid_fields", "conflict_fields",
-        ))
-        if (
-            any(
-                not isinstance(value, (list, tuple))
-                or tuple(value) != tuple(sorted(set(map(str, value))))
-                or any(not str(item).strip() for item in value)
-                for value in fields
-            )
-            or not any(fields)
-            or detail["endpoint"] not in successful_endpoints
-        ):
-            raise ValueError("Daily carried universe pending-onboarding fields are invalid")
-        evidence = detail["raw_evidence"]
-        if (
-            not isinstance(evidence, Mapping)
-            or set(evidence) != {"response_sha256", "row"}
-            or evidence["response_sha256"] != hashes[detail["endpoint"]]
-            or not isinstance(evidence["row"], Mapping)
-        ):
-            raise ValueError("Daily carried universe pending raw evidence is invalid")
-        membership = detail.get("membership_evidence")
-        if membership is not None:
-            endpoint_evidence = membership.get("endpoints") if isinstance(membership, Mapping) else None
-            if (
-                "membership" not in detail["conflict_fields"]
-                or not isinstance(endpoint_evidence, Mapping)
-                or len(endpoint_evidence) != 2
-                or any(
-                    endpoint not in successful_endpoints
-                    or not isinstance(value, Mapping)
-                    or set(value) != {"response_sha256", "row"}
-                    or value["response_sha256"] != hashes[endpoint]
-                    for endpoint, value in endpoint_evidence.items()
-                )
-            ):
-                raise ValueError("Daily carried universe pending membership evidence is invalid")
-
-
-def _daily_universe_component(row: Mapping[str, Any]) -> str:
-    exchange = str(row["exchange"])
-    asset_type = str(row["asset_type"])
-    board = str(row.get("board", ""))
-    if exchange == "SH" and asset_type == "stock" and board in {"main", "star"}:
-        return f"sh-stock-{board}"
-    if exchange == "SZ" and asset_type == "stock":
-        return "sz-stock"
-    if exchange == "SH" and asset_type == "etf":
-        return "sh-etf"
-    if exchange == "SZ" and asset_type == "etf":
-        return "sz-etf"
-    raise ValueError("Daily carried universe row is outside fixed component scope")
+        raise ValueError("Daily carried universe raw input is not the fixed official request")
 
 
 def _select_universe(

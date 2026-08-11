@@ -97,20 +97,6 @@ DATA_GAP_QUARANTINE_PROVIDER = "fundlab-data-gap-quarantine"
 # Keep this mapping local to the daily consumer: it is the contract that lets
 # a partially observed official universe remain safe to carry forward without
 # treating parser or membership defects as an endpoint outage.
-_OFFICIAL_UNIVERSE_COMPONENT_SCOPES: Mapping[str, Mapping[str, str]] = {
-    "sh-stock-main": {"exchange": "SH", "asset_type": "stock", "board": "main"},
-    "sh-stock-star": {"exchange": "SH", "asset_type": "stock", "board": "star"},
-    "sz-stock": {"exchange": "SZ", "asset_type": "stock"},
-    "sh-etf": {"exchange": "SH", "asset_type": "etf"},
-    "sz-etf": {"exchange": "SZ", "asset_type": "etf"},
-}
-_OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
-    "sh-stock-main": ("sse-main-stock-list",),
-    "sh-stock-star": ("sse-star-stock-list",),
-    "sz-stock": ("szse-a-stock-list",),
-    "sh-etf": ("sse-etf-scale-list", "sse-current-full-etf-list"),
-    "sz-etf": ("szse-etf-scale-daily", "szse-current-etf-list"),
-}
 
 
 class DailyRunInProgress(RuntimeError):
@@ -1250,7 +1236,11 @@ class DailyPipeline:
         # New provider observations carry a self-contained component closure.
         # Old complete observations remain reusable, but partial evidence never
         # gets that compatibility escape hatch.
-        if requires_component_closure or "component_closure" in observed.source_metadata:
+        component_closure_validated = (
+            requires_component_closure
+            or "component_closure" in observed.source_metadata
+        )
+        if component_closure_validated:
             try:
                 validate_exchange_component_closure(
                     metadata=observed.source_metadata,
@@ -1263,7 +1253,10 @@ class DailyPipeline:
                     },
                 ) from exc
         unavailable_components = self._official_unavailable_components(
-            observed, frame, pending_onboarding=bool(pending_onboarding),
+            observed,
+            frame,
+            pending_onboarding=bool(pending_onboarding),
+            component_closure_validated=component_closure_validated,
         )
         removed = tuple(sorted(prior_ids - official_ids))
         pending_existing_ids = tuple(sorted(prior_ids & set(pending_onboarding)))
@@ -1337,83 +1330,20 @@ class DailyPipeline:
         frame: pd.DataFrame,
         *,
         pending_onboarding: bool,
+        component_closure_validated: bool,
     ) -> dict[str, Mapping[str, Any]]:
-        """Validate exact exchange endpoint outages against returned rows.
-
-        A component failure can be carried only when the provider supplies an
-        explicit fixed component scope and has omitted every row in that
-        scope.  Anything else is an unpartitionable source/schema failure.
-        """
+        """Bind validated provider metadata to the persisted coverage claim."""
 
         raw = observed.source_metadata.get("unavailable_components", {})
         if not isinstance(raw, Mapping):
             raise DailyPipelineBlocked(
                 "universe", "official universe unavailable-components metadata is malformed"
             )
-        requested_scope = observed.source_metadata.get("requested_scope")
-        if (
-            not isinstance(requested_scope, Mapping)
-            or set(requested_scope) != {"exchanges", "asset_types"}
-            or not isinstance(requested_scope["exchanges"], (list, tuple))
-            or not isinstance(requested_scope["asset_types"], (list, tuple))
-            or set(requested_scope["exchanges"]) != {"SH", "SZ"}
-            or set(requested_scope["asset_types"]) != {"stock", "etf"}
-        ):
-            raise DailyPipelineBlocked(
-                "universe", "official universe requested scope is malformed"
-            )
-        required = {"scope", "endpoints", "failed_endpoint", "error_type", "message"}
-        normalized: dict[str, Mapping[str, Any]] = {}
-        for component, detail in raw.items():
-            component = str(component)
-            expected_scope = _OFFICIAL_UNIVERSE_COMPONENT_SCOPES.get(component)
-            expected_endpoints = _OFFICIAL_UNIVERSE_COMPONENT_ENDPOINTS.get(component)
-            if expected_scope is None or not isinstance(detail, Mapping):
-                raise DailyPipelineBlocked(
-                    "universe", "official universe unavailable component is unknown or malformed",
-                    {"component": component},
-                )
-            keys = set(detail)
-            if not required <= keys or keys - (required | {"component"}):
-                raise DailyPipelineBlocked(
-                    "universe", "official universe unavailable component detail has invalid shape",
-                    {"component": component},
-                )
-            if "component" in detail and detail["component"] != component:
-                raise DailyPipelineBlocked(
-                    "universe", "official universe unavailable component identity disagrees",
-                    {"component": component},
-                )
-            scope = detail["scope"]
-            endpoints = detail["endpoints"]
-            failed_endpoint = detail["failed_endpoint"]
-            error_type = detail["error_type"]
-            message = detail["message"]
-            if (
-                not isinstance(scope, Mapping)
-                or dict(scope) != dict(expected_scope)
-                or not isinstance(endpoints, (list, tuple))
-                or tuple(endpoints) != expected_endpoints
-                or not isinstance(failed_endpoint, str)
-                or failed_endpoint not in expected_endpoints
-                or error_type != ProviderUnavailableError.__name__
-                or not isinstance(message, str)
-                or not message.strip()
-            ):
-                raise DailyPipelineBlocked(
-                    "universe", "official universe unavailable component detail is invalid",
-                    {"component": component},
-                )
-            # Carry the validated source object unchanged.  The canonical
-            # wrapper must bind its degraded detail exactly to the persisted
-            # raw input, including the provider's optional component echo.
-            normalized[component] = dict(detail)
+        normalized = {str(component): dict(detail) for component, detail in raw.items()}
 
-        required_columns = {"instrument_id", "exchange", "asset_type", "board"}
-        if not required_columns <= set(frame.columns):
+        if "instrument_id" not in frame.columns:
             raise DailyPipelineBlocked(
-                "universe", "official universe frame lacks component identity columns",
-                {"missing_columns": tuple(sorted(required_columns - set(frame.columns)))},
+                "universe", "official universe frame lacks instrument identity"
             )
         frame_ids = tuple(sorted(map(str, frame["instrument_id"])))
         claims = [
@@ -1433,36 +1363,30 @@ class DailyPipeline:
                     "frame_instrument_count": len(frame_ids),
                 },
             )
-        for row in frame.loc[:, ["instrument_id", "exchange", "asset_type", "board"]].to_dict("records"):
-            component = DailyPipeline._official_universe_component_for_row(row)
-            if component in normalized:
+        if not component_closure_validated:
+            requested_scope = observed.source_metadata.get("requested_scope")
+            required_columns = {"instrument_id", "exchange", "asset_type", "board"}
+            if (
+                not isinstance(requested_scope, Mapping)
+                or set(requested_scope) != {"exchanges", "asset_types"}
+                or set(requested_scope.get("exchanges", ())) != {"SH", "SZ"}
+                or set(requested_scope.get("asset_types", ())) != {"stock", "etf"}
+                or not required_columns <= set(frame.columns)
+            ):
                 raise DailyPipelineBlocked(
-                    "universe", "official universe contains rows from an unavailable component",
-                    {
-                        "component": component,
-                        "instrument_id": str(row["instrument_id"]),
-                    },
+                    "universe", "legacy official universe scope is malformed"
+                )
+            valid_rows = (
+                ((frame["exchange"] == "SH") & (frame["asset_type"] == "stock")
+                 & frame["board"].isin(("main", "star")))
+                | ((frame["exchange"] == "SZ") & (frame["asset_type"] == "stock"))
+                | (frame["asset_type"].eq("etf") & frame["exchange"].isin(("SH", "SZ")))
+            )
+            if not bool(valid_rows.all()):
+                raise DailyPipelineBlocked(
+                    "universe", "legacy official universe row is outside the fixed component contract"
                 )
         return normalized
-
-    @staticmethod
-    def _official_universe_component_for_row(row: Mapping[str, Any]) -> str:
-        exchange = str(row["exchange"]).strip()
-        asset_type = str(row["asset_type"]).strip()
-        board = str(row["board"]).strip()
-        if exchange == "SH" and asset_type == "stock":
-            if board in {"main", "star"}:
-                return f"sh-stock-{board}"
-        elif exchange == "SZ" and asset_type == "stock":
-            return "sz-stock"
-        elif exchange == "SH" and asset_type == "etf":
-            return "sh-etf"
-        elif exchange == "SZ" and asset_type == "etf":
-            return "sz-etf"
-        raise DailyPipelineBlocked(
-            "universe", "official universe row is outside the fixed component contract",
-            {"instrument_id": str(row["instrument_id"])},
-        )
 
     @staticmethod
     def _pending_onboarding_metadata(
