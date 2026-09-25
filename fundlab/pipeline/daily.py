@@ -1042,10 +1042,9 @@ class DailyPipeline:
         for result in direct_limit_results.values():
             directly_verified_ids.intersection_update(result["_covered_instrument_ids"])
         missing_limit_ids = tuple(sorted(set(target_ids) - directly_verified_ids))
-        if len(direct_limit_results) < 2:
-            # The validator still requires two independent direct-limit
-            # backends. Keep prices visible but guard every instrument until a
-            # second provider is configured.
+        if len(direct_limit_results) < self.settings.daily.minimum_direct_limit_observations:
+            # Keep prices visible but guard every instrument when the configured
+            # minimum direct-limit evidence cannot be met.
             missing_limit_ids = tuple(sorted(target_ids))
         self._add_quarantine_reasons(
             execution_guard_reasons,
@@ -1193,7 +1192,11 @@ class DailyPipeline:
 
         try:
             validated = SimulationIncrementValidator(
-                self.warehouse, self.report_root,
+                self.warehouse,
+                self.report_root,
+                minimum_direct_limit_observations=(
+                    self.settings.daily.minimum_direct_limit_observations
+                ),
             ).validate_and_record(
                 candidate_observation_id=candidate_id,
                 calendar_observation_id=calendar_observation_id,

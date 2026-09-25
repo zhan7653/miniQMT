@@ -45,7 +45,7 @@ flowchart TD
     H --> NEW["交易所已确认、但历史主表尚未收录的新上市代码:<br/>首日按上市窗口补充;后续只凭连续已发布前序快照延续"]
     NEW --> NT["旧标的缺失优先做 no-trade 三源共识;<br/>无法确认则仅隔离对应标的，不阻断其他行情"]
     NT --> RS["research: derive_current_research_snapshot<br/>精确缺口 → 局部 quarantine；共享结构不完整 → 暂停"]
-    RS --> SE["status: 配置的密集状态源+股票 ST 源<br/>limits: 配置的直接限价源（第二路缺失则 no-execution）<br/>evidence: stock-actions / etf-actions / 配置的因子源<br/>factor reconciliation: BaoStock + 必要时 TickFlow 调整比率"]
+    RS --> SE["status: 配置的密集状态源+股票 ST 源<br/>limits: 配置的直接限价源（未达到配置阈值则 no-execution）<br/>evidence: stock-actions / etf-actions / 配置的因子源<br/>factor reconciliation: BaoStock + 必要时 TickFlow 调整比率"]
     SE --> CV["candidate: 组装 canonical-reconciler 源观测<br/>validate: SimulationIncrementValidator"]
     CV --> EX["extend: SimulationSnapshotBuilder.extend<br/>原子发布新快照 (publish=True)"]
     EX --> AC["accounts: 每个账户从各自 head+1<br/>逐会话跑交易内核到数据头"]
@@ -93,7 +93,7 @@ flowchart TD
 `config/fundlab.yaml` 五段,一一映射到冻结 dataclass:
 
 - `paths` → `FoundationPaths`:`market_data`(`data/warehouse/v2/canonical`)、`trading_database`(`data/warehouse/v2/trading.sqlite3`)、`report_root`(`data/reports/data_v2/canonical`);
-- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, baostock]`、`adjudicator: eastmoney-efinance`、`factor_provider: baostock`、`dense_status_provider: baostock`、`stock_status_provider: baostock`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 19 个账户：静态 ETF、单资产动量、LLM 红利，以及非 LLM 的规则红利、双动量、波动率倒数、相关性风险平价、趋势波动率目标、低 Beta/低波动、摘帽动量、在帽 ST 动量和 8 个宽基/卫星 ETF 危机策略变种；股票价格/ST 与危机账户只从创建日起前瞻评价，不生成历史收益结论；危机账户不读取溢价率，跨境风险改由单只仓位上限约束；LLM 红利以 `159207.SZ` 做只读含分红基准，60 个共同交易会话前不允许相对表现参与调仓;
+- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, baostock]`、`adjudicator: eastmoney-efinance`、`factor_provider: baostock`、`dense_status_provider: baostock`、`stock_status_provider: baostock`、`direct_limit_providers: [eastmoney-efinance]`、`minimum_direct_limit_observations: 1`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 19 个账户：静态 ETF、单资产动量、LLM 红利，以及非 LLM 的规则红利、双动量、波动率倒数、相关性风险平价、趋势波动率目标、低 Beta/低波动、摘帽动量、在帽 ST 动量和 8 个宽基/卫星 ETF 危机策略变种；股票价格/ST 与危机账户只从创建日起前瞻评价，不生成历史收益结论；危机账户不读取溢价率，跨境风险改由单只仓位上限约束；LLM 红利以 `159207.SZ` 做只读含分红基准，60 个共同交易会话前不允许相对表现参与调仓;
 - `execution` → `ExecutionPolicy`:参与率上限、滑点/冲击 bps、涨跌停阻断、部分成交;
 - `risk` → `RiskPolicy`:单仓权重上限、最低现金权重、允许资产类型;
 - `fees` → `FeeSchedule`:带生效区间与证据说明的分段费率规则,`trusted_for_simulation: true` 是模拟内核放行的显式声明(它是版本化的模拟假设,不是真实券商账户的声明)。

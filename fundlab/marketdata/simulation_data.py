@@ -2032,9 +2032,18 @@ class SimulationIncrementValidator:
     marker consumed by the incremental publisher.
     """
 
-    def __init__(self, warehouse: MarketDataWarehouse, report_root: str | Path) -> None:
+    def __init__(
+        self,
+        warehouse: MarketDataWarehouse,
+        report_root: str | Path,
+        *,
+        minimum_direct_limit_observations: int = 2,
+    ) -> None:
         self.warehouse = warehouse
         self.report_root = Path(report_root).resolve()
+        if minimum_direct_limit_observations < 1:
+            raise ValueError("minimum_direct_limit_observations must be at least 1")
+        self.minimum_direct_limit_observations = int(minimum_direct_limit_observations)
 
     def validate_and_record(
         self,
@@ -2285,6 +2294,9 @@ class SimulationIncrementValidator:
                     bars.loc[~execution_guard_mask].reset_index(drop=True),
                     provider_bars,
                     required_direct_limit_date=universe_scope.history_end,
+                    minimum_direct_limit_observations=(
+                        self.minimum_direct_limit_observations
+                    ),
                 )
                 break
             except TradeRuleError as exc:

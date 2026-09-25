@@ -65,8 +65,9 @@ pwsh -File scripts/register-daily-task.ps1
 ```
 
 The checked-in daily profile uses TickFlow plus BaoStock for research prices, state, and factors,
-with Eastmoney for conflict adjudication and latest direct-limit snapshots. The configured path keeps
-prices visible while missing second-source execution evidence applies an explicit no-execution guard.
+with Eastmoney for conflict adjudication and latest direct-limit snapshots. The current paper profile
+accepts one direct-limit source for daily execution; missing or conflicting evidence still applies an
+explicit no-execution guard, and historical OHLC bounds continue to require two independent backends.
 
 The canonical calendar carries exchange-announced future sessions (`daily.calendar_horizon_days`
 past today, both calendar sources agreeing over the full window), so the account clock advances
@@ -304,8 +305,9 @@ vendor event omitted a strict same-day cash component.
 Price limits are derived from previous close plus the point-in-time exchange rule, then audited rather
 than copied from a vendor. Historical high/low observations from at least two backends reject bounds
 that are too narrow. The current multi-source profile has one latest-session direct-limit source, so
-the two-source simulation gate keeps execution disabled until a second independent limit source is
-configured. This check also covers overly wide
+the simulation gate uses the configured minimum direct-limit count. The current profile sets that
+count to one for daily paper simulation; a second source can be enabled later for stricter evidence.
+This check also covers overly wide
 bounds and keeps the SSE unreformed `S`-share 5% rule separate from ST risk-warning rules.
 
 The accepted 2010--2026 history is the immutable migration baseline. Routine publication first turns

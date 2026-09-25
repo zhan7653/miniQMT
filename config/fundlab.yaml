@@ -17,10 +17,10 @@ daily:
   no_trade_providers: [tickflow, baostock, eastmoney-efinance]
   dense_status_provider: baostock
   stock_status_provider: baostock
-  # One latest-session limit source is available today. The validator still
-  # requires two independent sources, so prices remain visible but execution
-  # stays guarded until a second source is added.
+  # Temporarily accept one latest-session limit source for daily simulation.
+  # Add a second independent source later to restore the stricter gate.
   direct_limit_providers: [eastmoney-efinance]
+  minimum_direct_limit_observations: 1
   batch_size: 100
   # The canonical calendar carries exchange-announced sessions this many days
   # past today (both calendar sources must agree over the full window), so an

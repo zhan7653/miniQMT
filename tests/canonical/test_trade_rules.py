@@ -158,12 +158,25 @@ def test_provider_price_limit_audit_requires_two_direct_latest_boundaries():
     direct[["high", "low"]] = None
     direct[["limit_up", "limit_down"]] = [11.0, 9.0]
 
-    with pytest.raises(TradeRuleError, match="two direct provider"):
+    with pytest.raises(TradeRuleError, match="2 direct provider"):
         audit_provider_price_limits(
             derived,
             {"history-a": history, "history-b": history.copy(), "direct-a": direct},
             required_direct_limit_date=day,
         )
+
+    single = audit_provider_price_limits(
+        derived,
+        {
+            "history-a": history,
+            "history-b": history.copy(),
+            "direct-a": direct,
+        },
+        required_direct_limit_date=day,
+        minimum_direct_limit_observations=1,
+    )
+    assert single.latest_direct_verified_sessions == 1
+    assert single.minimum_direct_limit_observations_latest_session == 1
 
     audit = audit_provider_price_limits(
         derived,

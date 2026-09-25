@@ -578,7 +578,11 @@ def _data(args, settings: FoundationSettings) -> int:
             instrument_ids=tuple(sorted(map(str, instruments["instrument_id"]))),
         )
         result = SimulationIncrementValidator(
-            warehouse, settings.paths.report_root,
+            warehouse,
+            settings.paths.report_root,
+            minimum_direct_limit_observations=(
+                settings.daily.minimum_direct_limit_observations
+            ),
         ).validate_and_record(
             candidate_observation_id=candidate.observation_id,
             calendar_observation_id=args.calendar_observation_id,

@@ -172,13 +172,15 @@ def audit_provider_price_limits(
     provider_bars: Mapping[str, pd.DataFrame],
     *,
     required_direct_limit_date: date | str | None = None,
+    minimum_direct_limit_observations: int = 2,
 ) -> PriceLimitAudit:
     """Verify derived limits against independent upstream numeric observations.
 
     Provider-labelled limit values are checked when supplied.  Because the free
     historical channels generally omit those columns, every upstream high/low is
     also checked against the derived legal bounds.  Every active bounded session
-    must have observations from at least two provider backend groups.
+    must have observations from the configured minimum number of provider backend
+    groups.
     """
 
     keys = ["instrument_id", "session_date", "price_mode"]
@@ -201,6 +203,8 @@ def audit_provider_price_limits(
             "source_observation_ids": source_ids,
         }
         return PriceLimitAudit(**payload, evidence_hash=stable_digest(payload))
+    if minimum_direct_limit_observations < 1:
+        raise ValueError("minimum_direct_limit_observations must be at least 1")
     required = set(keys) | {"limit_up", "limit_down", "price_tick"}
     missing = sorted(required - set(bounded))
     if missing:
@@ -280,14 +284,19 @@ def audit_provider_price_limits(
         ].groupby(keys, sort=False)["provider"].nunique(dropna=True).reindex(
             pd.MultiIndex.from_frame(required_keys), fill_value=0,
         )
-        latest_verified = int(direct_counts.ge(2).sum())
+        latest_verified = int(
+            direct_counts.ge(minimum_direct_limit_observations).sum()
+        )
         latest_minimum = int(direct_counts.min()) if not direct_counts.empty else 0
-        if latest_bounded and latest_minimum < 2:
-            insufficient = direct_counts.loc[direct_counts.lt(2)]
+        if latest_bounded and latest_minimum < minimum_direct_limit_observations:
+            insufficient = direct_counts.loc[
+                direct_counts.lt(minimum_direct_limit_observations)
+            ]
             impacts = _price_limit_impacts_from_index(insufficient.index)
             key = impacts[0]
             raise TradeRuleError(
-                "Price-limit audit needs two direct provider limit values for "
+                "Price-limit audit needs "
+                f"{minimum_direct_limit_observations} direct provider limit value(s) for "
                 f"{key.instrument_id}/{key.session_date}",
                 impacts=impacts,
             )

@@ -63,10 +63,13 @@ class DailySettings:
     dense_status_provider: str = "baostock"
     stock_status_provider: str = "baostock"
     direct_limit_providers: tuple[str, ...] = ("eastmoney-efinance",)
+    minimum_direct_limit_observations: int = 2
 
     def __post_init__(self) -> None:
         if self.calendar_horizon_days < 1:
             raise ValueError("calendar_horizon_days must be at least 1")
+        if self.minimum_direct_limit_observations < 1:
+            raise ValueError("minimum_direct_limit_observations must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -448,6 +451,9 @@ def _daily_settings(raw: Any, base: Path) -> DailySettings:
         direct_limit_providers=tuple(map(str, raw.get(
             "direct_limit_providers", ("eastmoney-efinance",),
         ))),
+        minimum_direct_limit_observations=int(raw.get(
+            "minimum_direct_limit_observations", 2,
+        )),
         batch_size=int(raw.get("batch_size", 100)),
         calendar_horizon_days=int(raw.get("calendar_horizon_days", 60)),
         research_profile=(None if raw.get("research_profile") in (None, "") else str(raw.get("research_profile"))),
