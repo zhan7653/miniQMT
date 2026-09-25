@@ -2202,9 +2202,18 @@ def _record_current_master_observation(
                 "buy_lot", "price_tick", "sell_delay_sessions", "price_limit_ratio",
             ),
         })
+        # Keep provenance referential.  Embedding the previous row payload here
+        # makes every current-master reconciliation wrap the complete prior
+        # payload again.  A carried instrument can therefore grow from bytes
+        # to hundreds of megabytes over repeated daily runs and eventually
+        # exceed Arrow's 2 GiB string limit.  The immutable observations already
+        # retain the full upstream payloads; only their identities belong in the
+        # reconciled row.
         base["source_payload"] = canonical_json({
-            "official_membership_payload": published.get("source_payload"),
-            "historical_master_payload": base.get("source_payload"),
+            "kind": "current_master_reconciliation_r2_v2",
+            "official_membership_observation_id": universe_manifest.observation_id,
+            "historical_master_observation_id": base.get("source_observation_id"),
+            "payload_retention": "referenced immutable observations",
         })
         rows.append({
             key: base.get(key)

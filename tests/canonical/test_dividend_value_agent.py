@@ -1280,12 +1280,12 @@ def test_overwrite_hold_supersedes_old_future_decision_and_dry_run_does_not(
     ) is None
 
 
-def test_committed_dividend_agent_config_is_scheduled_and_uses_confirmed_budget():
+def test_committed_dividend_agent_config_is_paused_during_autonomous_migration():
     settings = load_foundation_settings(
         Path(__file__).resolve().parents[2] / "config" / "fundlab.yaml"
     )
     policy_settings = settings.agent.policies["paper-dividend"]
-    assert policy_settings.scheduled is True
+    assert policy_settings.scheduled is False
     assert settings.agent.llm.model == "gpt-5.6-sol"
     assert settings.agent.llm.max_output_tokens == 32768
     assert settings.agent.llm.store is False

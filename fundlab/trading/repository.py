@@ -184,8 +184,13 @@ BEGIN SELECT RAISE(ABORT, 'checkpoints require a running run'); END;
 
 
 class TradingRepository:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = read_only
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(self.path)
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA_SQL)
@@ -507,6 +512,8 @@ class TradingRepository:
             connection.close()
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
+        if self.read_only and not read_only:
+            raise PermissionError('Research repository is read-only')
         if read_only:
             connection = sqlite3.connect(f"file:{self.path.resolve().as_posix()}?mode=ro", uri=True)
         else:

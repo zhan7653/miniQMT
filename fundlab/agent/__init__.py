@@ -29,7 +29,15 @@ from fundlab.agent.features import (
     build_instrument_snapshots,
 )
 from fundlab.agent.llm import ResponsesAPIError, ResponsesDividendValueAdviser
-from fundlab.agent.price_signals import PriceSignalCandidate, build_price_signal_candidates
+from fundlab.agent.price_signals import (
+    PriceSignalCandidate,
+    build_price_signal_candidates,
+)
+from fundlab.agent.research_agent import ResearchAgent, ResearchAgentError
+from fundlab.agent.research_service import ResearchService
+from fundlab.agent.opinion import OpinionItem, OpinionRepository, OpinionService, OpinionSnapshot
+from fundlab.agent.report import research_report_schema
+from fundlab.agent.domains import ResearchDomain, domains, get_domain, register_domain
 from fundlab.agent.policy import (
     AgentPolicyError,
     CorrelationRiskParityPolicy,
@@ -83,6 +91,18 @@ __all__ = [
     "PortfolioPerformancePoint",
     "ResponsesAPIError",
     "ResponsesDividendValueAdviser",
+    "ResearchAgent",
+    "ResearchAgentError",
+    "ResearchService",
+    "OpinionItem",
+    "OpinionRepository",
+    "OpinionService",
+    "OpinionSnapshot",
+    "research_report_schema",
+    "ResearchDomain",
+    "domains",
+    "get_domain",
+    "register_domain",
     "SectorMomentumPolicy",
     "StPriceMomentumPolicy",
     "TrendVolatilityTargetPolicy",

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FundLab 模拟盘</title>
-<link rel="stylesheet" href="/static/style.css?v=20260807-4">
+<link rel="stylesheet" href="/static/style.css?v=20260909-1">
 <script src="/static/vendor/echarts.min.js"></script>
 </head>
 <body>
@@ -24,6 +24,8 @@
     <button class="tab" data-tab="runs">运行记录</button>
     <button class="tab" data-tab="schedule">计划任务</button>
     <button class="tab" data-tab="agent">Agent 决策</button>
+    <button class="tab" data-tab="research">Agent 研究</button>
+    <button class="tab" data-tab="opinion">舆论研究</button>
   </div>
 </nav>
 
@@ -173,8 +175,20 @@
       </div>
     </details>
   </section>
+  <section class="panel" id="panel-research">
+    <h2>自主研究报告</h2>
+    <p class="hint">报告来自 GPT-6 自主工具调查。结论、证据、反证和模拟决策彼此分开，打开本页不会触发模型调用。</p>
+    <div id="research-reports" class="cards"></div>
+    <div id="research-detail" class="boxed hidden"></div>
+  </section>
+  <section class="panel" id="panel-opinion">
+    <h2>舆论研究快照</h2>
+    <p class="hint">默认展示摘要；只有明确展开时才读取单条内容详情。快照按日期冻结，可供策略 Agent 回放。</p>
+    <div id="opinion-snapshots" class="cards"></div>
+    <div id="opinion-detail" class="boxed hidden"></div>
+  </section>
 </main>
 
-<script src="/static/app.js?v=20260807-4"></script>
+<script src="/static/app.js?v=20260909-2"></script>
 </body>
 </html>

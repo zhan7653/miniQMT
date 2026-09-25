@@ -92,6 +92,7 @@ def create_app(
             "accounts": accounts_cache.get(load_accounts)[0],
             "schedule": schedule,
             "last_report": reports[0] if reports else None,
+            "latest_research": service.research_reports(limit=1),
             "run": run_launcher.status(tail_lines=1),
             "config": {
                 "session_cutoff_local": settings.daily.session_cutoff.isoformat(
@@ -203,6 +204,35 @@ def create_app(
     def agent_decisions(account_id: str) -> list[dict[str, Any]]:
         try:
             return service.agent_decisions(account_id)
+        except DashboardError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/agent/research-reports")
+    def research_reports(limit: int = 50) -> list[dict[str, Any]]:
+        return service.research_reports(limit=max(1, min(limit, 500)))
+
+    @app.get("/api/agent/research-reports/{as_of}/{file_name}")
+    def research_report(as_of: str, file_name: str) -> dict[str, Any]:
+        try:
+            return service.research_report(as_of, file_name)
+        except DashboardError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/agent/opinion-snapshots")
+    def opinion_snapshots(limit: int = 50) -> list[dict[str, Any]]:
+        return service.opinion_snapshots(limit=max(1, min(limit, 500)))
+
+    @app.get("/api/agent/opinion-snapshots/{as_of}")
+    def opinion_snapshot(as_of: str, snapshot_id: str | None = None) -> dict[str, Any]:
+        try:
+            return service.opinion_snapshot(as_of, snapshot_id=snapshot_id)
+        except DashboardError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/agent/opinion-snapshots/{as_of}/details/{detail_ref}")
+    def opinion_detail(as_of: str, detail_ref: str, snapshot_id: str | None = None) -> dict[str, Any]:
+        try:
+            return service.opinion_detail(as_of, detail_ref, snapshot_id=snapshot_id)
         except DashboardError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

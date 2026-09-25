@@ -228,6 +228,37 @@ def build_parser() -> argparse.ArgumentParser:
     daily_run.add_argument("--skip-accounts", action="store_true")
     daily_commands.add_parser("status", help="Show snapshot head, account heads, and configuration")
 
+    opinion = commands.add_parser(
+        "opinion", help="Collect and inspect auditable public-opinion snapshots",
+    )
+    opinion_commands = opinion.add_subparsers(dest="opinion_command", required=True)
+    opinion_collect = opinion_commands.add_parser("collect", help="Collect current public discussion into a daily snapshot")
+    opinion_collect.add_argument("--query", action="append", required=True)
+    opinion_collect.add_argument("--as-of", type=date.fromisoformat)
+    opinion_collect.add_argument("--provider", action="append")
+    opinion_collect.add_argument("--limit", type=int, default=20)
+    opinion_collect.add_argument("--dry-run", action="store_true")
+    opinion_collect.add_argument("--refresh", action="store_true")
+    opinion_research = opinion_commands.add_parser("research", help="Ask the opinion research Agent to analyze a stored snapshot")
+    opinion_research.add_argument("--question", required=True)
+    opinion_research.add_argument("--as-of", type=date.fromisoformat)
+    opinion_research.add_argument("--max-turns", type=int)
+    opinion_research.add_argument("--model")
+    opinion_research.add_argument("--json", action="store_true", dest="json_output")
+    opinion_show = opinion_commands.add_parser("show", help="Show summary-only opinion snapshots")
+    opinion_show.add_argument("--as-of", type=date.fromisoformat)
+    opinion_show.add_argument("--instrument-id")
+    opinion_show.add_argument("--snapshot-id")
+    opinion_show.add_argument("--limit", type=int, default=20)
+    opinion_detail = opinion_commands.add_parser("detail", help="Expand one stored opinion item")
+    opinion_detail.add_argument("--as-of", type=date.fromisoformat, required=True)
+    opinion_detail.add_argument("--detail-ref", required=True)
+    opinion_detail.add_argument("--snapshot-id")
+    opinion_render = opinion_commands.add_parser("render", help="Render a stored JSON snapshot as Markdown")
+    opinion_render.add_argument("--as-of", type=date.fromisoformat, required=True)
+    opinion_render.add_argument("--snapshot-id")
+    opinion_render.add_argument("--output")
+
     simulate = commands.add_parser(
         "simulate", help="Run the shared kernel with a static or configured intent source"
     )
@@ -272,10 +303,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a review-cadence policy now (single account only)",
     )
+    research = agent_commands.add_parser(
+        "research", help="Run a read-only research agent (no PortfolioIntent or decision file)",
+    )
+    research.add_argument("--question", required=True)
+    research.add_argument("--as-of", type=date.fromisoformat)
+    research.add_argument("--account-id")
+    research.add_argument("--max-turns", type=int)
+    research.add_argument("--model")
+    research.add_argument("--profile")
+    research.add_argument("--domain", default="general")
+    research.add_argument("--json", action="store_true", dest="json_output")
+    research.add_argument("--publish-paper", action="store_true", help="Publish a validated recommended_intent to the selected paper account")
+    insight = agent_commands.add_parser(
+        "insight", help="Synthesize current strategy signals into a read-only daily insight",
+    )
+    insight.add_argument("--as-of", type=date.fromisoformat)
+    insight.add_argument("--max-turns", type=int)
+    insight.add_argument("--model")
+    insight.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Provider titles may contain emoji or other non-GBK characters on a
+    # Windows console. Keep JSON output valid instead of failing after a
+    # successful network collection.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     try:
         config_path = Path(args.config).resolve()
@@ -289,6 +345,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _simulate(args, settings)
         if args.command == "daily":
             return _daily(args, settings)
+        if args.command == "opinion":
+            return _opinion(args, settings)
         if args.command == "web":
             return _web(args, settings)
         if args.command == "agent":
@@ -302,6 +360,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _agent(args, settings: FoundationSettings) -> int:
+    if args.agent_command == "insight":
+        from fundlab.agent.research_service import ResearchService
+        result = ResearchService(settings).insight(
+            as_of=args.as_of, max_turns=args.max_turns, model=args.model,
+        )
+        print(canonical_json(to_primitive(result)) if args.json_output else result.get("report", ""))
+        return 0 if result.get("status", "ok") == "ok" else 2
+    if args.agent_command == "research":
+        from fundlab.agent.research_service import ResearchService
+        result = ResearchService(settings).research(
+            args.question, account_id=args.account_id, as_of=args.as_of,
+            max_turns=args.max_turns, model=args.model,
+            profile=args.profile,
+            publish_paper=args.publish_paper,
+            domain=None if args.domain == "general" else args.domain,
+        )
+        if args.json_output:
+            print(canonical_json(to_primitive(result)))
+        else:
+            print(result.get("report", ""))
+            if result.get("report_path"):
+                print(f"\nReport: {result['report_path']}")
+        return 0 if result.get("status", "ok") == "ok" else 2
+
     from fundlab.agent import AgentDecisionService
 
     service = AgentDecisionService(settings)
@@ -327,6 +409,61 @@ def _agent(args, settings: FoundationSettings) -> int:
         "decisions": outcomes,
     }))
     return 0 if not failed else 2
+
+
+def _opinion(args, settings: FoundationSettings) -> int:
+    from fundlab.agent.opinion import OpinionRepository, OpinionService
+    from fundlab.agent.opinion.service import render_markdown
+    from fundlab.common.dates import audit_now
+
+    # News collection and report reading do not need to verify/load the entire
+    # canonical price warehouse. News has its own clock, including weekends.
+    service = OpinionService(settings)
+    if args.opinion_command == "research":
+        from fundlab.agent.research_service import ResearchService
+        from fundlab.marketdata.portal import CanonicalMarketData
+        market = CanonicalMarketData.open(settings.paths.market_data)
+        target = args.as_of or market.manifest.plan.universe_scope.history_end
+        result = ResearchService(settings).research(
+            args.question, as_of=target, max_turns=args.max_turns,
+            model=args.model, domain="opinion", profile="opinion-research",
+        )
+        print(canonical_json(to_primitive(result)) if args.json_output else result.get("report", ""))
+        return 0 if result.get("status", "ok") == "ok" else 2
+    if args.opinion_command == "collect":
+        target = args.as_of or audit_now().date()
+        result = service.collect(
+            as_of=target, queries=tuple(args.query), providers=args.provider,
+            dry_run=args.dry_run, limit=args.limit, refresh=args.refresh,
+        )
+        print(canonical_json(to_primitive(result)))
+        return 0
+    target = args.as_of
+    if args.opinion_command == "show":
+        target = target or audit_now().date()
+        result = service.summary(
+            as_of=target, instrument_id=args.instrument_id,
+            snapshot_id=args.snapshot_id, limit=args.limit,
+        )
+        print(canonical_json(to_primitive(result)))
+        return 0 if result.get("status") in {"ok", "no_snapshot"} else 2
+    if args.opinion_command == "detail":
+        result = service.detail(
+            as_of=target, detail_ref=args.detail_ref, snapshot_id=args.snapshot_id,
+        )
+        print(canonical_json(to_primitive(result)))
+        return 0 if result.get("status") == "ok" else 2
+    repository = OpinionRepository(settings.agent.opinion.root)
+    snapshot = repository.load(as_of=target.isoformat(), snapshot_id=args.snapshot_id)
+    if snapshot is None:
+        raise ValueError("opinion snapshot not found")
+    markdown = render_markdown(snapshot)
+    if args.output:
+        Path(args.output).write_text(markdown, encoding="utf-8", newline="\n")
+        print(canonical_json({"status": "ok", "output": str(Path(args.output).resolve())}))
+    else:
+        print(markdown, end="")
+    return 0
 
 
 def _data(args, settings: FoundationSettings) -> int:

@@ -314,7 +314,7 @@ def test_dashboard_index_bypasses_stale_asset_cache(dashboard):
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert "/static/app.js?v=20260807-4" in response.text
+    assert "/static/app.js?v=20260909-2" in response.text
     assert client.get("/static/app.js").headers["cache-control"] == "no-store"
 
 

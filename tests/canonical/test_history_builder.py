@@ -1987,3 +1987,95 @@ def test_current_research_projection_uses_exact_exchange_membership_and_disjoint
     snapshot = warehouse.load_snapshot(result.snapshot_id)
     assert snapshot.plan.universe_scope is not None
     assert snapshot.plan.universe_scope.instrument_ids == ("510050.SH", "600000.SH")
+
+
+def test_current_master_reconciliation_keeps_provenance_referential_on_retries(
+    tmp_path,
+):
+    warehouse = MarketDataWarehouse(tmp_path / "market")
+    observed_at = datetime(2026, 7, 18, tzinfo=timezone.utc)
+    instrument_id = "560650.SH"
+    source = history_module.normalize_table(
+        MarketTable.INSTRUMENTS,
+        pd.DataFrame([{
+            "instrument_id": instrument_id,
+            "exchange": "SH",
+            "local_code": "560650",
+            "asset_type": "etf",
+            "name": "核心50",
+            "currency": "CNY",
+            "listed_date": "2022-06-27",
+            "delisted_date": None,
+            "board": "main",
+            "exchange_product_class": "etf",
+            "buy_lot": 1,
+            "quantity_step": 1,
+            "odd_lot_sell_all": True,
+            "price_tick": 0.001,
+            "sell_delay_sessions": 0,
+            "price_limit_ratio": None,
+            "field_lineage": None,
+            "source_payload": "historical-payload",
+            "source_provider": "historical-master",
+            "source_observation_id": "obs-historical-master",
+            "observed_at": observed_at.isoformat(),
+        }]),
+        provider="historical-master",
+        observed_at=observed_at.isoformat(),
+        require_observation_id=False,
+    )
+    official = source.copy()
+    official.loc[:, "source_payload"] = "official-payload"
+    official.loc[:, "source_provider"] = "exchange-public"
+    official.loc[:, "source_observation_id"] = "obs-official-membership"
+    universe = SimpleNamespace(
+        observation_id="obs-official-membership",
+        observed_at=observed_at,
+    )
+
+    first = history_module._record_current_master_observation(
+        warehouse,
+        source_master=source,
+        official_master=official,
+        source_snapshot_ids=(),
+        universe_manifest=universe,
+        universe_as_of=date(2026, 7, 18),
+        start_date=date(2026, 7, 18),
+        end_date=date(2026, 7, 18),
+        included_ids=(instrument_id,),
+    )
+    first_frame = warehouse.read_observation_table(
+        first.observation_id, MarketTable.INSTRUMENTS,
+    )
+    retry_source = first_frame.copy()
+    retry_source.loc[:, "source_observation_id"] = "obs-first-current-master"
+    second = history_module._record_current_master_observation(
+        warehouse,
+        source_master=retry_source,
+        official_master=official,
+        source_snapshot_ids=(),
+        universe_manifest=universe,
+        universe_as_of=date(2026, 7, 18),
+        start_date=date(2026, 7, 18),
+        end_date=date(2026, 7, 18),
+        included_ids=(instrument_id,),
+    )
+    first_payload = json.loads(first_frame.iloc[0]["source_payload"])
+    second_frame = warehouse.read_observation_table(
+        second.observation_id, MarketTable.INSTRUMENTS,
+    )
+    second_payload = json.loads(second_frame.iloc[0]["source_payload"])
+
+    assert first_payload == {
+        "historical_master_observation_id": "obs-historical-master",
+        "kind": "current_master_reconciliation_r2_v2",
+        "official_membership_observation_id": "obs-official-membership",
+        "payload_retention": "referenced immutable observations",
+    }
+    assert second_payload == {
+        "historical_master_observation_id": "obs-first-current-master",
+        "kind": "current_master_reconciliation_r2_v2",
+        "official_membership_observation_id": "obs-official-membership",
+        "payload_retention": "referenced immutable observations",
+    }
+    assert len(second_frame.iloc[0]["source_payload"]) < 512

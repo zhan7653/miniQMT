@@ -16,6 +16,7 @@ daily:
   # past today (both calendar sources must agree over the full window), so an
   # intent decided at the published data head can schedule its T+1 order.
   calendar_horizon_days: 60
+  research_profiles: [daily-insight, crisis-drawdown]
   accounts:
     - account_id: paper-1
       name: "Paper 1 (static ETF mix)"
@@ -133,6 +134,44 @@ agent:
     timeout_seconds: 300
     max_retries: 2
     store: false
+    web_tool: web_search_preview
+  opinion:
+    # External opinion providers are opt-in. Missing credentials degrade the
+    # opinion stage and never block canonical data or paper-account progress.
+    root: ../data/warehouse/v2/opinion
+    providers: [web]
+    # Supported values: zhihu, rss, web.  ``web`` uses the configured
+    # Responses relay and records source cards, not model-generated facts.
+    zhihu_base_url: https://developer.zhihu.com
+    zhihu_token_env: ZHIHU_ACCESS_SECRET
+    rss_feeds: []
+    # Optional fixed topics; an empty list uses current strategy instruments.
+    queries: []
+    broad_queries:
+      - A股 今日 市场 观点
+      - 基金 今日 市场 观点
+    max_items: 200
+    max_excerpt_chars: 500
+    max_detail_chars: 12000
+    max_age_days: 30
+    max_queries_per_run: 12
+  research_profiles:
+    dividend-research:
+      domain: dividend
+      model: gpt-6-astra
+      max_turns: 6
+    crisis-drawdown:
+      domain: crisis_drawdown
+      model: gpt-6-astra
+      max_turns: 6
+    daily-insight:
+      domain: general
+      model: gpt-6-astra
+      max_turns: 4
+    opinion-research:
+      domain: opinion
+      model: gpt-6-astra
+      max_turns: 6
   library:
     root: ../data/agent/library
     # Only explicitly listed .md/.txt files are sent to the trusted relay.
@@ -166,9 +205,9 @@ agent:
         511010.SH: "0.9"
     paper-dividend:
       type: dividend-value
-      # Enabled after a real Responses dry-run and local decision validation
-      # completed successfully on 2026-07-29.
-      scheduled: true
+      # Legacy fixed-top-N adviser is paused while dividend-research migrates
+      # to the autonomous evidence-first Agent.
+      scheduled: false
       charter: agents/dividend-value.yaml
       top_n: 10
       min_yield: "0.04"

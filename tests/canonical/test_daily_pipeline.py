@@ -2297,7 +2297,7 @@ def test_daily_pending_onboarding_and_exact_no_trade_do_not_block_publication(
     def bars_without_exact_no_trade_candidate(request):
         frame = real_bars(request)
         return frame.loc[
-            ~frame["instrument_id"].astype(str).eq(no_trade_id)
+            ~frame["instrument_id"].astype(str).isin((no_trade_id, carried_id))
         ].reset_index(drop=True)
 
     monkeypatch.setitem(globals(), "_daily_official_instruments", official_with_future_listing)
@@ -2306,6 +2306,28 @@ def test_daily_pending_onboarding_and_exact_no_trade_do_not_block_publication(
     pipeline = DailyPipeline(
         build_settings(tmp_path, ()), registry=_daily_extension_registry(),
         now_fn=lambda: evening_of(FUTURE_DAYS[0]),
+    )
+    real_resolve = pipeline._official_universe
+
+    def official_with_carried_membership_conflict(target, *, predecessor):
+        resolved = real_resolve(target, predecessor=predecessor)
+        detail = dict(resolved.degraded_detail or {})
+        pending = dict(detail.get("pending_onboarding", {}))
+        pending[carried_id] = {
+            "reason": "official_existing_instrument_membership_conflict",
+        }
+        detail["pending_onboarding"] = pending
+        return replace(
+            resolved,
+            degraded_detail=detail,
+            execution_guard_ids=tuple(sorted({
+                *resolved.execution_guard_ids,
+                carried_id,
+            })),
+        )
+
+    monkeypatch.setattr(
+        pipeline, "_official_universe", official_with_carried_membership_conflict,
     )
 
     result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
@@ -2316,6 +2338,7 @@ def test_daily_pending_onboarding_and_exact_no_trade_do_not_block_publication(
     assert result.snapshot_id is not None
     universe = next(stage for stage in result.stages if stage.name == "universe")
     assert tuple(universe.detail["pending_onboarding"]) == (_DAILY_NEW_ID,)
+    assert tuple(universe.detail["carried_instrument_conflicts"]) == (carried_id,)
     pending_manifest = pipeline.warehouse.load_observation(
         universe.detail["universe_observation_id"]
     )
@@ -2329,7 +2352,7 @@ def test_daily_pending_onboarding_and_exact_no_trade_do_not_block_publication(
     )
     no_trade = next(stage for stage in result.stages if stage.name == "no_trade")
     assert no_trade.status == "ok"
-    assert no_trade.detail["instruments"] == (no_trade_id,)
+    assert no_trade.detail["instruments"] == (carried_id, no_trade_id)
     snapshot = pipeline.warehouse.load_snapshot(result.snapshot_id)
     assert _DAILY_NEW_ID not in snapshot.plan.universe_scope.instrument_ids
     assert no_trade_id in snapshot.plan.universe_scope.instrument_ids

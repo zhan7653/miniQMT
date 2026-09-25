@@ -668,6 +668,112 @@ class DashboardService:
             entries.append(entry)
         return entries
 
+    def research_reports(self, limit: int = 50) -> list[dict[str, Any]]:
+        root = Path(self.settings.paths.report_root) / "agent-research"
+        if not root.is_dir():
+            return []
+        found: list[dict[str, Any]] = []
+        for path in root.glob("*/*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            report = payload.get("research_report")
+            if not isinstance(report, Mapping):
+                try:
+                    report = json.loads(payload.get('final_text', ''))
+                except (TypeError, json.JSONDecodeError):
+                    report = None
+            thesis = report.get("thesis") if isinstance(report, Mapping) else payload.get("final_text", "")
+            if not isinstance(thesis, str) or not thesis.strip():
+                continue
+            # Early autonomous smoke runs had no profile/question and were
+            # diagnostic probes rather than user-facing research. Keep them
+            # in their files for audit, but do not present them as live cards.
+            legacy = not bool(payload.get('question') or payload.get('profile'))
+            if legacy and (
+                not isinstance(report, Mapping)
+                or not (report.get('evidence') or report.get('counter_evidence'))
+            ):
+                continue
+            found.append({
+                "as_of": payload.get("as_of") if isinstance(payload, Mapping) else None,
+                "snapshot_id": payload.get("snapshot_id") if isinstance(payload, Mapping) else None,
+                "model": payload.get("model") if isinstance(payload, Mapping) else None,
+                "profile": payload.get("profile") if isinstance(payload, Mapping) else None,
+                "subject": _research_subject(payload),
+                "created_at": payload.get('created_at') or path.stat().st_mtime,
+                "legacy": False,
+                "recommendation": report.get("recommendation") if isinstance(report, Mapping) else None,
+                "thesis": thesis,
+                "path": str(path),
+                "file_name": path.name,
+                "directory": path.parent.name,
+            })
+        # Daily insight is immutable and idempotent by (as_of, profile,
+        # thesis). Keep one card even when older runs left duplicate files.
+        unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in sorted(found, key=lambda value: (str(value['as_of']), str(value['created_at'])), reverse=True):
+            key = (str(item.get("as_of")), str(item.get("profile") or "legacy"), str(item.get("subject") or item.get("thesis")))
+            if key not in unique:
+                unique[key] = {**item, 'versions': []}
+            unique[key]['versions'].append({k: item[k] for k in ('directory', 'file_name', 'created_at')})
+        return sorted(unique.values(), key=lambda item: (str(item.get("as_of")), str(item.get("created_at"))), reverse=True)[:max(1, min(limit, 500))]
+
+    def research_report(self, as_of: str, file_name: str) -> dict[str, Any]:
+        try:
+            if date.fromisoformat(as_of).isoformat() != as_of:
+                raise ValueError
+        except ValueError as exc:
+            raise DashboardError("非法研究报告日期") from exc
+        if Path(file_name).name != file_name or not re.fullmatch(r"[A-Za-z0-9]+\.json", file_name):
+            raise DashboardError("非法研究报告文件名")
+        root = (Path(self.settings.paths.report_root) / "agent-research").resolve()
+        path = root / as_of / file_name
+        if not path.resolve().is_relative_to(root) or not path.is_file():
+            raise DashboardError("研究报告不存在")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardError("研究报告损坏或无法读取") from exc
+        if not isinstance(payload, Mapping):
+            raise DashboardError("研究报告内容不是对象")
+        return dict(payload)
+
+    def opinion_snapshots(self, limit: int = 50) -> list[dict[str, Any]]:
+        from fundlab.agent.opinion import OpinionRepository
+        return OpinionRepository(self.settings.agent.opinion.root).list_snapshots(
+            limit=max(1, min(limit, 500)),
+        )
+
+    def opinion_snapshot(self, as_of: str, snapshot_id: str | None = None) -> dict[str, Any]:
+        from fundlab.agent.opinion import OpinionRepository
+        try:
+            parsed = date.fromisoformat(as_of)
+        except ValueError as exc:
+            raise DashboardError("非法舆论快照日期") from exc
+        if parsed.isoformat() != as_of:
+            raise DashboardError("非法舆论快照日期")
+        value = OpinionRepository(self.settings.agent.opinion.root).load(
+            as_of=as_of, snapshot_id=snapshot_id,
+        )
+        if value is None:
+            raise DashboardError("舆论快照不存在")
+        return value
+
+    def opinion_detail(self, as_of: str, detail_ref: str, snapshot_id: str | None = None) -> dict[str, Any]:
+        from fundlab.agent.opinion import OpinionRepository
+        if not re.fullmatch(r"[0-9a-f]{32}", detail_ref):
+            raise DashboardError("非法舆论详情引用")
+        value = OpinionRepository(self.settings.agent.opinion.root).detail(
+            as_of=as_of, detail_ref=detail_ref, snapshot_id=snapshot_id,
+        )
+        if value is None:
+            raise DashboardError("舆论详情不存在")
+        return value
+
     # ---------------------------------------------------- crisis monitoring
 
     def crisis_monitor(self) -> dict[str, Any]:
@@ -1279,3 +1385,25 @@ def _instrument_names_for_snapshot(root: str, snapshot_id: str) -> dict[str, str
         for row in frame[["instrument_id", "name"]].itertuples(index=False)
         if row.name is not None and str(row.name).strip()
     }
+
+
+def _research_subject(payload: Mapping[str, Any]) -> str:
+    question = payload.get("question")
+    if isinstance(question, str) and question.strip():
+        return re.sub(r"\s+", " ", question.strip())[:240]
+    ids = set()
+    for event in payload.get('tool_events', []):
+        if event.get('event') == 'tool_call':
+            ids.update(re.findall(r'\b\d{6}\.(?:SH|SZ)\b', json.dumps(event.get('arguments', {})).upper()))
+    if ids:
+        return '历史调试 · ' + ' / '.join(sorted(ids))
+    report = payload.get("research_report")
+    if not isinstance(report, Mapping):
+        try:
+            report = json.loads(str(payload.get("final_text") or ""))
+        except json.JSONDecodeError:
+            report = None
+    thesis = report.get("thesis") if isinstance(report, Mapping) else payload.get("final_text")
+    if isinstance(thesis, str) and thesis.strip():
+        return re.sub(r"\s+", " ", thesis.strip())[:240]
+    return "unknown"

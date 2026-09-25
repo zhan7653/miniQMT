@@ -1,5 +1,26 @@
 # 决策 Agent（`fundlab/agent`）
 
+## 自主研究 Agent
+
+`fundlab agent research` 使用通用 Responses tool loop。模型可以按任务自主调用
+canonical 行情、分红、公司行动、组合和危机特征工具，并通过当前兼容端点的
+`web_search_preview` 查询外部资料；每轮工具调用、来源 URL、snapshot 和结果哈希都会写入
+研究报告。研究模式只读，不能写决策文件或发送邮件。
+
+```powershell
+uv run fundlab agent research --profile dividend-research --account-id paper-dividend `
+  --question "核对当前组合中股息率异常的标的，并查找最近官方分红公告"
+uv run fundlab agent research --profile crisis-drawdown `
+  --question "分析 510300.SH 和 510500.SH 的回撤与反弹确认"
+uv run fundlab agent insight
+```
+
+统一 `ResearchReport` 必须区分事实、推断、反证、风险、催化剂和失效条件，并允许
+`insufficient_evidence`。`recommended_intent` 只是结构化草案；只有显式的
+`--publish-paper`、现有账户绑定和现有风险检查全部通过后，才会写入纸面决策文件。
+领域通过 `agent.research_profiles` 配置并由 `fundlab.agent.domains.register_domain` 扩展，
+首批内置 `dividend` 和 `crisis_drawdown`。
+
 `fundlab/agent` 是 JSON 决策文件契约的仓库内生产者。无论确定性策略还是 LLM
 策略，进入交易内核的唯一产物仍是：
 
@@ -13,6 +34,28 @@ PortfolioIntent
 
 Agent 不直接调用模拟内核，更不连接实盘。没有决策文件表示持有；已有但无效的文件
 会失败关闭，不能降级成沉默。
+
+## 舆论研究 Agent
+
+`fundlab.agent.opinion` 是独立的可选数据产品。默认通过已配置的 Responses Web Search
+relay 获取最新来源卡片，也可以启用知乎官方搜索和 RSS；它按日期和 `as_of` 执行去重、标的匹配和代码统计，并把原始输入、摘要快照和详情对象
+分开保存。缺少凭证或 Provider 失败只会产生 `degraded`/`skipped` 状态，不阻断每日行情
+发布和模拟账户推进。
+
+策略 Agent 通过 `read_opinion_snapshot`、`search_opinion` 和
+`compare_opinion_trend` 先读取摘要；只有摘要显示与当前策略相关时，才调用
+`read_opinion_detail` 展开单条内容。舆论 Agent 不写 `PortfolioIntent`，策略 Agent
+仍需把舆论与行情、分红、风险和持仓事实交叉验证。
+
+JSON `opinion_snapshot.v1` 是唯一回放和回测输入，Markdown 由同一 JSON 生成，只用于
+邮件、网页和人工阅读。所有内容受 `published_at <= as_of` 及最近内容年龄窗口限制，防止
+未来信息泄漏和无关旧内容持续污染策略上下文。
+
+```powershell
+uv run fundlab opinion collect --query "510300.SH 沪深300" --provider zhihu
+uv run fundlab opinion show --as-of 2026-09-09
+uv run fundlab opinion research --as-of 2026-09-09 --question "总结近期与该标的有关的多空观点"
+```
 
 ## 当前策略
 
@@ -272,9 +315,9 @@ fundlab agent decide (--account-id X | --all)
 
 ## 明确延期
 
-本期不抓取新闻，不启用 hosted web search，也不让 Agent 修改 charter、战术参数或
-提示词。这里的“迭代”是每周读取真实组合反馈、基准证据和既往记忆后重新作出受约束
-判断，不是让模型自行改写策略或追逐短期排名。
+舆论 Provider 仍然是可选项，不实现绕过平台限制的网页抓取，也不让 Agent 修改 charter、
+战术参数或提示词。这里的“迭代”是把新鲜、可追溯的公开讨论作为策略的附加证据，而不是
+让模型自行改写策略或追逐短期排名。
 
 ## 验证
 

@@ -299,10 +299,53 @@ class DailyPipeline:
                                 "quarantine", "degraded", persistent_quarantine,
                             ))
 
+                    if resolved_target is not None:
+                        try:
+                            opinion_detail = self._collect_opinion(
+                                snapshot_id, resolved_target,
+                                allow_network=not skip_data,
+                            )
+                            stages.append(DailyStage(
+                                "opinion_collect",
+                                str(opinion_detail.pop("status", "ok")),
+                                opinion_detail,
+                            ))
+                        except Exception as exc:
+                            # Public-opinion data is an optional context source;
+                            # never prevent the canonical simulation from moving.
+                            stages.append(DailyStage("opinion_collect", "degraded", {
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            }))
+
                     if skip_accounts:
                         stages.append(DailyStage("accounts", "skipped", {"reason": "--skip-accounts"}))
                     else:
                         accounts = self._advance_accounts(stages)
+                        profiles = tuple(dict.fromkeys(
+                            item for item in (
+                                self.settings.daily.research_profile,
+                                *self.settings.daily.research_profiles,
+                            ) if item
+                        ))
+                        for profile in profiles:
+                            try:
+                                from fundlab.agent.research_service import ResearchService
+                                insight = ResearchService(self.settings).insight(
+                                    as_of=resolved_target, profile=profile,
+                                )
+                                stages.append(DailyStage("research_insight", "ok", {
+                                    "profile": profile,
+                                    "report_path": insight.get("report_path"),
+                                    "recommendation": (insight.get("evidence", {}).get("research_report", {})
+                                                       .get("recommendation") if isinstance(insight.get("evidence"), dict) else None),
+                                }))
+                            except Exception as exc:
+                                stages.append(DailyStage("research_insight", "degraded", {
+                                    "profile": profile,
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc),
+                                }))
                 except DailyPipelineBlocked as exc:
                     status = "blocked"
                     stages.append(DailyStage(exc.stage, "blocked", {
@@ -331,6 +374,51 @@ class DailyPipeline:
         return DailyRunResult(status, resolved_target, snapshot_id, stages, accounts, report_path)
 
     # ------------------------------------------------------- calendar/target
+
+    def _collect_opinion(
+        self, snapshot_id: str | None, as_of: date, *, allow_network: bool = True,
+    ) -> dict[str, Any]:
+        from fundlab.agent.opinion import OpinionService
+
+        opinion_settings = self.settings.agent.opinion
+        if not allow_network:
+            return {"status": "skipped", "reason": "--skip-data keeps opinion collection offline"}
+        if not opinion_settings.providers:
+            return {"status": "skipped", "reason": "no opinion providers configured"}
+        if snapshot_id is None:
+            return {"status": "skipped", "reason": "no published market snapshot"}
+        market = CanonicalMarketData.open(self.settings.paths.market_data, snapshot_id)
+        queries = list(opinion_settings.broad_queries)
+        queries.extend(opinion_settings.queries)
+        ids: set[str] = set()
+        for account in self.settings.daily.accounts:
+            ids.update(map(str, account.weights))
+            policy = self.settings.agent.policies.get(account.account_id)
+            if policy is not None:
+                ids.update(re.findall(r"\b\d{6}\.(?:SH|SZ)\b", json.dumps(
+                    policy.params, ensure_ascii=False,
+                ).upper()))
+        by_id = {item.instrument_id: item for item in market.instruments(as_of=as_of)}
+        for instrument_id in sorted(ids)[:30]:
+            instrument = by_id.get(instrument_id)
+            queries.append(
+                instrument_id if instrument is None else
+                f"{instrument_id} {instrument.name}"
+            )
+        queries = list(dict.fromkeys(queries))[:opinion_settings.max_queries_per_run]
+        if not queries:
+            return {"status": "skipped", "reason": "no strategy instruments or opinion queries"}
+        result = OpinionService(self.settings, market=market).collect(
+            as_of=as_of, queries=queries, providers=opinion_settings.providers,
+        )
+        return {
+            "status": "ok" if result["snapshot"].get("quality") == "ready" else "degraded",
+            "snapshot_id": result["snapshot"].get("snapshot_id"),
+            "item_count": len(result["snapshot"].get("items", [])),
+            "providers": result["snapshot"].get("providers", []),
+            "queries": result["snapshot"].get("queries", []),
+            "snapshot_path": result.get("snapshot_path"),
+        }
 
     def _validated_calendar(self, history_start: date) -> tuple[str, pd.DataFrame]:
         """Capture both calendar channels, require exact agreement, record one canonical observation.
@@ -497,9 +585,15 @@ class DailyPipeline:
             raise DailyPipelineBlocked(
                 "universe", "official universe unavailable-components detail is malformed"
             )
+        carried_instrument_conflicts = {
+            str(instrument_id): dict(detail)
+            for instrument_id, detail in provider_pending.items()
+            if str(instrument_id) in previous_ids
+        }
         pending_onboarding = {
             str(instrument_id): dict(detail)
             for instrument_id, detail in provider_pending.items()
+            if str(instrument_id) not in previous_ids
         }
         pending_onboarding.update(self._pending_onboarding_metadata(
             official_frame, discovered_new_ids, target,
@@ -529,6 +623,7 @@ class DailyPipeline:
             "published_scope_instruments": len(target_ids),
             **dict(universe.degraded_detail or {}),
             "pending_onboarding": pending_onboarding,
+            "carried_instrument_conflicts": carried_instrument_conflicts,
         }))
 
         builder = HistoryDatabaseBuilder(

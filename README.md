@@ -86,7 +86,51 @@ with stage-level detail, Windows scheduled-task management plus a manual "run no
 live log tail, and agent decision submission with the same validation the account run applies.
 The dashboard binds to localhost only and manages nothing that the CLI does not already own.
 
+When `daily.research_profile` is configured, the daily cycle also runs the read-only Agent Insight
+profile after account advancement. A failure in that optional research stage is recorded as
+`research_insight: degraded`; it cannot change the paper-account result or write a decision.
+
 ## Agent integration
+
+### Autonomous research mode
+
+For open-ended, read-only research, use the Responses tool loop instead of the
+legacy fixed-top-N dividend review:
+
+```powershell
+uv run fundlab agent research --model gpt-6-astra --question "检查当前红利组合中股息率异常的标的，并核对最近公告"
+uv run fundlab agent research --profile crisis-drawdown --question "分析 510300.SH 和 510500.SH 是否出现危机回撤后的反弹确认"
+uv run fundlab agent insight
+```
+
+The research Agent can call the hosted web-search tool and bounded canonical
+data tools for instruments, prices, corporate actions, portfolio state, memory,
+and allow-listed documents. It must cite web URLs and local snapshot IDs, may
+conclude that evidence is insufficient, and has no tool capable of writing a
+decision file or placing an order. `agent decide` remains the validated paper
+trading path.
+
+### Public-opinion snapshots
+
+Public-opinion collection is a separate, optional data product. The default
+provider is the configured Responses Web Search relay; add the official
+`zhihu` provider or an RSS feed when credentials/access are available, then collect a daily
+snapshot:
+
+```powershell
+uv run fundlab opinion collect --query "510300.SH 沪深300" --query "沪深300 分红" --provider zhihu
+uv run fundlab opinion show --as-of 2026-09-09
+uv run fundlab opinion detail --as-of 2026-09-09 --detail-ref <detail_ref>
+uv run fundlab opinion render --as-of 2026-09-09
+```
+
+The JSON snapshot is the replayable fact source. Its default item view contains
+only compact excerpts and a `detail_ref`; a strategy Agent can call
+`read_opinion_detail` after deciding that an item deserves inspection. Future
+published content is filtered by `as_of`, and missing credentials or provider
+failures produce a degraded/skipped opinion stage without blocking the daily
+paper simulation. Markdown is rendered from the same snapshot for email and
+dashboard display; it is never used as a backtest input.
 
 The trading kernel accepts strategy decisions only as immutable `PortfolioIntent` objects through
 the `fundlab.trading.IntentSource` protocol. Three implementations ship in `fundlab.strategies`:

@@ -3,7 +3,7 @@
 /* ------------------------------------------------------------------ utils */
 
 const $ = (selector) => document.querySelector(selector);
-const UI_BUILD = "20260807-4";
+const UI_BUILD = "20260909-2";
 const SCHEDULE_REFRESHING_MESSAGE = "Task scheduler state is refreshing";
 let scheduleRetryTimer = null;
 
@@ -180,7 +180,7 @@ const EVENT_LABELS = {
 const STAGE_LABELS = {
   resolve: "解析目标日", universe: "官方标的池", bars: "行情双源采集", no_trade: "停牌共识",
   research: "研究快照", status: "状态采集", evidence: "行动/因子证据", candidate: "候选合成",
-  validate: "增量验证", extend: "原子发布", accounts: "账户推进", data: "数据阶段", calendar: "交易日历",
+  validate: "增量验证", extend: "原子发布", accounts: "账户推进", research_insight: "Agent 洞察", data: "数据阶段", calendar: "交易日历",
 };
 
 const SIDE_LABELS = { buy: "买入", sell: "卖出" };
@@ -1469,6 +1469,81 @@ async function loadAgentTab() {
   await loadDecisions();
 }
 
+async function loadResearchReports() {
+  const reports = await api("/api/agent/research-reports");
+  const holder = $("#research-reports");
+  holder.replaceChildren();
+  if (!reports.length) {
+    holder.appendChild(el("div", { class: "empty", text: "尚无研究报告，请运行 fundlab agent research" }));
+    return;
+  }
+  for (const item of reports) {
+    const node = el("div", { class: "card" }, [
+      el("div", { class: "hint", text: `${item.as_of || "—"} · ${item.model || "—"}` }),
+      el("strong", { text: item.recommendation || "研究报告" }),
+      el("p", { text: String(item.thesis || "").slice(0, 240) }),
+    ]);
+    clickable(node, async () => {
+      try {
+        const report = await api(`/api/agent/research-reports/${encodeURIComponent(item.directory)}/${encodeURIComponent(item.file_name)}`);
+        const detail = $("#research-detail");
+        detail.replaceChildren(el("pre", { text: JSON.stringify(report.research_report || { report: report.final_text }, null, 2) }));
+        detail.classList.remove("hidden");
+        clearError();
+      } catch (error) { showError(error); }
+    });
+    holder.appendChild(node);
+  }
+}
+
+async function loadOpinionSnapshots() {
+  const snapshots = await api("/api/agent/opinion-snapshots");
+  const holder = $("#opinion-snapshots");
+  holder.replaceChildren();
+  if (!snapshots.length) {
+    holder.appendChild(el("div", { class: "empty", text: "尚无舆论快照，请运行 fundlab opinion collect" }));
+    return;
+  }
+  for (const item of snapshots) {
+    const node = el("div", { class: "card" }, [
+      el("div", { class: "hint", text: `${item.as_of || "—"} · ${item.quality || "—"}` }),
+      el("strong", { text: item.snapshot_id || "舆论快照" }),
+      el("p", { text: `内容 ${item.item_count || 0} 条 · ${item.quality === "ready" ? "可用" : "部分可用"}` }),
+    ]);
+    clickable(node, async () => {
+      try {
+        const snapshot = await api(`/api/agent/opinion-snapshots/${encodeURIComponent(item.as_of)}?snapshot_id=${encodeURIComponent(item.snapshot_id || "")}`);
+        const detail = $("#opinion-detail");
+        const items = (snapshot.items || []).slice(0, 20);
+        const cards = items.map((opinion) => {
+          const card = el("div", { class: "card" }, [
+            el("div", { class: "hint", text: `${opinion.source || "—"} · ${opinion.published_at || "日期未核验"}` }),
+            el("strong", { text: opinion.title || "无标题" }),
+            el("p", { text: String(opinion.excerpt || "").slice(0, 360) }),
+            el("a", { href: opinion.url || "#", target: "_blank", rel: "noopener", text: "打开来源" }),
+          ]);
+          if (opinion.detail_ref) clickable(card, async () => {
+            try {
+              const expanded = await api(`/api/agent/opinion-snapshots/${encodeURIComponent(snapshot.as_of)}/details/${encodeURIComponent(opinion.detail_ref)}?snapshot_id=${encodeURIComponent(snapshot.snapshot_id || "")}`);
+              const body = expanded.text || expanded.detail || expanded;
+              detail.replaceChildren(el("pre", { text: typeof body === "string" ? body : JSON.stringify(body, null, 2) }));
+              detail.classList.remove("hidden");
+            } catch (error) { showError(error); }
+          });
+          return card;
+        });
+        detail.replaceChildren(
+          el("div", { class: "hint", text: `快照 ${snapshot.as_of} · ${items.length} 条摘要；点击单条查看详情` }),
+          el("div", { class: "cards" }, cards),
+        );
+        detail.classList.remove("hidden");
+        clearError();
+      } catch (error) { showError(error); }
+    });
+    holder.appendChild(node);
+  }
+}
+
 function nextDay(dateString) {
   // Pure UTC arithmetic: mixing local-time parsing with toISOString() would
   // return the SAME day for any timezone east of UTC (this UI runs in UTC+8).
@@ -1659,6 +1734,8 @@ function refreshTab(name, { auto = false, force = false, onlyIfNeeded = false } 
       else if (name === "runs") await loadRuns({ auto });
       else if (name === "schedule") { await loadSchedule(); await pollRunStatus(); }
       else if (name === "agent") await loadAgentTab();
+      else if (name === "research") await loadResearchReports();
+      else if (name === "opinion") await loadOpinionSnapshots();
       loadedTabs.add(name);
       tabLoadedAt.set(name, Date.now());
       clearError();
