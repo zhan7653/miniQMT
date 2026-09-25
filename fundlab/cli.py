@@ -98,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.add_argument("--source-snapshot-id", required=True)
     status.add_argument("--calendar-observation-id", required=True)
-    status.add_argument("--provider", choices=("baostock", "xtquant"), default="baostock")
+    status.add_argument("--provider", choices=("baostock",), default="baostock")
     status.add_argument("--batch-size", type=int, default=50)
     status.add_argument("--shard-count", type=int, default=1)
     status.add_argument("--shard-index", type=int, default=0)
@@ -185,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--asset-type", action="append", choices=("stock", "etf"), default=[])
     history.add_argument(
         "--source", action="append", choices=(
-            "tickflow", "eastmoney-efinance", "exchange-public", "sina-etf", "baostock", "xtquant",
+            "tickflow", "eastmoney-efinance", "exchange-public", "sina-etf", "baostock",
         ),
         required=True,
         help="Two baseline providers and an optional third conflict adjudicator",
@@ -560,6 +560,7 @@ def _data(args, settings: FoundationSettings) -> int:
             batch_size=args.batch_size,
             refresh=args.refresh,
             predecessor_snapshot_id=args.predecessor_snapshot_id,
+            factor_provider=settings.daily.factor_provider,
         ))
         print(canonical_json({"status": result.status, **to_primitive(result)}))
         return 0 if result.status == "complete" else 2

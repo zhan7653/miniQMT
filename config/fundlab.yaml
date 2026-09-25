@@ -9,8 +9,18 @@ daily:
   session_cutoff_local: "19:00"
   agent_decision_dir: ../data/agent/decisions
   report_dir: ../data/reports/daily
-  source_pair: [tickflow, xtquant]
-  adjudicator: baostock
+  # Use independent public sources for research prices and Eastmoney for
+  # conflict adjudication.
+  source_pair: [tickflow, baostock]
+  adjudicator: eastmoney-efinance
+  factor_provider: baostock
+  no_trade_providers: [tickflow, baostock, eastmoney-efinance]
+  dense_status_provider: baostock
+  stock_status_provider: baostock
+  # One latest-session limit source is available today. The validator still
+  # requires two independent sources, so prices remain visible but execution
+  # stays guarded until a second source is added.
+  direct_limit_providers: [eastmoney-efinance]
   batch_size: 100
   # The canonical calendar carries exchange-announced sessions this many days
   # past today (both calendar sources must agree over the full window), so an

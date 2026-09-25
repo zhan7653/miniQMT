@@ -26,7 +26,8 @@ uv run ruff check .
 uv run pytest tests/canonical
 ```
 
-`--inexact` is required because `xtquant` is installed outside `uv.lock` in this workspace.
+The runtime uses the providers declared in `config/fundlab.yaml`; no local broker client is required
+for the configured research-price path.
 
 ## Daily operations
 
@@ -63,10 +64,9 @@ with catch-up and retries:
 pwsh -File scripts/register-daily-task.ps1
 ```
 
-The local MiniQMT client should be running so the `xtquant` provider can serve complete data. If it
-is offline, every exactly attributable price gap is quarantined independently—even when that is the
-whole current universe—while any independently verified scope continues. The next run resumes the
-same immutable observations instead of invalidating the last trusted snapshot.
+The checked-in daily profile uses TickFlow plus BaoStock for research prices, state, and factors,
+with Eastmoney for conflict adjudication and latest direct-limit snapshots. The configured path keeps
+prices visible while missing second-source execution evidence applies an explicit no-execution guard.
 
 The canonical calendar carries exchange-announced future sessions (`daily.calendar_horizon_days`
 past today, both calendar sources agreeing over the full window), so the account clock advances
@@ -237,8 +237,8 @@ remain deferred; live trading is explicitly out of scope. See `docs/architecture
 
 ## Trusted data canary
 
-The current direct channels are TickFlow, Eastmoney through Efinance, BaoStock, and the explicitly
-installed local MiniQMT/xtquant service. Their clients do not silently replace one another, and
+The current direct channels are TickFlow, Eastmoney through Efinance, and BaoStock. Their clients do
+not silently replace one another, and
 open-stock-data is not a runtime dependency. Inspect the capability/installation matrix first:
 
 ```powershell
@@ -271,20 +271,20 @@ for conflicting instruments:
 ```powershell
 uv run fundlab data build-history --start-date 2010-01-01 --end-date 2026-07-17 `
   --asset-type stock --asset-type etf --batch-size 100 `
-  --source tickflow --source xtquant --source baostock --publish
+  --source tickflow --source baostock --source eastmoney-efinance --publish
 ```
 
 The two independent sources inside one batch are captured concurrently. Disjoint process shards are
 also supported, but use them only when both selected clients explicitly allow concurrent sessions.
-BaoStock's anonymous client is single-session, and the local MiniQMT service should default to one
-process unless concurrent supply has been validated. Shards never publish independently; assemble
+BaoStock's anonymous client is single-session, so keep its collection within one process unless
+concurrent supply has been validated. Shards never publish independently; assemble
 them once all shard commands finish:
 
 ```powershell
 uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
-  --source tickflow --source xtquant --shard-count 4 --shard-index 0
+  --source tickflow --source baostock --source eastmoney-efinance --shard-count 4 --shard-index 0
 uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
-  --source tickflow --source xtquant --shard-count 4 --assemble-only --publish
+  --source tickflow --source baostock --source eastmoney-efinance --shard-count 4 --assemble-only --publish
 ```
 
 Run shard indexes `0` through `3`. The final report lists every included and excluded instrument;
@@ -303,8 +303,9 @@ vendor event omitted a strict same-day cash component.
 
 Price limits are derived from previous close plus the point-in-time exchange rule, then audited rather
 than copied from a vendor. Historical high/low observations from at least two backends reject bounds
-that are too narrow; on the latest completed session, MiniQMT/xtquant and Eastmoney direct upper/lower
-limits must both match every active bounded instrument. This second check also covers overly wide
+that are too narrow. The current multi-source profile has one latest-session direct-limit source, so
+the two-source simulation gate keeps execution disabled until a second independent limit source is
+configured. This check also covers overly wide
 bounds and keeps the SSE unreformed `S`-share 5% rule separate from ST risk-warning rules.
 
 The accepted 2010--2026 history is the immutable migration baseline. Routine publication first turns

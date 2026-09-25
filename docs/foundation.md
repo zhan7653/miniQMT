@@ -23,9 +23,9 @@ capability. The registry never falls back. The direct adapters are:
   count as this one backend.
 - `baostock`: raw/audit bars plus exhaustive historical stock ST and suspension observations. Its
   dividend results remain audit-only because they do not prove complete rights/action lifecycle.
-- `xtquant`: the explicitly installed local MiniQMT service. History download is opt-in per request;
-  daily volume is normalized from hands to shares. It supplies the dense local daily-status baseline
-  and independent event-ratio factors used to check action economics.
+- `baostock`: the public source for the configured dense status, stock ST, and adjustment-factor
+  evidence. Its dividend results remain audit-only because they do not prove complete rights/action
+  lifecycle.
 - `exchange-public` and `sina-calendar`: the fixed current SH/SZ stock/ETF universe and a separately
   reconciled full civil-date exchange calendar.
 - `cninfo-public`: direct CNInfo public APIs for stock cash, share and rights-action lifecycle.
@@ -198,11 +198,11 @@ explicit user authorization. This section is preserved as the historical record 
 performs one idempotent cycle: capture and cross-check the BaoStock and Sina exchange calendars into
 one validated canonical calendar observation, resolve the latest completed session against the
 configured cutoff, and — when the published snapshot is behind — run the increment path end to end
-(two-source history build with a BaoStock adjudicator, automatic no-trade consensus for full-window
-suspensions, current-research derivation, xtquant/BaoStock status collection, action and factor
-evidence collection, target-date xtquant/Eastmoney direct price-limit snapshots, and strict
-corporate-action/factor reconciliation (xtquant primary, targeted BaoStock audit, with a TickFlow
-raw/forward-adjusted ratio audit only for events still missing a factor), candidate composition,
+(two-source history build with TickFlow/BaoStock and Eastmoney adjudication, automatic no-trade
+consensus for full-window suspensions, current-research derivation, configured BaoStock status
+collection, action and configured factor evidence collection, target-date direct price-limit
+snapshots, and strict corporate-action/factor reconciliation (BaoStock factor evidence with a
+targeted TickFlow raw/forward-adjusted ratio audit for events still missing a factor), candidate composition,
 increment validation, atomic componentized publish).
 Afterwards every account configured under `daily:` in `config/fundlab.yaml` is advanced session by
 session to the published head with its intent source (`static` weights or `agent-file` decisions).
@@ -240,15 +240,15 @@ uv run fundlab data reconcile --readiness research_price --description "600000 c
 # field calibration and one immutable reconciled partition are durable.
 uv run fundlab data build-history --start-date 2010-01-01 --end-date 2026-07-17 `
   --asset-type stock --asset-type etf --batch-size 100 `
-  --source tickflow --source xtquant --publish
+  --source tickflow --source baostock --source eastmoney-efinance --publish
 
 # Optional process-level sharding: use only when both source clients support concurrent
-# sessions. BaoStock anonymous access and the local MiniQMT default should use one process.
+# sessions. BaoStock anonymous access should use one process.
 # Run indexes 0..3 without --publish, then assemble once.
 uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
-  --source tickflow --source xtquant --shard-count 4 --shard-index 0
+  --source tickflow --source baostock --source eastmoney-efinance --shard-count 4 --shard-index 0
 uv run fundlab data build-history --end-date 2026-07-17 --batch-size 100 `
-  --source tickflow --source xtquant --shard-count 4 --assemble-only --publish
+  --source tickflow --source baostock --source eastmoney-efinance --shard-count 4 --assemble-only --publish
 
 # Convert a ready field-level reconciliation into an exact EOD partition. This
 # derives the rules, checks dense session coverage and binds two-provider direct
@@ -303,9 +303,9 @@ The revision-2 current SH/SZ cohort is complete through 2026-07-24: 6,809 stocks
 validated simulation partitions. The current audited component snapshot is
 `snap-2a502eb188874c6ac7bbfb7f`, with
 14,967,641 daily bars, 12,098 calendar rows, 53,184 corporate actions, and 46,325 adjustment factors.
-For the latest session, 6,803 active bounded instruments were checked against direct xtquant and
-Eastmoney upper/lower values with zero missing values or conflicts; five suspended instruments and one
-unbounded IPO were represented explicitly. The weekly successor was atomically published from
+For the latest session, active bounded instruments were checked against the configured direct-limit
+source and same-session history bounds; missing second-source evidence keeps execution disabled. The
+weekly successor was atomically published from
 `snap-27e45e704ec05e31679f6c7f`; the earlier EOD induction proof separately verified that reusing a stale
 predecessor is rejected without changing the current pointer.
 The previous schema-5 publication `snap-9a0c35efaf0ac6a9c9e6d82e` remains immutable and readable.

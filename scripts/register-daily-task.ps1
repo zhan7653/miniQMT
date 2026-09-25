@@ -37,4 +37,4 @@ Register-ScheduledTask -TaskName "FundLab Daily" `
     -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
 Write-Host "Registered 'FundLab Daily': Tuesday-Saturday at $Time, catch-up + scheduler fallback retries."
-Write-Host "Requirement: keep the MiniQMT client running so xtquant can serve data."
+Write-Host "Research prices, state, and factors use TickFlow/BaoStock; execution remains guarded until two direct-limit sources are available."

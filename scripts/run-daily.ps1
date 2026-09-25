@@ -2,9 +2,9 @@
 # Safe to re-run: the pipeline is idempotent and resumes from the observation
 # warehouse. Exit code 0 = ok/up-to-date/degraded, 2 = a fail-closed gate blocked the run.
 #
-# Operational requirement: the local MiniQMT client must be running for the
-# xtquant provider; if it is offline the data stage blocks and the next run
-# resumes where it stopped.
+# The configured research-price path uses TickFlow plus BaoStock.  If direct
+# execution evidence is incomplete, the affected scope is marked no-execution
+# and the next run resumes where it stopped.
 
 param([switch]$FunctionsOnly)
 

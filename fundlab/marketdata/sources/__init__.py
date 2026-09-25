@@ -11,7 +11,6 @@ from fundlab.marketdata.sources.exchange import ExchangePublicUniverseProvider
 from fundlab.marketdata.sources.sina import SinaEtfProvider
 from fundlab.marketdata.sources.sina_calendar import SinaCalendarProvider
 from fundlab.marketdata.sources.tickflow import TickFlowProvider
-from fundlab.marketdata.sources.xtquant import XtQuantProvider
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,6 @@ def default_provider_registry() -> ProviderRegistry:
     registry.register(SinaCalendarProvider())
     registry.register(BaoStockProvider())
     registry.register(CninfoCorporateActionProvider())
-    registry.register(XtQuantProvider())
     return registry
 
 
@@ -60,7 +58,6 @@ __all__ = [
     "SinaCalendarProvider",
     "SourceStatus",
     "TickFlowProvider",
-    "XtQuantProvider",
     "default_provider_registry",
     "source_statuses",
 ]

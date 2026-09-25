@@ -272,7 +272,6 @@ def test_canonical_cli_creates_account_and_runs_shared_kernel(tmp_path, capsys):
     assert {item["provider"] for item in sources} == {
         "baostock", "cninfo-public", "eastmoney-efinance", "exchange-public",
         "eastmoney-fund-public", "sina-calendar", "sina-etf", "tickflow",
-        "xtquant",
     }
 
     assert main([

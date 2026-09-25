@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from importlib import import_module
 import json
 import math
 from pathlib import Path
@@ -81,7 +80,7 @@ class EtfRuleEvidenceBuilder:
             )
         source_identity = {
             "membership_and_classification": "SSE/SZSE public fund lists",
-            "current_limit_calibration": "MiniQMT/xtquant get_instrument_detail",
+            "current_limit_calibration": "configured ETF detail provider",
             "cross_border_t0_rule": (
                 "https://english.sse.com.cn/news/newsrelease/c/4947611.shtml"
             ),
@@ -122,9 +121,12 @@ class EtfRuleEvidenceBuilder:
                     len(etfs),
                     len(frame),
                 )
-        client = self._client or import_module("xtquant.xtdata")
-        if hasattr(client, "enable_hello"):
-            client.enable_hello = False
+        client = self._client
+        if client is None:
+            raise TradeRuleError(
+                "ETF rule detail provider is not configured; new ETF onboarding is quarantined",
+                instrument_ids=instrument_ids,
+            )
 
         rules: list[dict[str, Any]] = []
         detail_hashes: dict[str, str] = {}
@@ -135,12 +137,12 @@ class EtfRuleEvidenceBuilder:
                 detail = client.get_instrument_detail(instrument_id, iscomplete=True)
             except Exception as exc:
                 raise TradeRuleError(
-                    f"MiniQMT ETF rule evidence request failed: {instrument_id}",
+                    f"ETF rule evidence request failed: {instrument_id}",
                     instrument_ids=(instrument_id,),
                 ) from exc
             if not isinstance(detail, Mapping) or not detail:
                 raise TradeRuleError(
-                    f"MiniQMT has no current ETF rule evidence: {instrument_id}",
+                    f"ETF detail provider has no current rule evidence: {instrument_id}",
                     instrument_ids=(instrument_id,),
                 )
             detail_hashes[instrument_id] = stable_digest(_replace_non_finite(detail))
@@ -151,14 +153,14 @@ class EtfRuleEvidenceBuilder:
             )
             observed_open = _compact_date(detail.get("OpenDate"))
             if observed_open is not None and observed_open != listed:
-                # The exchange list owns the listing lifecycle.  MiniQMT's OpenDate
-                # is only current instrument-detail evidence and is known to mean
+                # The exchange list owns the listing lifecycle.  A detail provider's
+                # OpenDate is only current instrument-detail evidence and is known to mean
                 # data availability/creation date for some old and money-market
                 # ETFs.  Preserve the disagreement instead of changing history or
                 # blocking otherwise usable rule evidence.
                 listing_date_conflicts[instrument_id] = {
                     "exchange_listed_date": listed.isoformat(),
-                    "xtquant_open_date": observed_open.isoformat(),
+                    "detail_open_date": observed_open.isoformat(),
                 }
             current_ratio = _observed_limit_ratio(detail, instrument_id)
             product_class = str(instrument["exchange_product_class"])
@@ -197,8 +199,8 @@ class EtfRuleEvidenceBuilder:
                 known = listed
                 evidence_parts = [
                     f"exchange_product_class={product_class}",
-                    f"xtquant_current_limit_ratio={current_ratio:.2f}",
-                    f"xtquant_secuCategory={detail.get('secuCategory')}",
+                    f"current_limit_ratio={current_ratio:.2f}",
+                    f"secuCategory={detail.get('secuCategory')}",
                 ]
                 if effective_from == CROSS_BORDER_T0_EFFECTIVE:
                     known = CROSS_BORDER_T0_KNOWN
@@ -240,7 +242,7 @@ class EtfRuleEvidenceBuilder:
             "source_identity": source_identity,
         }
         # Reuse immutable evidence when the dated rules are unchanged.  The
-        # raw report still pins the exact MiniQMT calibration that first proved
+        # The raw report still pins the exact detail calibration that first proved
         # those rules, while today's nominal quote cannot invalidate completed
         # foundation checkpoints merely because PreClose moved.
         semantic_primitive = to_primitive(semantic_evidence)
@@ -267,7 +269,7 @@ class EtfRuleEvidenceBuilder:
                 )
         evidence_payload = {
             **semantic_evidence,
-            "xtquant_instrument_detail_sha256": detail_hashes,
+            "instrument_detail_sha256": detail_hashes,
             "listing_date_conflicts": listing_date_conflicts,
             "observed_at": datetime.now(timezone.utc),
         }
@@ -308,7 +310,7 @@ def _verified_etf_rule_report(
     ):
         return None
     instrument_ids = tuple(map(str, etfs["instrument_id"]))
-    detail_hashes = payload.get("xtquant_instrument_detail_sha256")
+    detail_hashes = payload.get("instrument_detail_sha256")
     if (
         not isinstance(detail_hashes, Mapping)
         or set(map(str, detail_hashes)) != set(instrument_ids)

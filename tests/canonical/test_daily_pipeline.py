@@ -19,6 +19,7 @@ from fundlab.marketdata import (
     CoverageClaim,
     MarketDataWarehouse,
     MarketTable,
+    ObservationError,
     ObservationPayload,
     ProviderCapability,
     ProviderRegistry,
@@ -635,6 +636,13 @@ def build_settings(tmp_path, accounts: tuple[DailyAccountSettings, ...]) -> Foun
             agent_decision_root=tmp_path / "decisions",
             report_root=tmp_path / "daily-reports",
             accounts=accounts,
+            source_pair=("tickflow", "xtquant"),
+            adjudicator="baostock",
+            factor_provider="xtquant",
+            no_trade_providers=("tickflow", "xtquant", "baostock"),
+            dense_status_provider="xtquant",
+            stock_status_provider="baostock",
+            direct_limit_providers=("xtquant", "eastmoney-efinance"),
         ),
     )
 
@@ -1677,6 +1685,7 @@ def _daily_extension_registry() -> ProviderRegistry:
             ProviderCapability.INSTRUMENTS,
             ProviderCapability.DAILY_BARS_RAW,
             ProviderCapability.DAILY_STATUS,
+            ProviderCapability.ADJUSTMENT_FACTORS,
         })),
         ("sina-calendar", frozenset({ProviderCapability.TRADING_CALENDAR})),
         ("exchange-public", frozenset({ProviderCapability.INSTRUMENTS})),
@@ -2514,7 +2523,7 @@ def test_daily_new_listing_runs_through_componentized_increment_and_publication(
         (stage.name, stage.status, stage.detail) for stage in first.stages
     ]
     limit_stage = next(stage for stage in first.stages if stage.name == "limits")
-    assert limit_stage.detail["execution_guard_sample"] == ("688825.SH",)
+    assert limit_stage.detail["execution_guard_sample"] == (_DAILY_NEW_ID,)
     assert first.snapshot_id is not None
     by_name = {stage.name: stage for stage in first.stages}
     assert by_name["bars"].detail["included"] == len(_DAILY_BASE_IDS)
@@ -2856,7 +2865,13 @@ def test_daily_publishes_prices_with_execution_guard_when_direct_limits_are_miss
     assert EXECUTION_EVIDENCE_GAP_RULE_ID not in set(prior_rows["trade_rule_id"])
 
 
-def test_daily_status_collector_top_level_failure_blocks(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("failure_type", "expected_status"),
+    ((ConnectionError, "blocked"), (ObservationError, "degraded")),
+)
+def test_daily_dense_status_failure_is_scoped(
+    tmp_path, monkeypatch, failure_type, expected_status,
+):
     import fundlab.marketdata.simulation_data as simulation_data_module
     import fundlab.pipeline.daily as daily_module
     from fundlab.marketdata.etf_rules import EtfRuleEvidenceBuilder
@@ -2891,26 +2906,35 @@ def test_daily_status_collector_top_level_failure_blocks(tmp_path, monkeypatch):
             self.delegate = real_collector(*args, **kwargs)
 
         def collect(self, spec):
-            if spec.provider_name == "xtquant":
-                raise ConnectionError("MiniQMT status endpoint unavailable")
+            if spec.provider_name == "xtquant" and failure_type is ConnectionError:
+                raise failure_type("dense status endpoint unavailable")
             return self.delegate.collect(spec)
 
     monkeypatch.setattr(
         daily_module, "SimulationStatusCollector", FailingXtquantStatusCollector,
     )
     _ready_multi_asset_market(tmp_path / "market")
+    registry = _daily_extension_registry()
+    if expected_status == "degraded":
+        def unavailable(request):
+            raise ObservationError("MiniQMT status endpoint unavailable")
+        monkeypatch.setattr(registry.provider("xtquant"), "observe", unavailable)
     pipeline = DailyPipeline(
         build_settings(tmp_path, ()),
-        registry=_daily_extension_registry(),
+        registry=registry,
         now_fn=lambda: evening_of(FUTURE_DAYS[0]),
     )
 
     result = pipeline.run(target_date=FUTURE_DAYS[0], skip_accounts=True)
 
-    assert result.status == "blocked"
+    assert result.status == expected_status
     status = next(stage for stage in result.stages if stage.name == "status")
-    assert status.status == "blocked"
-    assert status.detail["error_type"] == "ConnectionError"
+    assert status.status == expected_status
+    if expected_status == "blocked":
+        assert status.detail["error_type"] == "ConnectionError"
+    else:
+        assert result.snapshot_id is not None
+        assert status.detail["dense"]["unresolved_instrument_ids"]
 
 
 def test_daily_etf_rule_detail_failure_guards_only_affected_etf(tmp_path, monkeypatch):

@@ -201,7 +201,7 @@ class EastmoneyEtfActionProvider:
     list/content endpoints supply the public-known date and record/effect lifecycle;
     Narrow keyed archive gaps are verified against hashed public copies of
     issuer/exchange disclosure documents.
-    Canonical reconciliation still requires an independent MiniQMT factor event.
+    Canonical reconciliation still requires an independent factor event.
     """
 
     name = "eastmoney-fund-public"

@@ -45,8 +45,8 @@ class DailySettings:
     agent_decision_root: Path
     report_root: Path
     accounts: tuple[DailyAccountSettings, ...]
-    source_pair: tuple[str, str] = ("tickflow", "xtquant")
-    adjudicator: str = "baostock"
+    source_pair: tuple[str, str] = ("tickflow", "baostock")
+    adjudicator: str = "eastmoney-efinance"
     batch_size: int = 100
     # How far past today the canonical calendar carries exchange-announced
     # future sessions, so a head-of-data intent can always schedule its T+1
@@ -54,6 +54,15 @@ class DailySettings:
     calendar_horizon_days: int = 60
     research_profile: str | None = None
     research_profiles: tuple[str, ...] = ()
+    # Appended after the original fields so positional callers retain their
+    # pre-fallback argument order.
+    factor_provider: str = "baostock"
+    no_trade_providers: tuple[str, ...] = (
+        "tickflow", "baostock", "eastmoney-efinance",
+    )
+    dense_status_provider: str = "baostock"
+    stock_status_provider: str = "baostock"
+    direct_limit_providers: tuple[str, ...] = ("eastmoney-efinance",)
 
     def __post_init__(self) -> None:
         if self.calendar_horizon_days < 1:
@@ -427,8 +436,18 @@ def _daily_settings(raw: Any, base: Path) -> DailySettings:
         agent_decision_root=_path("agent_decision_dir", "../data/agent/decisions"),
         report_root=_path("report_dir", "../data/reports/daily"),
         accounts=tuple(accounts),
-        source_pair=tuple(map(str, raw.get("source_pair", ("tickflow", "xtquant")))),
-        adjudicator=str(raw.get("adjudicator", "baostock")),
+        source_pair=tuple(map(str, raw.get("source_pair", ("tickflow", "baostock")))),
+        adjudicator=str(raw.get("adjudicator", "eastmoney-efinance")),
+        factor_provider=str(raw.get("factor_provider", "baostock")),
+        no_trade_providers=tuple(map(str, raw.get(
+            "no_trade_providers",
+            ("tickflow", "baostock", "eastmoney-efinance"),
+        ))),
+        dense_status_provider=str(raw.get("dense_status_provider", "baostock")),
+        stock_status_provider=str(raw.get("stock_status_provider", "baostock")),
+        direct_limit_providers=tuple(map(str, raw.get(
+            "direct_limit_providers", ("eastmoney-efinance",),
+        ))),
         batch_size=int(raw.get("batch_size", 100)),
         calendar_horizon_days=int(raw.get("calendar_horizon_days", 60)),
         research_profile=(None if raw.get("research_profile") in (None, "") else str(raw.get("research_profile"))),

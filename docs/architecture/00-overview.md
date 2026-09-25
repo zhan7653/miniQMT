@@ -126,7 +126,7 @@ sequenceDiagram
 ## 日常怎么跑
 
 ```powershell
-uv sync --dev --frozen --inexact      # xtquant 在 uv.lock 之外,必须 --inexact
+uv sync --dev --frozen
 uv run fundlab agent decide --all     # 仅运行 scheduled=true 的 Agent 策略
 uv run fundlab daily run              # 一条命令:校验日历→扩展快照→推进账户(幂等)
 uv run fundlab daily status           # 快照头、账户头寸日、配置概览
@@ -136,7 +136,7 @@ uv run ruff check .                 # Python 3.11 兼容性与高信号静态检
 uv run pytest tests/canonical         # 全量测试
 ```
 
-退出码语义:`0` = 成功、已最新或带精确隔离的 `degraded`;`2` = 不可切分的共享完整性/发布/审计失败,或没有任何启用账户能够推进。原因在控制台 JSON 与 `data/reports/daily/` 报告里;修复后重跑即从持久观测仓库续传。MiniQMT 离线会降低完整价格覆盖,但可精确归属的缺口只进入 quarantine,不会让上一可信快照或无关范围失效。
+退出码语义:`0` = 成功、已最新或带精确隔离的 `degraded`;`2` = 不可切分的共享完整性/发布/审计失败,或没有任何启用账户能够推进。原因在控制台 JSON 与 `data/reports/daily/` 报告里;修复后重跑即从持久观测仓库续传。多源行情或执行证据缺口只进入 quarantine/no-execution,不会让上一可信快照或无关范围失效。
 
 ## 当前状态(2026-07-27)
 
@@ -144,8 +144,8 @@ uv run pytest tests/canonical         # 全量测试
 | --- | --- |
 | 已发布快照 | `snap-2a502eb188874c6ac7bbfb7f`(6,809 标的,14.9M 日线,数据至 2026-07-24) |
 | 模拟账户 | `paper-1`、`paper-agent` 头寸日 2026-07-24；`paper-dividend` 已配置，下一轮 daily 创建并以现金起步 |
-| 数据源 | 9 个:tickflow、xtquant、baostock、eastmoney-efinance、eastmoney-fund-public、exchange-public、sina-calendar、sina-etf、cninfo-public |
-| 每日配置 | 双源 `[tickflow, xtquant]`,仲裁 `baostock`,收盘截止 19:00,日历前瞻 60 天 |
+| 数据源 | 8 个:tickflow、baostock、eastmoney-efinance、eastmoney-fund-public、exchange-public、sina-calendar、sina-etf、cninfo-public |
+| 每日配置 | 研究行情双源 `[tickflow, baostock]`,仲裁 `eastmoney-efinance`,状态/因子 `baostock`,收盘截止 19:00,日历前瞻 60 天 |
 | 测试 | `tests/canonical` 全量用例通过 |
 
 **2026-07-27 清理记录**:v1 遗留仓库(sqlite/parquet)及其 audit/import 通道、tencent 因子源、一次性构建/验证报告(已压缩至 `data/archive/build-reports-2026-07.zip`)、旧工具痕迹(.codex 等)已全部移除;Web 控制台完成一轮视觉与交互改版。详见 git 历史与 [foundation.md](../foundation.md) 的退役备注。

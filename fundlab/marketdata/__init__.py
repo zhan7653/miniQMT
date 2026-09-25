@@ -100,7 +100,6 @@ from fundlab.marketdata.sources import (
     SinaEtfProvider,
     SinaCalendarProvider,
     TickFlowProvider,
-    XtQuantProvider,
     default_provider_registry,
     source_statuses,
 )
@@ -172,7 +171,6 @@ __all__ = [
     "SinaEtfProvider",
     "SinaCalendarProvider",
     "TickFlowProvider",
-    "XtQuantProvider",
     "default_provider_registry",
     "default_reconciliation_policy",
     "derive_ratio_adjusted_bars",

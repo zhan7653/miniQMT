@@ -87,6 +87,7 @@ class StatusCollectionSpec:
     shard_count: int = 1
     shard_index: int = 0
     refresh: bool = False
+    include_all_assets: bool = False
 
     def __post_init__(self) -> None:
         if self.provider_name not in {"baostock", "xtquant"}:
@@ -119,6 +120,7 @@ class EvidenceCollectionSpec:
     batch_size: int = 100
     refresh: bool = False
     predecessor_snapshot_id: str | None = None
+    factor_provider: str = "baostock"
 
     def __post_init__(self) -> None:
         if self.kind not in {"stock-actions", "etf-actions", "factors"}:
@@ -129,6 +131,8 @@ class EvidenceCollectionSpec:
             raise ValueError(
                 "Incremental stock action evidence requires a predecessor snapshot"
             )
+        if not self.factor_provider.strip():
+            raise ValueError("factor_provider must not be empty")
 
 
 @dataclass(frozen=True)
@@ -300,7 +304,7 @@ class SimulationEvidenceCollector:
                 MarketTable.CORPORATE_ACTIONS, "etf",
             ),
             "factors": (
-                "xtquant", ProviderCapability.ADJUSTMENT_FACTORS,
+                spec.factor_provider, ProviderCapability.ADJUSTMENT_FACTORS,
                 MarketTable.ADJUSTMENT_FACTORS, None,
             ),
         }[spec.kind]
@@ -1220,7 +1224,7 @@ class SimulationStatusCollector:
         # accidental concurrent shards while retaining deterministic recovery units.
         from fundlab.marketdata.history import _exclusive_build_lock
 
-        if spec.provider_name == "baostock":
+        if spec.provider_name == "baostock" and not spec.include_all_assets:
             lock = self.warehouse.root / "builds" / ".locks" / "baostock-status.lock"
             with _exclusive_build_lock(lock):
                 provider = self.registry.resolve(
@@ -1270,8 +1274,8 @@ class SimulationStatusCollector:
         if not scope.instrument_ids:
             raise ValueError("Status collection requires a non-empty universe scope")
         if spec.provider_name == "baostock":
-            # ETFs never carry stock ST designations; BaoStock is used only for
-            # stock ST while xtquant supplies dense suspension state for all assets.
+            # ETFs never carry stock ST designations; a separate dense status
+            # source supplies suspension state for all assets.
             instruments = instruments.loc[
                 instruments["asset_type"].astype(str).eq("stock")
             ].reset_index(drop=True)
@@ -1290,6 +1294,7 @@ class SimulationStatusCollector:
             "batch_size": spec.batch_size,
             "shard_count": spec.shard_count,
             "shard_index": spec.shard_index,
+            "include_all_assets": spec.include_all_assets,
         })[:24]
         checkpoint = self.warehouse.root / "builds" / build_id / "checkpoint.json"
         state = _read_json_if_present(checkpoint)

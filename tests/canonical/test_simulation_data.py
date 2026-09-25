@@ -771,7 +771,7 @@ def test_status_collection_is_shardable_validated_and_resumable(tmp_path, monkey
                 (CoverageClaim(
                     MarketTable.DAILY_BARS, True, DAYS[0], DAYS[-1], request.instrument_ids,
                 ),),
-                {"backend_group": "baostock"},
+                {"backend_group": "xtquant"},
             )
 
     from fundlab.marketdata import ProviderRegistry
@@ -1093,7 +1093,7 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
     ))
 
     class FactorProvider:
-        name = "xtquant"
+        name = "baostock"
         capabilities = frozenset({ProviderCapability.ADJUSTMENT_FACTORS})
 
         def __init__(self):
@@ -1112,7 +1112,7 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
                     MarketTable.ADJUSTMENT_FACTORS, True,
                     DAYS[0], DAYS[-1], request.instrument_ids,
                 ),),
-                {"backend_group": "xtquant"},
+                {"backend_group": "baostock"},
             )
 
     from fundlab.marketdata import ProviderRegistry
@@ -1123,7 +1123,9 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
     collector = SimulationEvidenceCollector(
         warehouse, tmp_path / "reports", registry=registry,
     )
-    spec = EvidenceCollectionSpec(research.snapshot_id, "factors", batch_size=1)
+    spec = EvidenceCollectionSpec(
+        research.snapshot_id, "factors", batch_size=1, factor_provider="baostock",
+    )
 
     first = collector.collect(spec)
     second = collector.collect(spec)
@@ -1143,6 +1145,7 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
         warehouse, tmp_path / "unavailable-reports", registry=unavailable_registry,
     ).collect(EvidenceCollectionSpec(
         research.snapshot_id, "factors", batch_size=1, refresh=True,
+        factor_provider="baostock",
     ))
     assert unavailable.status == "incomplete"
     assert unavailable.unresolved_instrument_ids == ("600000.SH",)
@@ -1161,6 +1164,7 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
                     warehouse, tmp_path / f"record-{type(error).__name__}", registry=registry,
                 ).collect(EvidenceCollectionSpec(
                     research.snapshot_id, "factors", batch_size=1, refresh=True,
+                    factor_provider="baostock",
                 ))
 
     import fundlab.marketdata.simulation_data as simulation_data_module
@@ -1176,6 +1180,7 @@ def test_factor_evidence_collection_is_validated_and_resumable(tmp_path, monkeyp
                 warehouse, tmp_path / "checkpoint-failure", registry=registry,
             ).collect(EvidenceCollectionSpec(
                 research.snapshot_id, "factors", batch_size=1, refresh=True,
+                factor_provider="baostock",
             ))
 
 

@@ -21,13 +21,13 @@ from fundlab.marketdata import (
     SinaEtfProvider,
     SinaCalendarProvider,
     TickFlowProvider,
-    XtQuantProvider,
 )
 from fundlab.marketdata.sources.cninfo import CninfoPublicClient, _cninfo_token
 from fundlab.marketdata.sources.exchange import (
     _validate_component_closure,
     validate_exchange_component_closure,
 )
+from fundlab.marketdata.sources.xtquant import XtQuantProvider
 
 
 START = date(2026, 7, 13)

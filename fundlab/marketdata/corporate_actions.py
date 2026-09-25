@@ -151,9 +151,9 @@ def reconcile_corporate_action_factors(
     corroborating_factors: pd.DataFrame | None = None,
     daily_bars: pd.DataFrame | None = None,
 ) -> CorporateActionReconciliationResult:
-    """Require every position-changing event to agree with one MiniQMT factor event.
+    """Require every position-changing event to agree with one factor event.
 
-    MiniQMT occasionally reports the same economic event on an announcement,
+    A factor provider may report the same economic event on an announcement,
     suspension, or resume date rather than the exchange implementation date.  The
     official action lifecycle remains canonical; a unique economic match within 31
     civil days may therefore prove the event while retaining the raw factor date in
@@ -926,7 +926,7 @@ def _apply_corroborating_factor_evidence(
         secondary, relative = matched
         for group in nearby_conflicts:
             replaced_action_indexes.update(map(int, group.index))
-        # MiniQMT supplies the canonical market-effect date.  Secondary cumulative
+        # The primary factor feed supplies the canonical market-effect date.  Secondary cumulative
         # factor feeds can publish the same economics on a later bookkeeping date;
         # retain that raw date in lineage without moving the executable event.
         effect_date = factor_key[1]
@@ -1214,7 +1214,7 @@ def _economic_mismatches(actions: pd.DataFrame, raw: Mapping[str, Any]) -> tuple
         entitlement = _number(row["share_ratio"])
         allotted = _number(raw.get("allotNum"))
         # CNInfo reports the maximum subscription entitlement per holding;
-        # MiniQMT reports the market-wide shares actually allotted.  The latter
+        # The primary factor feed reports the market-wide shares actually allotted.  The latter
         # may be lower after non-participation, but cannot exceed entitlement.
         if allotted <= 0 or allotted > entitlement + max(1e-6, entitlement * 1e-4):
             mismatches.append("rights_ratio")

@@ -38,7 +38,7 @@
 | `adjustments.py` | ~90 | `derive_ratio_adjusted_bars`:点时前复权推导;`visible_factor_ids`。 |
 | `portal.py` | ~420 | 唯一查询门面 `CanonicalMarketData`(注释原文:"The only query surface for version-pinned canonical market data")与 `PointInTimeMarketView`;类型化 `Instrument` / `DailyBar` / `CorporateAction` / `MarketSession`。 |
 
-9 个数据源(`name` / 独立后端组 `backend_group` / 能力):`tickflow`(tickflow-unverified;raw+adjusted 日线)、`eastmoney-efinance`(eastmoney;日线+状态)、`eastmoney-fund-public`(eastmoney;ETF 公司行动)、`exchange-public`(exchange-public;标的宇宙;ETF 完整列表按 `listingDate <= as_of_date` 截面化,原始响应计数/哈希和被排除的未来代码保留审计)、`sina-etf`(sina;ETF raw 日线)、`sina-calendar`(sina;交易日历)、`baostock`(baostock;标的+日历+raw 日线等)、`cninfo-public`(cninfo;股票公司行动；日常先完整扫描权益分派/配股/补充更正公告索引，再只抓受影响与持久 pending 股票的结构化详情)、`xtquant`(xtquant;日线+复权因子等,需 MiniQMT 在线)。对账策略以 `backend_group` 计独立性——两个 eastmoney 源只算一个独立后端。
+8 个数据源(`name` / 独立后端组 `backend_group` / 能力):`tickflow`(tickflow-unverified;raw+adjusted 日线)、`eastmoney-efinance`(eastmoney;日线+最新限价快照)、`eastmoney-fund-public`(eastmoney;ETF 公司行动)、`exchange-public`(exchange-public;标的宇宙;ETF 完整列表按 `listingDate <= as_of_date` 截面化,原始响应计数/哈希和被排除的未来代码保留审计)、`sina-etf`(sina;ETF raw 日线)、`sina-calendar`(sina;交易日历)、`baostock`(baostock;标的+日历+raw 日线+状态+复权因子等)、`cninfo-public`(cninfo;股票公司行动；日常先完整扫描权益分派/配股/补充更正公告索引，再只抓受影响与持久 pending 股票的结构化详情)。对账策略以 `backend_group` 计独立性——两个 eastmoney 源只算一个独立后端。
 
 ## 关键流程
 
@@ -46,7 +46,7 @@
 
 ```mermaid
 sequenceDiagram
-    participant P as Provider(如 xtquant)
+    participant P as Provider(如 baostock 或 TickFlow)
     participant I as MarketIngestionService
     participant W as MarketDataWarehouse
     participant R as ReconciliationService

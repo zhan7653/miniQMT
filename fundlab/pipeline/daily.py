@@ -87,8 +87,11 @@ from fundlab.trading import (
 PIPELINE_VERSION = "daily-pipeline-v2"
 SUPPORTED_REPORT_PIPELINE_VERSIONS = ("daily-pipeline-v1", PIPELINE_VERSION)
 CALENDAR_PROVIDERS = ("baostock", "sina-calendar")
-NO_TRADE_PROVIDERS = ("tickflow", "xtquant", "baostock")
-DIRECT_LIMIT_PROVIDERS = ("xtquant", "eastmoney-efinance")
+# Kept as a compatibility default for callers that import this module.  The
+# running pipeline uses DailySettings.no_trade_providers so the research chain
+# can be switched without reintroducing a removed provider as an implicit requirement.
+NO_TRADE_PROVIDERS = ("tickflow", "baostock", "eastmoney-efinance")
+DIRECT_LIMIT_PROVIDERS = ("eastmoney-efinance",)
 FACTOR_AUDIT_PROVIDER = "canonical-tickflow-adjusted-factor-audit-r2-v1"
 FACTOR_AUDIT_VERSION = "adjusted-price-factor-audit-r2-v1"
 DATA_GAP_QUARANTINE_PROVIDER = "fundlab-data-gap-quarantine"
@@ -971,13 +974,17 @@ class DailyPipeline:
         status_collector = SimulationStatusCollector(
             self.warehouse, self.report_root, registry=self.registry,
         )
-        for provider in ("xtquant", "baostock"):
+        dense_status_provider = self.settings.daily.dense_status_provider
+        stock_status_provider = self.settings.daily.stock_status_provider
+        collected_status: dict[str, Any] = {}
+        for provider in tuple(dict.fromkeys((dense_status_provider, stock_status_provider))):
             try:
                 result = status_collector.collect(StatusCollectionSpec(
                     source_snapshot_id=research.snapshot_id,
                     calendar_observation_id=calendar_observation_id,
                     provider_name=provider,
                     batch_size=50,
+                    include_all_assets=(provider == dense_status_provider),
                 ))
             except Exception as exc:
                 raise DailyPipelineBlocked(
@@ -986,7 +993,7 @@ class DailyPipeline:
                         "error_type": type(exc).__name__,
                     },
                 ) from exc
-            status_results[provider] = result
+            collected_status[provider] = result
             if result.status != "complete":
                 unresolved_ids = tuple(getattr(
                     result, "unresolved_instrument_ids", (),
@@ -998,6 +1005,10 @@ class DailyPipeline:
                     blockers=result.blockers,
                 )
                 all_date_execution_guard_ids.update(unresolved_ids)
+        # Keep the canonical composition keys stable while allowing the
+        # configured dense and stock-status providers to be the same source.
+        status_results["dense"] = collected_status[dense_status_provider]
+        status_results["stock"] = collected_status[stock_status_provider]
         stages.append(DailyStage(
             "status",
             "degraded" if any(
@@ -1014,13 +1025,14 @@ class DailyPipeline:
             for provider, result in status_results.items()
         }))
 
+        direct_limit_providers = tuple(self.settings.daily.direct_limit_providers)
         direct_limit_results = {
             provider: self._collect_direct_limit_observations(
                 provider=provider,
                 target=target,
                 instrument_ids=target_ids,
             )
-            for provider in DIRECT_LIMIT_PROVIDERS
+            for provider in direct_limit_providers
         }
         empty_limit_providers = tuple(
             provider for provider, result in direct_limit_results.items()
@@ -1030,6 +1042,11 @@ class DailyPipeline:
         for result in direct_limit_results.values():
             directly_verified_ids.intersection_update(result["_covered_instrument_ids"])
         missing_limit_ids = tuple(sorted(set(target_ids) - directly_verified_ids))
+        if len(direct_limit_results) < 2:
+            # The validator still requires two independent direct-limit
+            # backends. Keep prices visible but guard every instrument until a
+            # second provider is configured.
+            missing_limit_ids = tuple(sorted(target_ids))
         self._add_quarantine_reasons(
             execution_guard_reasons,
             missing_limit_ids,
@@ -1080,6 +1097,7 @@ class DailyPipeline:
                     predecessor_snapshot_id=(
                         predecessor.snapshot_id if kind == "stock-actions" else None
                     ),
+                    factor_provider=self.settings.daily.factor_provider,
                 ))
             except Exception as exc:
                 raise DailyPipelineBlocked(
@@ -2370,7 +2388,11 @@ class DailyPipeline:
         request = ProviderRequest(
             ProviderCapability.DAILY_BARS_RAW, start, end, instrument_ids,
         )
-        for provider in NO_TRADE_PROVIDERS:
+        daily_settings = getattr(getattr(self, "settings", None), "daily", None)
+        no_trade_providers = getattr(
+            daily_settings, "no_trade_providers", NO_TRADE_PROVIDERS,
+        )
+        for provider in no_trade_providers:
             observed, _ = self._capture_exact_source(
                 provider=provider,
                 request=request,
@@ -3127,10 +3149,10 @@ class DailyPipeline:
             research_bars["instrument_id"].astype(str).isin(available_ids)
         ].reset_index(drop=True)
         dense_status = self._concat_observation_tables(
-            status_results["xtquant"].observation_ids, MarketTable.DAILY_BARS,
+            status_results["dense"].observation_ids, MarketTable.DAILY_BARS,
         )
         stock_st = self._concat_observation_tables(
-            status_results["baostock"].observation_ids, MarketTable.DAILY_BARS,
+            status_results["stock"].observation_ids, MarketTable.DAILY_BARS,
         )
         calendar_window = calendar_frame.loc[
             calendar_frame["session_date"].astype(str).between(
@@ -3331,8 +3353,8 @@ class DailyPipeline:
         input_ids = tuple(sorted({
             *build_partition_ids,
             *(item for item in (no_trade_observation_id,) if item),
-            *status_results["xtquant"].observation_ids,
-            *status_results["baostock"].observation_ids,
+            *status_results["dense"].observation_ids,
+            *status_results["stock"].observation_ids,
             *evidence_results["stock-actions"].observation_ids,
             *evidence_results["etf-actions"].observation_ids,
             *evidence_results["factors"].observation_ids,

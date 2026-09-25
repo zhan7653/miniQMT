@@ -41,11 +41,11 @@ flowchart TD
     CAL --> TGT["目标日 = 截止 19:00 前最近的已完成开市日"]
     TGT -- "目标日 ≤ 已发布数据头" --> UTD["data: up_to_date → 退出码 0"]
     TGT --> U["universe: exchange-public 官方全量清单<br/>端点失败或成员暂时缺失 → 沿用前任并禁用对应执行"]
-    U --> H["bars: HistoryDatabaseBuilder 增量构建<br/>双源 tickflow+xtquant, 仲裁 baostock"]
+    U --> H["bars: HistoryDatabaseBuilder 增量构建<br/>双源 tickflow+baostock, 仲裁 eastmoney-efinance"]
     H --> NEW["交易所已确认、但历史主表尚未收录的新上市代码:<br/>首日按上市窗口补充;后续只凭连续已发布前序快照延续"]
     NEW --> NT["旧标的缺失优先做 no-trade 三源共识;<br/>无法确认则仅隔离对应标的，不阻断其他行情"]
     NT --> RS["research: derive_current_research_snapshot<br/>精确缺口 → 局部 quarantine；共享结构不完整 → 暂停"]
-    RS --> SE["status: xtquant+baostock 停牌/ST/前收<br/>limits: xtquant+Eastmoney 目标日直接涨跌停价<br/>evidence: stock-actions / etf-actions / xtquant factors<br/>factor reconciliation: BaoStock + 必要时 TickFlow 调整比率"]
+    RS --> SE["status: 配置的密集状态源+股票 ST 源<br/>limits: 配置的直接限价源（第二路缺失则 no-execution）<br/>evidence: stock-actions / etf-actions / 配置的因子源<br/>factor reconciliation: BaoStock + 必要时 TickFlow 调整比率"]
     SE --> CV["candidate: 组装 canonical-reconciler 源观测<br/>validate: SimulationIncrementValidator"]
     CV --> EX["extend: SimulationSnapshotBuilder.extend<br/>原子发布新快照 (publish=True)"]
     EX --> AC["accounts: 每个账户从各自 head+1<br/>逐会话跑交易内核到数据头"]
@@ -57,7 +57,7 @@ flowchart TD
 
 ### 幂等性与被阻断后的恢复
 
-- 全程幂等:源观测捕获走 `capture_resumable`(同范围已完整则复用);行情日期范围扩展时从不可变仓库选择同源、同标的、同参数的最长已验证前缀，只向上游请求新后缀，再记录带完整前缀/后缀血缘的组合观测；已验证的日历观测按输入观测 ID 精确匹配复用(`_matching_validated_calendar`);同一前序/universe/日历/日期/标的集合的 canonical no-trade 分区只在已通过三独立后端校验后复用;目标日双源直接涨跌停观测按单标的成功累积，未覆盖标的进入 execution-evidence guard 而不阻止价格发布;公司行动先与 xtquant 因子核对,未解决事件只补采 BaoStock 因子,仍缺失时才用 TickFlow 原始/前复权价格比率做目标事件审计;目标日不超过已发布数据头时直接 `up_to_date`;账户按 run 链头推进,重复运行不会重放会话。
+- 全程幂等:源观测捕获走 `capture_resumable`(同范围已完整则复用);行情日期范围扩展时从不可变仓库选择同源、同标的、同参数的最长已验证前缀，只向上游请求新后缀，再记录带完整前缀/后缀血缘的组合观测；已验证的日历观测按输入观测 ID 精确匹配复用(`_matching_validated_calendar`);同一前序/universe/日历/日期/标的集合的 canonical no-trade 分区只在已通过三独立后端校验后复用;目标日双源直接涨跌停观测按单标的成功累积，未覆盖标的进入 execution-evidence guard 而不阻止价格发布;公司行动先与配置的因子源核对,未解决事件仍可用 BaoStock 因子和 TickFlow 原始/前复权价格比率做目标事件审计;目标日不超过已发布数据头时直接 `up_to_date`;账户按 run 链头推进,重复运行不会重放会话。
 - 股票公司行动的日常入口是巨潮公告索引，不再逐日重抓全市场历史：完整扫描权益分派、配股与补充/更正公告后，先把分红预案、股东/董事提议、提示性方案以及纯 H 股公告归为不可执行披露并在报告中记录忽略原因；只对正式实施公告、配股公告、可能改变 A 股生命周期字段的更正/调整公告，以及 `pending.json` 中尚待结构化详情的股票调用逐股接口。pending 按公告 ID 逐条解析和清除，同股另一条行动不会顺带清掉未解决公告；未受影响股票继续生成 canonical evidence。更正/调整公告会用独立结构化观测对照前序已接受记录，无业务字段变化时保留一次非阻断确认并在第二次独立确认后清除。成功扫描、失败前已取得的原始分页响应、哈希、水位和待办位于 `data/warehouse/v2/indexes/cninfo-stock-actions/`，采集报告分别列出全宇宙、全部公告命中、可执行命中、已忽略公告及原因、实际新请求、复用详情、完成和缺失范围。公告跨页唯一数、总数、字段或首屏复查等无法精确归属的结构异常仍暂停该次新发布；正式实施详情暂不可用只隔离对应标的。若详情显示前序历史事件被新增、删除或任一业务字段改值（包括到账/上市日、数量倍数或除权日移动），routine daily 不自动改写历史，而是只对精确标的/事件/字段建立 correction quarantine 与 no-execution guard；干净股票继续。历史修正必须另走 exact dependency closure、allowed-diff 与 CAS 审计流程。
 - 新上市标的不会触发全历史重建：daily 对每个目标日刷新一次缺省历史主表；同一目标日的失败重试固定复用观测日期不早于目标日的最新完整主表，使 history/research 身份和下游检查点保持稳定。`exchange-public` 的 ETF 完整列表可能提前公布未来代码，因此先按 `listingDate <= as_of_date` 形成目标日截面，并保留原始响应计数/哈希及未来代码排除清单。官方端点暂不可用时只沿用上一份可信成员表并标记降级，不会猜测新代码。仅当代码来自该目标日完整主表、`listed_date` 落在本次增量窗口且关键元数据齐全时，`HistoryDatabaseBuilder` 才以不可变官方观测作为显式 master override，对新代码单独采集双源行情。若后续交易日历史主表仍未收录该代码，只能用范围连续且标的身份完全一致的已发布模拟前序继续补充。源行情、状态或后续证据不足必须收缩到该精确代码：价格缺失进入 quarantine，只有执行辅助证据不足则保留价格并进入 execution-evidence guard；没有可信前序证明的更早上市代码视为待处理历史修正，不得拖住其他标的的当日发布。
 - 被阻断后:**修复原因后直接重跑同一条命令**,管线从持久化的观测仓库续传,不需要任何手工清理。若 canonical 指针或账户已提交而报告提升失败,重跑会在 daily 锁内先验证并补齐隐藏 pending 收据,再继续本轮幂等业务；不会仅凭 pending 发布快照。最终失败维护 `logs/daily/LAST-RUN-BLOCKED`;降级完成维护 `logs/daily/LAST-RUN-DEGRADED`,其中记录报告路径、全部 degraded 阶段、degraded/blocked 账户，并在存在价格 quarantine 时附完整标的/原因/连续天数；日志打印非空的 `[DEGRADED]` 摘要。干净成功会清除两个标记。
@@ -93,7 +93,7 @@ flowchart TD
 `config/fundlab.yaml` 五段,一一映射到冻结 dataclass:
 
 - `paths` → `FoundationPaths`:`market_data`(`data/warehouse/v2/canonical`)、`trading_database`(`data/warehouse/v2/trading.sqlite3`)、`report_root`(`data/reports/data_v2/canonical`);
-- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, xtquant]`、`adjudicator: baostock`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 19 个账户：静态 ETF、单资产动量、LLM 红利，以及非 LLM 的规则红利、双动量、波动率倒数、相关性风险平价、趋势波动率目标、低 Beta/低波动、摘帽动量、在帽 ST 动量和 8 个宽基/卫星 ETF 危机策略变种；股票价格/ST 与危机账户只从创建日起前瞻评价，不生成历史收益结论；危机账户不读取溢价率，跨境风险改由单只仓位上限约束；LLM 红利以 `159207.SZ` 做只读含分红基准，60 个共同交易会话前不允许相对表现参与调仓;
+- `daily` → `DailySettings`:`session_cutoff_local: "19:00"`、`agent_decision_dir`、`report_dir`、`source_pair: [tickflow, baostock]`、`adjudicator: eastmoney-efinance`、`factor_provider: baostock`、`dense_status_provider: baostock`、`stock_status_provider: baostock`、`batch_size: 100`、`calendar_horizon_days: 60`、`accounts`(`DailyAccountSettings`,strategy 只允许 `static`/`agent-file`,static 必须带 weights)——当前配置了 19 个账户：静态 ETF、单资产动量、LLM 红利，以及非 LLM 的规则红利、双动量、波动率倒数、相关性风险平价、趋势波动率目标、低 Beta/低波动、摘帽动量、在帽 ST 动量和 8 个宽基/卫星 ETF 危机策略变种；股票价格/ST 与危机账户只从创建日起前瞻评价，不生成历史收益结论；危机账户不读取溢价率，跨境风险改由单只仓位上限约束；LLM 红利以 `159207.SZ` 做只读含分红基准，60 个共同交易会话前不允许相对表现参与调仓;
 - `execution` → `ExecutionPolicy`:参与率上限、滑点/冲击 bps、涨跌停阻断、部分成交;
 - `risk` → `RiskPolicy`:单仓权重上限、最低现金权重、允许资产类型;
 - `fees` → `FeeSchedule`:带生效区间与证据说明的分段费率规则,`trusted_for_simulation: true` 是模拟内核放行的显式声明(它是版本化的模拟假设,不是真实券商账户的声明)。
@@ -117,11 +117,11 @@ flowchart TD
 - **只允许不可切分的共享失败暂停新数据头**:没有可信价格并不自动全局阻断；只要每个缺口都能精确归属，就发布对应 DATA_GAP quarantine，哪怕覆盖整个 universe。只有共享日历、无法局部化的 schema/对账、manifest/CAS、持久化/数据库或审计提交失败才停止新发布，并保持上一可信快照不变。股票池、状态、涨跌停、公司行动、因子等可归属异常必须记录原错误并降级，不能阻断无关标的。
 - **幂等重入**:重跑不重复采数(可续传捕获 + 观测复用)、不重复发布(up_to_date 短路)、不重放账户会话(按 run 链头推进);OS 级文件锁保证任意时刻至多一轮。
 - **哈希与不可变绑定**:报告文件名嵌入 `stable_digest` 内容摘要；写入先 flush/fsync 到唯一临时文件，正式 JSON 用不可覆盖发布并逐字节校验竞态 winner。EOD 在 CAS 前持久化隐藏收据，只有候选已由 verified current 确认为发布结果后才提升正式报告；每轮报告完整记录各阶段的 observation_id / snapshot_id,可追溯到具体源观测。
-- **双源一致性**:日历要求 `baostock` 与 `sina-calendar` 在含未来 60 天的整个窗口上开市日集合完全一致;行情增量要求 `tickflow`+`xtquant` 双源对账、`baostock` 仲裁;整段缺失必须由三源无成交共识解释。
+- **双源一致性**:日历要求 `baostock` 与 `sina-calendar` 在含未来 60 天的整个窗口上开市日集合完全一致;行情增量要求 `tickflow`+`baostock` 双源对账、`eastmoney-efinance` 仲裁;整段缺失必须由配置的三源无成交共识解释。
 - **停牌占位仍是无成交**:三源无成交共识允许“源无行”或“显式 `suspended=true`、OHLC 平价、零成交量且成交额为空/为零”的占位行;任何非平价、实际成交量/成交额或非显式停牌都不能冒充停牌，只隔离该标的并保留冲突观测 ID。
 - **账户时钟边界 = 已发布数据头**:日历虽伸向未来,账户只推进到 `history_end`,保证 T+1 订单由次日发布的真实价格执行。
 - **单账户故障隔离**:一个账户阻断不阻止其他账户推进；存在成功或部分推进账户时整轮为 `degraded`(退出码 0)，只有全部实际尝试的启用账户都无法推进时才为 `blocked`。已提交的逐 session head 永不因后续账户或反馈错误回滚。
-- **运行前置条件**:MiniQMT 在线时提供 xtquant 行情和状态证据；客户端离线或单项能力不可用时，对应缺口进入隔离/no-execution，其他已验证行情仍继续发布。
+- **运行前置条件**:行情、状态和因子使用配置的公开多源；直接限价证据不足时，对应缺口进入隔离/no-execution，其他已验证行情仍继续发布。
 
 ## 测试对应
 

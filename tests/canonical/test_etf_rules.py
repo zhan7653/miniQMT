@@ -100,7 +100,7 @@ def test_etf_rule_evidence_materializes_historical_ratio_and_t0_transitions(tmp_
     assert result.report.is_file() and len(result.evidence_hash) == 64
 
 
-def test_exchange_listing_date_remains_authoritative_when_xtquant_open_date_differs(tmp_path):
+def test_exchange_listing_date_remains_authoritative_when_detail_open_date_differs(tmp_path):
     class ConflictingOpenDateClient(_Client):
         def get_instrument_detail(self, instrument_id, *, iscomplete):
             detail = super().get_instrument_detail(instrument_id, iscomplete=iscomplete)
@@ -122,7 +122,7 @@ def test_exchange_listing_date_remains_authoritative_when_xtquant_open_date_diff
     assert payload["listing_date_conflicts"] == {
         "510300.SH": {
             "exchange_listed_date": "2012-05-28",
-            "xtquant_open_date": "2012-05-29",
+            "detail_open_date": "2012-05-29",
         },
     }
 
@@ -202,7 +202,7 @@ def test_etf_report_with_incomplete_raw_detail_hashes_is_not_reused(tmp_path):
         universe_observation_id="obs-official",
     )
     payload = json.loads(first.report.read_text(encoding="utf-8"))
-    payload["xtquant_instrument_detail_sha256"] = {}
+    payload["instrument_detail_sha256"] = {}
     invalid_hash = stable_digest(payload)
     invalid = tmp_path / f"etf-rules-2026-07-17-{invalid_hash[:16]}.json"
     invalid.write_text(canonical_json(payload), encoding="utf-8", newline="\n")
